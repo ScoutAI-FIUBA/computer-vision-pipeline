@@ -5,6 +5,8 @@ docs/
 .env
 
 scripts/__pycache__/
+__pycache__/
+*.py[cod]
 
 media/
 outputs/

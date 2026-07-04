@@ -23,42 +23,47 @@ def detect_players(image_path: Path, api_key: str) -> dict:
     return client.infer(str(image_path), model_id=MODEL_ID)
 
 
-def draw_detections(image_path: Path, result: dict, output_path: Path) -> None:
+def annotate_image(image_path: Path, result: dict):
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        import cv2
+        import supervision as sv
     except ModuleNotFoundError as error:
-        raise SystemExit(
-            "Missing dependency: Pillow. Run `python -m pip install -r requirements.txt`."
+        raise RuntimeError(
+            "Missing dependency. Run `python -m pip install -r requirements.txt`."
         ) from error
 
-    image = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Could not read image: {image_path}")
 
-    for prediction in result.get("predictions", []):
-        x = float(prediction["x"])
-        y = float(prediction["y"])
-        width = float(prediction["width"])
-        height = float(prediction["height"])
+    detections = sv.Detections.from_inference(result)
+    class_names = detections.data.get("class_name", ["object"] * len(detections))
+    confidences = detections.confidence if detections.confidence is not None else [None] * len(detections)
+    labels = [
+        f"{class_name} {confidence:.2f}" if confidence is not None else str(class_name)
+        for class_name, confidence in zip(class_names, confidences)
+    ]
 
-        left = x - width / 2
-        top = y - height / 2
-        right = x + width / 2
-        bottom = y + height / 2
+    annotated = sv.BoxAnnotator().annotate(scene=image, detections=detections)
+    return sv.LabelAnnotator().annotate(scene=annotated, detections=detections, labels=labels)
 
-        label = prediction.get("class", "object")
-        confidence = prediction.get("confidence")
-        if confidence is not None:
-            label = f"{label} {float(confidence):.2f}"
 
-        draw.rectangle((left, top, right, bottom), outline="red", width=3)
+def draw_detections(image_path: Path, result: dict, output_path: Path) -> None:
+    try:
+        import cv2
+    except ModuleNotFoundError as error:
+        raise SystemExit(
+            "Missing dependency. Run `python -m pip install -r requirements.txt`."
+        ) from error
 
-        text_left, text_top, text_right, text_bottom = draw.textbbox((left, top), label, font=font)
-        draw.rectangle((text_left, text_top, text_right + 4, text_bottom + 4), fill="red")
-        draw.text((text_left + 2, text_top + 2), label, fill="white", font=font)
+    try:
+        annotated = annotate_image(image_path, result)
+    except (RuntimeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path)
+    if not cv2.imwrite(str(output_path), annotated):
+        raise SystemExit(f"Could not write annotated image: {output_path}")
 
 
 def main() -> None:

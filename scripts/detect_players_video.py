@@ -23,33 +23,22 @@ def estimate_calls(frames_to_read: int, frame_stride: int) -> int:
     return 0 if frames_to_read <= 0 else (frames_to_read + frame_stride - 1) // frame_stride
 
 
-def draw_detections(frame, predictions: list[dict], min_confidence: float) -> None:
-    import cv2
+def draw_detections(frame, result: dict, min_confidence: float):
+    import supervision as sv
 
-    height, width = frame.shape[:2]
+    detections = sv.Detections.from_inference(result)
+    if detections.confidence is not None:
+        detections = detections[detections.confidence >= min_confidence]
 
-    for prediction in predictions:
-        confidence = prediction.get("confidence")
-        if confidence is not None and float(confidence) < min_confidence:
-            continue
+    class_names = detections.data.get("class_name", ["object"] * len(detections))
+    confidences = detections.confidence if detections.confidence is not None else [None] * len(detections)
+    labels = [
+        f"{class_name} {confidence:.2f}" if confidence is not None else str(class_name)
+        for class_name, confidence in zip(class_names, confidences)
+    ]
 
-        x = float(prediction["x"])
-        y = float(prediction["y"])
-        box_width = float(prediction["width"])
-        box_height = float(prediction["height"])
-
-        left = max(0, int(x - box_width / 2))
-        top = max(0, int(y - box_height / 2))
-        right = min(width - 1, int(x + box_width / 2))
-        bottom = min(height - 1, int(y + box_height / 2))
-
-        label = prediction.get("class", "object")
-        if confidence is not None:
-            label = f"{label} {float(confidence):.2f}"
-
-        cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-        cv2.rectangle(frame, (left, max(0, top - 20)), (left + 8 * len(label), top), (0, 0, 255), -1)
-        cv2.putText(frame, label, (left + 2, max(12, top - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    annotated = sv.BoxAnnotator().annotate(scene=frame, detections=detections)
+    return sv.LabelAnnotator().annotate(scene=annotated, detections=detections, labels=labels)
 
 
 def infer_frame(client, frame, suffix: str) -> dict:
@@ -72,7 +61,7 @@ def open_video(video_path: Path):
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
-        raise SystemExit(f"Could not open video: {video_path}")
+        raise RuntimeError(f"Could not open video: {video_path}")
     return capture
 
 
@@ -85,57 +74,91 @@ def video_info(capture, max_frames: int | None) -> tuple[float, int, int]:
     return fps, frame_count, frames_to_read
 
 
-def process_video(args: argparse.Namespace, api_key: str) -> None:
+def inspect_video(video_path: Path, frame_stride: int, max_frames: int | None) -> dict:
+    capture = open_video(video_path)
+    try:
+        fps, frame_count, frames_to_read = video_info(capture, max_frames)
+    finally:
+        capture.release()
+
+    return {
+        "fps": fps or None,
+        "frame_count": frame_count or None,
+        "frames_to_read": frames_to_read,
+        "estimated_roboflow_calls": estimate_calls(frames_to_read, frame_stride),
+    }
+
+
+def default_output_fps(fps: float, frame_stride: int, sampled_output_only: bool, output_fps: float | None) -> float:
+    if output_fps is not None:
+        return output_fps
+    return max(1.0, (fps or 30) / frame_stride) if sampled_output_only else fps or 30
+
+
+def process_video(
+    video_path: Path,
+    output_path: Path,
+    api_key: str,
+    frame_stride: int = 30,
+    max_frames: int | None = None,
+    sampled_output_only: bool = True,
+    reuse_last_detections: bool = False,
+    confidence: float = 0.0,
+    output_fps: float | None = None,
+) -> dict:
     import cv2
 
-    capture = open_video(args.video)
-    fps, frame_count, frames_to_read = video_info(capture, args.max_frames)
+    capture = open_video(video_path)
+    fps, frame_count, frames_to_read = video_info(capture, max_frames)
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    output_fps = args.output_fps
-    if output_fps is None:
-        output_fps = max(1.0, (fps or 30) / args.frame_stride) if args.sampled_output_only else fps or 30
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_fps = default_output_fps(fps, frame_stride, sampled_output_only, output_fps)
 
-    writer = cv2.VideoWriter(str(args.output), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
     if not writer.isOpened():
-        raise SystemExit(f"Could not write output video: {args.output}")
+        capture.release()
+        raise RuntimeError(f"Could not write output video: {output_path}")
 
-    client = roboflow_client(api_key)
-    last_predictions: list[dict] = []
+    empty_result = {"predictions": []}
+    last_result = empty_result
     frame_index = 0
     calls = 0
 
     try:
-        while args.max_frames is None or frame_index < args.max_frames:
+        client = roboflow_client(api_key)
+        while max_frames is None or frame_index < max_frames:
             ok, frame = capture.read()
             if not ok:
                 break
 
-            predictions: list[dict] = []
+            result = empty_result
             inferred = False
-            if frame_index % args.frame_stride == 0:
+            if frame_index % frame_stride == 0:
                 result = infer_frame(client, frame, f"_{frame_index}.jpg")
-                predictions = result.get("predictions", [])
-                last_predictions = predictions
+                last_result = result
                 calls += 1
                 inferred = True
-            elif args.reuse_last_detections:
-                predictions = last_predictions
+            elif reuse_last_detections:
+                result = last_result
 
-            draw_detections(frame, predictions, args.confidence)
-            if inferred or not args.sampled_output_only:
+            frame = draw_detections(frame, result, confidence)
+            if inferred or not sampled_output_only:
                 writer.write(frame)
             frame_index += 1
     finally:
         capture.release()
         writer.release()
 
-    print(f"Frames read: {frame_index}/{frame_count or 'unknown'}")
-    print(f"Roboflow calls: {calls}")
-    print(f"Output FPS: {output_fps}")
-    print(f"Annotated video saved to: {args.output}")
+    return {
+        "model_id": MODEL_ID,
+        "frames_read": frame_index,
+        "frame_count": frame_count or None,
+        "frames_to_read": frames_to_read,
+        "roboflow_calls": calls,
+        "output_fps": output_fps,
+    }
 
 
 def main() -> None:
@@ -176,23 +199,42 @@ def main() -> None:
     load_dotenv()
     args.output = args.output or Path("outputs") / f"{args.video.stem}_detections.mp4"
 
-    capture = open_video(args.video)
-    fps, frame_count, frames_to_read = video_info(capture, args.max_frames)
-    capture.release()
+    try:
+        info = inspect_video(args.video, args.frame_stride, args.max_frames)
 
-    if args.dry_run:
-        print(f"Video: {args.video}")
-        print(f"FPS: {fps or 'unknown'}")
-        print(f"Frame count: {frame_count or 'unknown'}")
-        print(f"Frames to read: {frames_to_read or 'unknown'}")
-        print(f"Estimated Roboflow calls: {estimate_calls(frames_to_read, args.frame_stride)}")
-        return
+        if args.dry_run:
+            print(f"Video: {args.video}")
+            print(f"FPS: {info['fps'] or 'unknown'}")
+            print(f"Frame count: {info['frame_count'] or 'unknown'}")
+            print(f"Frames to read: {info['frames_to_read'] or 'unknown'}")
+            print(f"Estimated Roboflow calls: {info['estimated_roboflow_calls']}")
+            return
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from error
 
     api_key = os.getenv("ROBOFLOW_API_KEY")
     if not api_key:
         raise SystemExit("Missing ROBOFLOW_API_KEY environment variable")
 
-    process_video(args, api_key)
+    try:
+        stats = process_video(
+            args.video,
+            args.output,
+            api_key,
+            frame_stride=args.frame_stride,
+            max_frames=args.max_frames,
+            sampled_output_only=args.sampled_output_only,
+            reuse_last_detections=args.reuse_last_detections,
+            confidence=args.confidence,
+            output_fps=args.output_fps,
+        )
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from error
+
+    print(f"Frames read: {stats['frames_read']}/{stats['frame_count'] or 'unknown'}")
+    print(f"Roboflow calls: {stats['roboflow_calls']}")
+    print(f"Output FPS: {stats['output_fps']}")
+    print(f"Annotated video saved to: {args.output}")
 
 
 if __name__ == "__main__":

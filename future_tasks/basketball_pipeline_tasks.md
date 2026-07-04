@@ -9,8 +9,8 @@ This backlog documents the implementation work needed to evolve the current Robo
 | Image detection | Implemented with Roboflow Inference and annotated image output. |
 | Video detection | Implemented with frame sampling, dry-run cost estimation, sampled-only output, and annotated MP4 output. |
 | Cost control | Basic controls exist: `--dry-run`, `--frame-stride`, `--max-frames`, `--sampled-output-only`. |
-| Supervision integration | Not implemented yet. Current scripts draw manually. |
-| Tracking | Not implemented yet. |
+| Supervision integration | Implemented for image/video annotation; reusable helpers are still pending. |
+| Tracking | Local ByteTrack script implemented for sampled inferred frames; API integration and smoothing are pending. |
 | Team identification | Not implemented yet. |
 | Jersey OCR | Not implemented yet. |
 | Court keypoints / homography | Not implemented yet. |
@@ -74,9 +74,9 @@ Acceptance criteria:
 
 ### Task 2.1: Convert Roboflow outputs to `sv.Detections`
 
-- [ ] Add `supervision` to pinned dependencies.
-- [ ] Convert `InferenceHTTPClient` results with `sv.Detections.from_inference(result)`.
-- [ ] Replace manual detection filtering with Supervision filtering.
+- [x] Add `supervision` to pinned dependencies.
+- [x] Convert `InferenceHTTPClient` results with `sv.Detections.from_inference(result)`.
+- [x] Replace manual detection filtering with Supervision filtering.
 
 Acceptance criteria:
 
@@ -97,14 +97,20 @@ Acceptance criteria:
 
 ### Task 3.1: Add ByteTrack tracking
 
-- [ ] Use `sv.ByteTrack` or the current recommended Supervision tracker API.
-- [ ] Track only detections from frames actually inferred.
-- [ ] Output track IDs in labels.
+- [x] Use `sv.ByteTrack` or the current recommended Supervision tracker API.
+- [x] Track only detections from frames actually inferred.
+- [x] Output track IDs in labels.
 
 Acceptance criteria:
 
-- Sampled video output shows stable track IDs on simple clips.
-- Track IDs are saved in JSON/CSV for later analysis.
+- [x] Sampled video output can show track IDs on simple clips.
+- [x] Track IDs are saved in JSONL for later analysis.
+
+Notes:
+
+- Implemented locally in `scripts/track_players_video.py` only; not API-integrated yet.
+- Default output writes only inferred frames to avoid implying continuous tracking across skipped frames.
+- Next step is track smoothing/interpolation and then API integration if local behavior is good enough.
 
 ### Task 3.2: Add track-level smoothing
 
