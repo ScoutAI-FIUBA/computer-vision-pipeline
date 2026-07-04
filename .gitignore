@@ -1,0 +1,10 @@
+.atl/
+.venv/
+docs/
+
+.env
+
+scripts/__pycache__/
+
+media/
+outputs/
