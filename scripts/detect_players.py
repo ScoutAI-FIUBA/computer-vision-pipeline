@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
+try:
+    from scripts.annotation_helpers import annotate_detections, detections_from_inference
+    from scripts.env_config import PLAYER_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
+except ModuleNotFoundError:
+    from annotation_helpers import annotate_detections, detections_from_inference
+    from env_config import PLAYER_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
 
-MODEL_ID = "basketball-player-detection-3-ycjdo/16"
-API_URL = "https://serverless.roboflow.com"
+MODEL_ID = PLAYER_MODEL_ID
+API_URL = ROBOFLOW_API_URL
 
 
 def detect_players(image_path: Path, api_key: str) -> dict:
@@ -26,7 +31,6 @@ def detect_players(image_path: Path, api_key: str) -> dict:
 def annotate_image(image_path: Path, result: dict):
     try:
         import cv2
-        import supervision as sv
     except ModuleNotFoundError as error:
         raise RuntimeError(
             "Missing dependency. Run `python -m pip install -r requirements.txt`."
@@ -36,16 +40,8 @@ def annotate_image(image_path: Path, result: dict):
     if image is None:
         raise ValueError(f"Could not read image: {image_path}")
 
-    detections = sv.Detections.from_inference(result)
-    class_names = detections.data.get("class_name", ["object"] * len(detections))
-    confidences = detections.confidence if detections.confidence is not None else [None] * len(detections)
-    labels = [
-        f"{class_name} {confidence:.2f}" if confidence is not None else str(class_name)
-        for class_name, confidence in zip(class_names, confidences)
-    ]
-
-    annotated = sv.BoxAnnotator().annotate(scene=image, detections=detections)
-    return sv.LabelAnnotator().annotate(scene=annotated, detections=detections, labels=labels)
+    detections = detections_from_inference(result)
+    return annotate_detections(image, detections)
 
 
 def draw_detections(image_path: Path, result: dict, output_path: Path) -> None:
@@ -76,16 +72,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    try:
-        from dotenv import load_dotenv
-    except ModuleNotFoundError as error:
-        raise SystemExit(
-            "Missing dependency: python-dotenv. Run `python -m pip install -r requirements.txt`."
-        ) from error
-
-    load_dotenv()
-
-    api_key = os.getenv("ROBOFLOW_API_KEY")
+    api_key = get_roboflow_api_key()
     if not api_key:
         raise SystemExit("Missing ROBOFLOW_API_KEY environment variable")
 

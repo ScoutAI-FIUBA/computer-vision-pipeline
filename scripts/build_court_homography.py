@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """Build a local FIBA court homography from detected keypoints.
 
-WARNING / TODO: this script uses a best-guess ``COURT_POINT_MAP`` that maps
-detected keypoint labels to FIBA (28m x 15m) court coordinates. The mapping
-was inferred from a single broadcast-angle test image and is explicitly an
-APPROXIMATION, not ground truth. Before relying on the resulting homography
-for production stats, replace the mapping with a measurement taken on a real
-FIBA court (or the target broadcast camera angle). Every consumer of the
-output JSON must treat the homography as approximate.
+This script uses the shared labeled court template from
+``scripts/court_template.py``. That template is the authoritative label ->
+court-coordinate map for this repo.
 
 The script:
 
 - Reads parsed keypoints (output of ``detect_court_keypoints.py``).
-- Filters them by ``--min-confidence`` and by membership in ``COURT_POINT_MAP``.
+- Filters them by ``--min-confidence`` and by canonical geometry allowed in the
+  selected ``--geometry-mode``.
 - Calls ``cv2.findHomography`` with RANSAC and a configurable reprojection
   threshold (pixel space).
 - Returns the homography, the inlier mask, and per-inlier reprojection error
@@ -32,48 +29,40 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
+try:
+    from scripts.court_template import (
+        COURT_TEMPLATE_LOOKUP,
+        GEOMETRY_MODE_STATUSES,
+        canonical_point_map,
+        geometry_statuses_for_mode,
+        template_points,
+    )
+except ModuleNotFoundError:
+    from court_template import (
+        COURT_TEMPLATE_LOOKUP,
+        GEOMETRY_MODE_STATUSES,
+        canonical_point_map,
+        geometry_statuses_for_mode,
+        template_points,
+    )
 
-# FIBA court dimensions: 28m long x 15m wide. The mapping is best-guess only
-# and needs real measurement before production use. See module docstring.
-#
-# Coordinate system: x_m along court length (0 = near baseline, 28 = far
-# baseline), y_m across court width (0 = one sideline, 15 = the other). Near
-# basket rim is at (0, 7.5); far basket rim is at (28, 7.5).
-#
-# The numeric labels below come from the Roboflow basketball-court-detection-2
-# keypoint model. The mapping was inferred from a single broadcast-angle
-# frame and is not validated against a measured court.
-COURT_POINT_MAP: dict[str, tuple[float, float]] = {
-    # Paint / free-throw rectangle corners and free-throw line edges.
-    "01": (5.80, 9.95),
-    "02": (5.80, 11.10),
-    "04": (5.80, 5.05),
-    "11": (0.00, 7.50),
-    # Free-throw circle: 3.6m radius centered at (5.8, 7.5).
-    "09": (2.20, 7.50),
-    # 3-point line: 6.75m arc from rim, corner at 1.575m from baseline.
-    "05": (1.575, 0.90),
-    "10": (6.75, 7.50),
-    "12": (5.00, 3.90),
-    "13": (4.50, 4.20),
-    "14": (1.575, 14.10),
-    # Half-court landmarks (labels 15/16 sit past the near half in the test
-    # image; treat as approximate).
-    "15": (14.00, 11.00),
-    "16": (14.00, 4.00),
-}
+# FIBA court dimensions: 28m long x 15m wide. Coordinate system: x_m along
+# court length and y_m across court width, with (0, 0) at the top-left corner.
+COURT_POINT_MAP: dict[str, tuple[float, float]] = canonical_point_map()
 
 
 @dataclass
 class HomographyResult:
-    matrix: np.ndarray
-    mask: np.ndarray
+    matrix: Any
+    mask: Any
     inliers_count: int
     reprojection_mean_m: float
     reprojection_median_m: float
+    geometry_mode: str
+    geometry_statuses_allowed: tuple[str, ...]
+    point_map_used: dict[str, tuple[float, float]]
     matched: list[dict[str, Any]]
+    skipped: list[dict[str, Any]]
 
 
 def load_keypoints_json(path: Path) -> dict[str, Any]:
@@ -114,23 +103,51 @@ def compute_homography(
     min_confidence: float,
     min_points: int,
     reproj_threshold: float,
+    geometry_mode: str = "strict",
     point_map: dict[str, tuple[float, float]] | None = None,
 ) -> HomographyResult:
-    mapping = point_map if point_map is not None else COURT_POINT_MAP
+    import cv2
+    import numpy as np
+
+    mapping = point_map if point_map is not None else canonical_point_map(geometry_mode)
+    allowed_statuses = geometry_statuses_for_mode(geometry_mode)
 
     matched: list[dict[str, Any]] = []
     src_pts: list[tuple[float, float]] = []
     dst_pts: list[tuple[float, float]] = []
-    skipped_unknown: list[str] = []
-    skipped_low_conf: list[str] = []
+    skipped: list[dict[str, Any]] = []
     for point in keypoints:
         label = str(point.get("label", ""))
         confidence = point.get("confidence")
         if label not in mapping:
-            skipped_unknown.append(label)
+            template_point = COURT_TEMPLATE_LOOKUP.get(label)
+            if template_point is None:
+                reason = "label_not_in_template"
+                geometry_status = None
+            elif template_point.court_xy is None:
+                reason = "geometry_unknown"
+                geometry_status = template_point.geometry_status
+            else:
+                reason = "geometry_status_excluded"
+                geometry_status = template_point.geometry_status
+            skipped.append(
+                {
+                    "label": label,
+                    "confidence": confidence,
+                    "reason": reason,
+                    "geometry_status": geometry_status,
+                }
+            )
             continue
         if confidence is not None and confidence < min_confidence:
-            skipped_low_conf.append(label)
+            skipped.append(
+                {
+                    "label": label,
+                    "confidence": confidence,
+                    "reason": "below_confidence",
+                    "geometry_status": COURT_TEMPLATE_LOOKUP.get(label).geometry_status if label in COURT_TEMPLATE_LOOKUP else None,
+                }
+            )
             continue
         src_pts.append((float(point["x"]), float(point["y"])))
         dst_pts.append(mapping[label])
@@ -140,13 +157,14 @@ def compute_homography(
                 "image_xy": [float(point["x"]), float(point["y"])],
                 "court_meters": list(mapping[label]),
                 "confidence": confidence,
+                "geometry_status": COURT_TEMPLATE_LOOKUP.get(label).geometry_status if label in COURT_TEMPLATE_LOOKUP else None,
             }
         )
 
     if len(matched) < min_points:
         raise ValueError(
             f"Need at least {min_points} matched points to fit a homography; got {len(matched)} "
-            f"(unknown labels: {len(skipped_unknown)}, below confidence: {len(skipped_low_conf)})."
+            f"(skipped: {len(skipped)}, geometry mode: {geometry_mode})."
         )
 
     src = np.asarray(src_pts, dtype=np.float32)
@@ -181,106 +199,143 @@ def compute_homography(
         inliers_count=inliers_count,
         reprojection_mean_m=reprojection_mean,
         reprojection_median_m=reprojection_median,
+        geometry_mode=geometry_mode,
+        geometry_statuses_allowed=allowed_statuses,
+        point_map_used=mapping,
         matched=matched,
+        skipped=skipped,
     )
 
 
-def project_points(homography: np.ndarray, points: list[tuple[float, float]]) -> np.ndarray:
+def project_points(homography: Any, points: list[tuple[float, float]]) -> Any:
+    import cv2
+    import numpy as np
+
     arr = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
     return cv2.perspectiveTransform(arr, homography).reshape(-1, 2)
 
 
-def draw_fiba_court(width_m: float = 28.0, height_m: float = 15.0, pixels_per_meter: int = 40) -> np.ndarray:
+def draw_fiba_court(width_m: float = 28.0, height_m: float = 15.0, pixels_per_meter: int = 40) -> Any:
     """Render a top-down 2D FIBA court with the standard lines.
 
-    This is a sanity-check visualization, not a precise blueprint. Hoops are
-    drawn as small circles; the 3-point line is a single arc per half plus the
-    straight corner segments.
+    This is a sanity-check visualization using the same court geometry as the
+    canonical point map.
     """
+    import math
+
+    import cv2
+    import numpy as np
+
     width_px = int(width_m * pixels_per_meter)
     height_px = int(height_m * pixels_per_meter)
     image = np.full((height_px, width_px, 3), 255, dtype=np.uint8)
     color_court = (40, 40, 40)
     color_paint = (60, 60, 60)
+    line_thickness = 2
 
     def to_px(x_m: float, y_m: float) -> tuple[int, int]:
         return int(round(x_m * pixels_per_meter)), int(round(y_m * pixels_per_meter))
 
+    def pt(label: str) -> tuple[float, float]:
+        return COURT_POINT_MAP[label]
+
+    def radius_m(center_label: str, edge_label: str) -> float:
+        center_x, center_y = pt(center_label)
+        edge_x, edge_y = pt(edge_label)
+        return math.hypot(edge_x - center_x, edge_y - center_y)
+
+    def angle_deg(center_label: str, edge_label: str) -> float:
+        center_x, center_y = pt(center_label)
+        edge_x, edge_y = pt(edge_label)
+        return math.degrees(math.atan2(edge_y - center_y, edge_x - center_x)) % 360
+
+    def arc_angles(start_deg: float, end_deg: float, through_deg: float) -> tuple[int, int]:
+        start_deg %= 360
+        end_deg %= 360
+        through_deg %= 360
+        if (through_deg - start_deg) % 360 <= (end_deg - start_deg) % 360:
+            if start_deg <= end_deg:
+                return int(round(start_deg)), int(round(end_deg))
+            return int(round(start_deg - 360)), int(round(end_deg))
+        if end_deg <= start_deg:
+            return int(round(end_deg)), int(round(start_deg))
+        return int(round(end_deg - 360)), int(round(start_deg))
+
     # Outer boundary.
-    cv2.rectangle(image, to_px(0, 0), to_px(width_m, height_m), color_court, 2)
+    cv2.rectangle(image, to_px(0, 0), to_px(width_m, height_m), color_court, line_thickness)
 
     # Half-court line.
-    cv2.line(image, to_px(width_m / 2, 0), to_px(width_m / 2, height_m), color_court, 2)
-    # Center circle (FIBA 3.6m radius around center court).
-    cv2.circle(image, to_px(width_m / 2, height_m / 2), int(3.6 * pixels_per_meter), color_court, 2)
+    cv2.line(image, to_px(*pt("19")), to_px(*pt("23")), color_court, line_thickness)
+    cv2.circle(
+        image,
+        to_px(*pt("21")),
+        int(round(radius_m("21", "18") * pixels_per_meter)),
+        color_court,
+        line_thickness,
+    )
 
-    for basket_x in (0.0, width_m):
-        sign = 1 if basket_x == 0.0 else -1
-        rim_y = height_m / 2
-        paint_half_width = 2.45
-        three_pt_inset_from_sideline = 0.9
-        corner_x = basket_x + sign * 1.575
-        corner_y_top = rim_y - (paint_half_width + three_pt_inset_from_sideline)
-        corner_y_bot = rim_y + (paint_half_width + three_pt_inset_from_sideline)
-        backboard_y_top = rim_y - 0.9
-        backboard_y_bot = rim_y + 0.9
+    for hoop_label in ("09", "33"):
+        cv2.circle(image, to_px(*pt(hoop_label)), int(round(0.225 * pixels_per_meter)), color_court, line_thickness)
 
-        # Backboard + rim.
-        cv2.line(
-            image,
-            to_px(corner_x, backboard_y_top),
-            to_px(corner_x, backboard_y_bot),
-            color_court,
-            2,
-        )
-        cv2.circle(image, to_px(basket_x, rim_y), int(0.225 * pixels_per_meter), color_court, 2)
+    cv2.rectangle(image, to_px(*pt("04")), to_px(*pt("14")), color_paint, line_thickness)
+    cv2.rectangle(image, to_px(*pt("28")), to_px(*pt("38")), color_paint, line_thickness)
 
-        # Paint / key (4.9m wide x 5.8m deep).
-        cv2.rectangle(
-            image,
-            to_px(basket_x, rim_y - paint_half_width),
-            to_px(basket_x + sign * 5.8, rim_y + paint_half_width),
-            color_paint,
-            2,
-        )
+    cv2.circle(
+        image,
+        to_px(*pt("13")),
+        int(round(radius_m("13", "12") * pixels_per_meter)),
+        color_court,
+        line_thickness,
+    )
+    cv2.circle(
+        image,
+        to_px(*pt("29")),
+        int(round(radius_m("29", "28") * pixels_per_meter)),
+        color_court,
+        line_thickness,
+    )
 
-        # Free-throw circle.
-        cv2.circle(
-            image,
-            to_px(basket_x + sign * 5.8, rim_y),
-            int(3.6 * pixels_per_meter),
-            color_court,
-            2,
-        )
+    cv2.line(image, to_px(*pt("10")), to_px(*pt("11")), color_court, line_thickness)
+    cv2.line(image, to_px(*pt("31")), to_px(*pt("32")), color_court, line_thickness)
 
-        # 3-point line: corner straight segments + arc of 6.75m from rim.
-        cv2.line(image, to_px(corner_x, corner_y_top), to_px(corner_x, corner_y_bot), color_court, 2)
-        arc_center = (int(round(basket_x * pixels_per_meter)), int(round(rim_y * pixels_per_meter)))
-        arc_radius = int(6.75 * pixels_per_meter)
-        # Draw the arc on the side facing the basket. The arc goes from
-        # (corner_x, corner_y_top) to (corner_x, corner_y_bot) sweeping away
-        # from the baseline.
-        if sign == 1:
-            start_angle = 0.0
-            end_angle = 180.0
-        else:
-            start_angle = 180.0
-            end_angle = 360.0
-        cv2.ellipse(
-            image,
-            arc_center,
-            (arc_radius, arc_radius),
-            0,
-            start_angle,
-            end_angle,
-            color=color_court,
-            thickness=2,
-        )
+    left_arc_start, left_arc_end = arc_angles(
+        angle_deg("09", "10"),
+        angle_deg("09", "11"),
+        angle_deg("09", "16"),
+    )
+    right_arc_start, right_arc_end = arc_angles(
+        angle_deg("33", "31"),
+        angle_deg("33", "32"),
+        angle_deg("33", "26"),
+    )
+
+    cv2.ellipse(
+        image,
+        to_px(*pt("09")),
+        tuple([int(round(radius_m("09", "10") * pixels_per_meter))] * 2),
+        0,
+        left_arc_start,
+        left_arc_end,
+        color_court,
+        line_thickness,
+    )
+    cv2.ellipse(
+        image,
+        to_px(*pt("33")),
+        tuple([int(round(radius_m("33", "31") * pixels_per_meter))] * 2),
+        0,
+        right_arc_start,
+        right_arc_end,
+        color_court,
+        line_thickness,
+    )
 
     return image
 
 
-def draw_projected_keypoints(court_image: np.ndarray, homography: np.ndarray, matched: list[dict[str, Any]], pixels_per_meter: int = 40) -> np.ndarray:
+def draw_projected_keypoints(court_image: Any, homography: Any, matched: list[dict[str, Any]], pixels_per_meter: int = 40) -> Any:
+    import cv2
+
     annotated = court_image.copy()
     for entry in matched:
         x_m, y_m = entry["court_meters"]
@@ -305,11 +360,13 @@ def draw_projected_keypoints(court_image: np.ndarray, homography: np.ndarray, ma
 
 def write_court_visualization(
     output_path: Path,
-    homography: np.ndarray,
+    homography: Any,
     matched: list[dict[str, Any]],
     *,
     pixels_per_meter: int = 40,
 ) -> None:
+    import cv2
+
     court = draw_fiba_court(pixels_per_meter=pixels_per_meter)
     annotated = draw_projected_keypoints(court, homography, matched, pixels_per_meter=pixels_per_meter)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +379,10 @@ def homography_result_to_dict(result: HomographyResult, *, blob: dict[str, Any],
         "model_id": blob.get("model_id"),
         "min_confidence": min_confidence,
         "reproj_threshold": reproj_threshold,
+        "geometry_mode": result.geometry_mode,
+        "geometry_statuses_allowed": list(result.geometry_statuses_allowed),
         "matched_points": result.matched,
+        "skipped_points": result.skipped,
         "homography_matrix": result.matrix.tolist(),
         "inliers_count": result.inliers_count,
         "reprojection_error_meters": {
@@ -330,7 +390,8 @@ def homography_result_to_dict(result: HomographyResult, *, blob: dict[str, Any],
             "median": result.reprojection_median_m,
         },
         "court_dimensions_m": {"length": 28.0, "width": 15.0},
-        "court_point_map_used": {label: list(coords) for label, coords in COURT_POINT_MAP.items()},
+        "court_template": template_points(),
+        "court_point_map_used": {label: list(coords) for label, coords in result.point_map_used.items()},
     }
 
 
@@ -346,6 +407,12 @@ def main() -> None:
     parser.add_argument("--min-confidence", type=float, default=0.7, help="Minimum keypoint confidence (default 0.7)")
     parser.add_argument("--min-points", type=int, default=4, help="Minimum matched points to attempt homography (default 4)")
     parser.add_argument("--reproj-threshold", type=float, default=8.0, help="RANSAC reprojection threshold in pixels (default 8.0)")
+    parser.add_argument(
+        "--geometry-mode",
+        choices=sorted(GEOMETRY_MODE_STATUSES),
+        default="strict",
+        help="Canonical geometry filter mode. Both modes currently use the same authoritative mapped labels.",
+    )
     parser.add_argument(
         "--self-test",
         action="store_true",
@@ -373,6 +440,7 @@ def main() -> None:
         min_confidence=args.min_confidence,
         min_points=args.min_points,
         reproj_threshold=args.reproj_threshold,
+        geometry_mode=args.geometry_mode,
     )
 
     output_path = args.output or Path("outputs") / f"{args.keypoints_json.stem}_homography.json"
@@ -394,14 +462,23 @@ def main() -> None:
         write_court_visualization(court_image_path, result.matrix, result.matched)
 
     print(f"Matched points: {len(result.matched)}")
+    print(f"Geometry mode: {result.geometry_mode} ({', '.join(result.geometry_statuses_allowed)})")
     print(f"Inliers: {result.inliers_count}/{len(result.matched)}")
     print(f"Reprojection error (m): mean={result.reprojection_mean_m:.3f} median={result.reprojection_median_m:.3f}")
+    print(f"Used labels: {[entry['label'] for entry in result.matched]}")
+    print(
+        "Skipped labels: "
+        f"{[{ 'label': entry['label'], 'reason': entry['reason'], 'geometry_status': entry['geometry_status'] } for entry in result.skipped]}"
+    )
     print(f"Homography JSON: {output_path}")
     if args.court_image:
         print(f"Court visualization: {court_image_path}")
 
 
 def run_self_test() -> None:
+    import cv2
+    import numpy as np
+
     # Synthetic 4-point square: image pts form a perfect 1m x 1m square in
     # pixel space; FIBA points form a perfect 1m x 1m square. After fitting,
     # the homography should map every image point back to its source within

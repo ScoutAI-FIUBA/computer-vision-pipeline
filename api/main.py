@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import base64
-import os
 import tempfile
 from pathlib import Path
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
-from scripts.detect_players import MODEL_ID, annotate_image, detect_players
+from scripts.detect_players import annotate_image, detect_players
 from scripts.detect_players_video import inspect_video, process_video
+from scripts.env_config import PLAYER_MODEL_ID, get_roboflow_api_key
 
-
-load_dotenv()
 
 app = FastAPI(title="Basketball Player Detection")
 
@@ -31,7 +28,7 @@ def save_upload(file: UploadFile, contents: bytes, default_name: str) -> Path:
 
 @app.post("/detect/image")
 async def detect_image(file: UploadFile = File(...)) -> dict:
-    api_key = os.getenv("ROBOFLOW_API_KEY")
+    api_key = get_roboflow_api_key()
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing ROBOFLOW_API_KEY")
 
@@ -53,7 +50,7 @@ async def detect_image(file: UploadFile = File(...)) -> dict:
             raise HTTPException(status_code=500, detail="Could not encode annotated image")
 
         return {
-            "model_id": MODEL_ID,
+            "model_id": PLAYER_MODEL_ID,
             "predictions": result.get("predictions", []),
             "annotated_image_base64": base64.b64encode(encoded).decode("ascii"),
         }
@@ -89,12 +86,12 @@ async def detect_video(
 
         if dry_run:
             return {
-                "model_id": MODEL_ID,
+                "model_id": PLAYER_MODEL_ID,
                 "dry_run": True,
                 **info,
             }
 
-        api_key = os.getenv("ROBOFLOW_API_KEY")
+        api_key = get_roboflow_api_key()
         if not api_key:
             raise HTTPException(status_code=500, detail="Missing ROBOFLOW_API_KEY")
 

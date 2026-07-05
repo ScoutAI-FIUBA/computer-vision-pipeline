@@ -5,24 +5,30 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import math
 from pathlib import Path
+from statistics import median
 from typing import Any
 
+try:
+    from scripts.court_template import (
+        edges_for_labels,
+        label_class_mapping as template_label_class_mapping,
+        labeled_edges_for_labels,
+        sort_keypoints_by_template,
+    )
+    from scripts.env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
+except ModuleNotFoundError:
+    from court_template import (
+        edges_for_labels,
+        label_class_mapping as template_label_class_mapping,
+        labeled_edges_for_labels,
+        sort_keypoints_by_template,
+    )
+    from env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
 
-API_URL = "https://serverless.roboflow.com"
-DEFAULT_MODEL_ID = "basketball-court-detection-2/22"
-
-# ponytail: placeholder edges until labels are mapped to canonical court positions.
-# These connect keypoints in the order they appear in the parsed list, which is
-# NOT a correct basketball-court skeleton. Replace with a verified mapping as
-# soon as the user publishes label -> canonical point associations.
-def default_court_edges(keypoint_count: int) -> list[tuple[int, int]]:
-    return [(i, i + 1) for i in range(keypoint_count - 1)]
-
-
-COURT_EDGES = default_court_edges
-
+API_URL = ROBOFLOW_API_URL
+DEFAULT_MODEL_ID = COURT_MODEL_ID
 
 def detect_keypoints(image_path: Path, api_key: str, model_id: str) -> dict:
     from inference_sdk import InferenceHTTPClient
@@ -97,11 +103,11 @@ def parse_keypoints(result: dict, min_confidence: float, width: int, height: int
                 "confidence": confidence,
             }
         )
-    return keypoints
+    return sort_keypoints_by_template(keypoints)
 
 
 def label_class_mapping(parsed_keypoints: list[dict]) -> dict[str, int]:
-    return {label: index for index, label in enumerate(sorted({point["label"] for point in parsed_keypoints}))}
+    return template_label_class_mapping([str(point["label"]) for point in parsed_keypoints])
 
 
 def to_keypoints(parsed_keypoints: list[dict]):
@@ -144,7 +150,7 @@ def to_keypoints(parsed_keypoints: list[dict]):
 
 
 def draw_with_annotators(image, key_points) -> Any:
-    """Annotate ``image`` with vertices and edges using Supervision annotators.
+    """Annotate ``image`` with keypoint vertices and labels.
 
     Returns the annotated image. Label text is still drawn with cv2 since the
     Supervision VertexAnnotator only renders circles.
@@ -155,16 +161,8 @@ def draw_with_annotators(image, key_points) -> Any:
     keypoint_count = len(key_points.xy[0]) if len(key_points) > 0 else 0
     annotated = image
     if keypoint_count > 0:
-        # ponytail: EdgeAnnotator crashes on (1, 0, 2) zero-keypoint arrays
-        # (it indexes xy[0] unconditionally), so skip when there is nothing.
         vertex = sv.VertexAnnotator(color=sv.Color.YELLOW, radius=6)
-        edge = sv.EdgeAnnotator(
-            color=sv.Color.YELLOW,
-            thickness=2,
-            edges=COURT_EDGES(keypoint_count),
-        )
         annotated = vertex.annotate(annotated, key_points)
-        annotated = edge.annotate(annotated, key_points)
 
     nested_labels = (key_points.data or {}).get("labels") if key_points.data else None
     labels = nested_labels[0] if nested_labels else []
@@ -194,6 +192,77 @@ def draw_with_annotators(image, key_points) -> Any:
             2,
         )
     return annotated
+
+
+def visible_edges_for_keypoints(key_points) -> list[tuple[int, int]]:
+    labels_data = (key_points.data or {}).get("labels") if key_points.data else None
+    labels = labels_data[0] if labels_data else []
+    if len(labels) < 2 or len(key_points.xy) == 0:
+        return []
+
+    candidate_edges = labeled_edges_for_labels(labels)
+    if len(candidate_edges) <= 1:
+        return edges_for_labels(labels)
+
+    points = key_points.xy[0]
+    distances: list[float] = []
+    edge_distances: dict[tuple[int, int], float] = {}
+    for _, _, start_index, end_index in candidate_edges:
+        start = points[start_index]
+        end = points[end_index]
+        distance = math.hypot(float(start[0]) - float(end[0]), float(start[1]) - float(end[1]))
+        edge_key = (start_index, end_index)
+        edge_distances[edge_key] = distance
+        if distance > 0:
+            distances.append(distance)
+
+    if not distances:
+        return []
+
+    distance_limit = median(distances) * 1.8
+    plausible_edges = [
+        (start_index, end_index)
+        for _, _, start_index, end_index in candidate_edges
+        if edge_distances[(start_index, end_index)] <= distance_limit
+    ]
+    if not plausible_edges:
+        return []
+
+    adjacency: dict[int, set[int]] = {}
+    for start_index, end_index in plausible_edges:
+        adjacency.setdefault(start_index, set()).add(end_index)
+        adjacency.setdefault(end_index, set()).add(start_index)
+
+    best_component: set[int] = set()
+    best_edge_count = -1
+    visited: set[int] = set()
+    for node in adjacency:
+        if node in visited:
+            continue
+        stack = [node]
+        component: set[int] = set()
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.add(current)
+            stack.extend(neighbor for neighbor in adjacency[current] if neighbor not in visited)
+
+        component_edge_count = sum(
+            1 for start_index, end_index in plausible_edges if start_index in component and end_index in component
+        )
+        if component_edge_count > best_edge_count or (
+            component_edge_count == best_edge_count and len(component) > len(best_component)
+        ):
+            best_component = component
+            best_edge_count = component_edge_count
+
+    return [
+        (start_index, end_index)
+        for start_index, end_index in plausible_edges
+        if start_index in best_component and end_index in best_component
+    ]
 
 
 def draw_keypoints(image_path: Path, keypoints: list[dict], output_path: Path) -> None:
@@ -241,16 +310,10 @@ def main() -> None:
     parser.add_argument("--confidence", type=float, default=0.0, help="Minimum keypoint confidence to draw, when provided")
     args = parser.parse_args()
 
-    try:
-        from dotenv import load_dotenv
-    except ModuleNotFoundError as error:
-        raise SystemExit("Missing dependency: python-dotenv. Run `python -m pip install -r requirements.txt`.") from error
-
-    load_dotenv()
-    api_key = os.getenv("ROBOFLOW_API_KEY")
+    api_key = get_roboflow_api_key()
     if not api_key:
         raise SystemExit("Missing ROBOFLOW_API_KEY environment variable")
-    model_id = args.model_id or os.getenv("COURT_MODEL_ID", DEFAULT_MODEL_ID)
+    model_id = args.model_id or DEFAULT_MODEL_ID
 
     output_path = args.output or Path("outputs") / f"{args.image.stem}_court_keypoints.jpg"
     json_output = args.json_output or Path("outputs") / f"{args.image.stem}_court_keypoints.json"
@@ -280,7 +343,6 @@ def main() -> None:
 
     if not keypoints:
         print("Warning: no court keypoints found")
-    # TODO: Homography needs a verified mapping from detected keypoint labels to canonical court coordinates.
     print(f"Keypoints: {len(keypoints)}")
     print(f"Annotated image saved to: {output_path}")
     print(f"Keypoint JSON saved to: {json_output}")

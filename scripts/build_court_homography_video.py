@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Run sampled-frame court keypoint detection + FIBA homography on a video.
 
-WARNING / TODO: this script reuses the best-guess ``COURT_POINT_MAP`` from
-``scripts/build_court_homography.py``. That mapping is an APPROXIMATION
-inferred from a single broadcast-angle frame and is not ground truth. The
-homography produced here must be treated as approximate until the mapping is
-replaced with a real measurement on the target court / camera angle. Every
-downstream consumer of the output video is on the hook for that caveat.
+This script reuses the shared labeled template from
+``scripts/court_template.py`` via ``scripts/build_court_homography.py``. That
+template is the authoritative label -> court-coordinate map for this repo.
 
 The script:
 
@@ -28,7 +25,6 @@ The script:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -37,15 +33,18 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+from env_config import COURT_MODEL_ID, get_roboflow_api_key
+
 
 def _import_homography_helpers():
     from build_court_homography import (
-        COURT_POINT_MAP,
         compute_homography,
         draw_fiba_court,
         draw_projected_keypoints,
     )
-    return COURT_POINT_MAP, compute_homography, draw_fiba_court, draw_projected_keypoints
+    from court_template import canonical_point_map
+
+    return canonical_point_map, compute_homography, draw_fiba_court, draw_projected_keypoints
 
 
 def _import_keypoint_parser():
@@ -109,12 +108,16 @@ def composite_frame(
     )
     if homography_status.get("status") == "ok":
         label += (
+            f"  mode={homography_status.get('geometry_mode', '?')}"
             f"  matched={homography_status.get('matched_count', 0)}"
             f"  inliers={homography_status.get('inliers_count', 0)}"
             f"  mean_err={homography_status.get('reprojection_mean_m', 0.0):.3f}m"
         )
     elif homography_status.get("status") == "insufficient":
-        label += f"  matched={homography_status.get('matched_count', 0)}"
+        label += (
+            f"  mode={homography_status.get('geometry_mode', '?')}"
+            f"  matched={homography_status.get('matched_count', 0)}"
+        )
 
     cv2.putText(
         composite,
@@ -128,7 +131,7 @@ def composite_frame(
     )
     cv2.putText(
         composite,
-        "FIBA court (28m x 15m) - COURT_POINT_MAP is best-guess, not measured",
+        "FIBA court (28m x 15m) - authoritative label template",
         (12, height - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -151,13 +154,15 @@ def process_video(
     output_fps: float | None = None,
     min_points: int = 4,
     reproj_threshold: float = 8.0,
+    geometry_mode: str = "strict",
 ) -> dict:
     import cv2
 
-    COURT_POINT_MAP, compute_homography, _, _ = _import_homography_helpers()
+    canonical_point_map, compute_homography, _, _ = _import_homography_helpers()
     parse_keypoints = _import_keypoint_parser()
     infer_frame, roboflow_client = _import_video_inference()
     default_output_fps, _, open_video, video_info = _import_video_plumbing()
+    point_map = canonical_point_map(geometry_mode)
 
     capture = open_video(video_path)
     fps, frame_count, frames_to_read = video_info(capture, max_frames)
@@ -200,19 +205,22 @@ def process_video(
                 "matched_count": 0,
                 "inliers_count": 0,
                 "reprojection_mean_m": 0.0,
+                "geometry_mode": geometry_mode,
             }
             if frame_index % frame_stride == 0:
                 result = infer_frame(client, frame, f"_{frame_index}.jpg", model_id)
                 calls += 1
                 inferred = True
                 keypoints = parse_keypoints(result, min_confidence, width, height)
-                status["matched_count"] = sum(1 for point in keypoints if point.get("label") in COURT_POINT_MAP)
+                status["matched_count"] = sum(1 for point in keypoints if point.get("label") in point_map)
                 try:
                     homography = compute_homography(
                         keypoints,
                         min_confidence=min_confidence,
                         min_points=min_points,
                         reproj_threshold=reproj_threshold,
+                        geometry_mode=geometry_mode,
+                        point_map=point_map,
                     )
                     frames_with_homography += 1
                     inliers_total += homography.inliers_count
@@ -224,8 +232,11 @@ def process_video(
                         "matched_count": len(homography.matched),
                         "inliers_count": homography.inliers_count,
                         "reprojection_mean_m": homography.reprojection_mean_m,
+                        "geometry_mode": homography.geometry_mode,
                         "matrix": homography.matrix,
                         "matched": homography.matched,
+                        "used_labels": [entry["label"] for entry in homography.matched],
+                        "skipped": homography.skipped,
                     }
                 except ValueError as error:
                     status["status"] = "insufficient"
@@ -250,6 +261,8 @@ def process_video(
         "mean_inliers": (inliers_total / frames_with_homography) if frames_with_homography else 0.0,
         "mean_reprojection_error_m": (error_total / error_count) if error_count else 0.0,
         "output_fps": effective_output_fps,
+        "geometry_mode": geometry_mode,
+        "geometry_points_available": sorted(point_map),
     }
 
 
@@ -291,6 +304,12 @@ def main() -> None:
     )
     parser.add_argument("--min-points", type=int, default=4, help="Minimum matched points to fit a homography (default 4)")
     parser.add_argument("--reproj-threshold", type=float, default=8.0, help="RANSAC reprojection threshold in pixels (default 8.0)")
+    parser.add_argument(
+        "--geometry-mode",
+        choices=("strict", "debug"),
+        default="strict",
+        help="Canonical geometry filter mode. Both modes currently use the same authoritative mapped labels.",
+    )
     args = parser.parse_args()
 
     if args.frame_stride < 1:
@@ -306,16 +325,10 @@ def main() -> None:
     if args.reproj_threshold <= 0:
         raise SystemExit("--reproj-threshold must be greater than 0")
 
-    try:
-        from dotenv import load_dotenv
-    except ModuleNotFoundError as error:
-        raise SystemExit("Missing dependency: python-dotenv. Run `python -m pip install -r requirements.txt`.") from error
-
-    load_dotenv()
-    api_key = os.getenv("ROBOFLOW_API_KEY")
+    api_key = get_roboflow_api_key()
     if not api_key and not args.dry_run:
         raise SystemExit("Missing ROBOFLOW_API_KEY environment variable")
-    model_id = args.model_id or os.getenv("COURT_MODEL_ID", "basketball-court-detection-2/22")
+    model_id = args.model_id or COURT_MODEL_ID
     args.output = args.output or Path("outputs") / f"{args.video.stem}_homography.mp4"
 
     _, inspect_video, _, _ = _import_video_plumbing()
@@ -338,7 +351,10 @@ def main() -> None:
     if not api_key:
         raise SystemExit("Missing ROBOFLOW_API_KEY environment variable")
 
-    print("WARNING: COURT_POINT_MAP is a best-guess approximation; homography is approximate, not measured.")
+    if args.geometry_mode == "debug":
+        print("Geometry mode: debug (same authoritative mapped labels as strict).")
+    else:
+        print("Geometry mode: strict (authoritative mapped labels only).")
 
     try:
         stats = process_video(
@@ -353,11 +369,13 @@ def main() -> None:
             output_fps=args.output_fps,
             min_points=args.min_points,
             reproj_threshold=args.reproj_threshold,
+            geometry_mode=args.geometry_mode,
         )
     except RuntimeError as error:
         raise SystemExit(str(error)) from error
 
     print(f"Model ID: {stats['model_id']}")
+    print(f"Geometry mode: {stats['geometry_mode']}")
     print(f"Frames read: {stats['frames_read']}/{stats['frame_count'] or 'unknown'}")
     print(f"Roboflow calls: {stats['roboflow_calls']}")
     print(f"Frames with homography: {stats['frames_with_homography']}")

@@ -35,13 +35,13 @@ This backlog documents the implementation work needed to evolve the current Robo
 
 ### Task 1.1: Centralize model configuration
 
-- [ ] Move model IDs into a small config module or `.env` variables.
-- [ ] Support at least:
+- [x] Move model IDs into a small config module or `.env` variables.
+- [x] Support at least:
   - `ROBOFLOW_API_KEY`
   - `PLAYER_MODEL_ID`
   - `COURT_MODEL_ID`
   - `JERSEY_OCR_MODEL_ID`
-- [ ] Keep defaults aligned with the currently working player model.
+- [x] Keep defaults aligned with the currently working player model.
 
 Acceptance criteria:
 
@@ -50,14 +50,21 @@ Acceptance criteria:
 
 ### Task 1.2: Save raw inference outputs
 
-- [ ] Add optional `--save-json` to image and video scripts.
-- [ ] For video, save one JSON record per inferred frame.
-- [ ] Include frame index, timestamp, model ID, and predictions.
+- [x] Add optional `--save-json` to image and video scripts.
+- [x] For video, save one JSON record per inferred frame.
+- [x] Include frame index, timestamp, model ID, and predictions.
 
 Acceptance criteria:
 
 - Detection outputs can be inspected without re-calling Roboflow.
 - Failed/interesting frames can be replayed offline.
+
+Notes:
+
+- Video raw inference output is now emitted as JSONL from `scripts/video_pipeline.py`
+  and `scripts/track_players_video.py`.
+- Current per-inference record includes `frame_index`, `timestamp_seconds`,
+  `model_id`, and `predictions`.
 
 ### Task 1.3: Add frame extraction utility
 
@@ -108,9 +115,23 @@ Acceptance criteria:
 
 Notes:
 
-- Implemented locally in `scripts/track_players_video.py` only; not API-integrated yet.
+- Implemented locally in `scripts/track_players_video.py` and exposed through the
+  unified entrypoint `scripts/video_pipeline.py`; not API-integrated yet.
 - Default output writes only inferred frames to avoid implying continuous tracking across skipped frames.
 - Next step is track smoothing/interpolation and then API integration if local behavior is good enough.
+
+## Recommended next task
+
+**Recommended next implementation task: Task 3.2 — Add track-level smoothing.**
+
+Why this is next now:
+
+- The repo already has config centralization, raw inference JSONL output, and a
+  unified video pipeline entrypoint for player detection + tracking.
+- The highest-value improvement for the current pipeline is visual stability and
+  less misleading tracked output between sampled frames.
+- `Task 1.3` (frame extraction utility) is still useful, but it is now a
+  support tool rather than the main pipeline bottleneck.
 
 ### Task 3.2: Add track-level smoothing
 

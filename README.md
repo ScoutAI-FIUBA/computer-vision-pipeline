@@ -18,6 +18,103 @@ Video processing can make many Roboflow calls. Run `dry_run=true` first to estim
 
 These scripts are local pipeline steps only. The tracking and court keypoint scripts are not integrated into the API yet.
 
+## Script Roles
+
+This repo currently has one main local video entrypoint plus a set of focused
+tools. Keep that distinction clear so the pipeline can evolve without turning
+every experiment into the "official" path.
+
+### Main entrypoints
+
+Use these first.
+
+| Script | Role | When to use it |
+| --- | --- | --- |
+| `scripts/video_pipeline.py` | Main local video pipeline | Run the current player-detection + tracking pipeline with annotated video, track JSONL, and raw inference JSONL. |
+| `scripts/detect_players.py` | Main single-image detector | Run player detection on one local image/frame. |
+
+### Local support tools
+
+These are useful, but they are support/debug tools rather than the primary
+workflow.
+
+| Script | Role | When to use it |
+| --- | --- | --- |
+| `scripts/extract_video_frames.py` | Offline frame extraction | Sample a local video into JPG frames without calling Roboflow. |
+| `scripts/detect_players_video.py` | Detection-only video helper | Inspect or run sampled video detection without tracking; also provides reusable video helpers. |
+| `scripts/track_players_video.py` | Tracking core | Core ByteTrack processing used by `video_pipeline.py`; still useful directly for focused tracking/debug work. |
+| `scripts/detect_court_keypoints.py` | Court keypoints on one image | Test court landmarks on a single frame. |
+| `scripts/detect_court_keypoints_video.py` | Court keypoints on sampled video | Evaluate court keypoint behavior across a clip. |
+| `scripts/build_court_homography.py` | Homography from saved keypoints | Turn detected court keypoints into a FIBA homography and debug reprojection quality. |
+| `scripts/build_court_homography_video.py` | Video homography debug | Build a side-by-side debug video for court projection quality checks. |
+
+### Shared infrastructure
+
+| Script | Role |
+| --- | --- |
+| `scripts/env_config.py` | Shared `.env`-backed configuration for model IDs, API key, and Roboflow endpoint. |
+
+### Current direction
+
+- Treat `scripts/video_pipeline.py` as the canonical local video path.
+- Treat court/homography scripts as separate debug/evaluation tools until they
+  are intentionally integrated into the main pipeline.
+- Add new stages to the pipeline by reusing these support tools first, then
+  folding only the stable pieces into the main entrypoint.
+
+## Integration roadmap
+
+This is the intended path so future work stays understandable.
+
+### 1. Keep as the main pipeline
+
+These belong in `scripts/video_pipeline.py` because they are part of the core
+"process one local video and inspect the result" workflow.
+
+| Stage | Status | Notes |
+| --- | --- | --- |
+| Player detection | Integrated | Current base stage. |
+| ByteTrack tracking | Integrated | Includes conservative smoothing and optional stale-track reuse. |
+| Raw inference JSONL | Integrated | One record per inferred frame. |
+| Court keypoints | Next integration candidate | Integrate only after the current debug flow is stable enough. |
+| Court homography / player projection | Later integration candidate | Depends on trustworthy keypoint labels and court mapping. |
+| Team identification | Future | Add after tracking and court projection are stable. |
+| Jersey OCR | Future | Add after track crops and team separation are reliable. |
+| Event logic / make-miss | Future | Depends on stable tracking + court geometry. |
+
+### 2. Keep as external tools for now
+
+These remain outside the main pipeline until their outputs are trustworthy and
+their role is clear.
+
+| Script | Why it stays external for now |
+| --- | --- |
+| `scripts/extract_video_frames.py` | Operator tooling for offline inspection, not part of inference/render. |
+| `scripts/detect_players_video.py` | Detection-only helper and source of reusable video utilities. |
+| `scripts/track_players_video.py` | Processing core used by the main pipeline, but still useful as a focused debug tool. |
+| `scripts/detect_court_keypoints.py` | Single-frame evaluation tool for court landmarks. |
+| `scripts/detect_court_keypoints_video.py` | Sampled-video evaluation tool for court landmarks. |
+| `scripts/build_court_homography.py` | Local geometry/debug tool for checking court mapping quality. |
+| `scripts/build_court_homography_video.py` | Side-by-side projection debug tool before main-pipeline integration. |
+
+### 3. Candidates to merge or retire later
+
+- `scripts/detect_players_video.py`: keep while it provides reusable helpers;
+  retire it as a user-facing entrypoint once `video_pipeline.py` fully replaces
+  it for normal video work.
+- `scripts/track_players_video.py`: keep as the implementation core unless it
+  becomes thin enough to fold directly into `video_pipeline.py` without making
+  that file ugly.
+- Court and homography scripts: keep separate until the integration path is
+  proven; do not merge them early just to reduce file count.
+
+### Rule of thumb
+
+- If a script is used to process the normal local video workflow, it belongs in
+  or behind `scripts/video_pipeline.py`.
+- If a script exists to inspect, validate, calibrate, or debug one stage, keep
+  it as a support tool until the stage is stable.
+
 Detect court keypoints on one frame:
 
 ```bash
@@ -29,8 +126,8 @@ Defaults:
 - Output image: `outputs/<image-stem>_court_keypoints.jpg`.
 - Keypoint JSON: `outputs/<image-stem>_court_keypoints.json` with `model_id`, `raw_result`, normalized `keypoints`, and a `keypoints_sv` summary (`xy`, `labels`, `class_ids`, `keypoint_confidence`).
 - Court model: `COURT_MODEL_ID` or `basketball-court-detection-2/22`.
-- Visualization uses Supervision `sv.KeyPoints` with `sv.VertexAnnotator` (yellow circles + label text) and `sv.EdgeAnnotator` (placeholder consecutive edges until labels are mapped to canonical court positions).
-- Homography is pending until detected keypoint names are mapped to canonical court coordinates.
+- Visualization uses Supervision `sv.KeyPoints` with `sv.VertexAnnotator` (yellow circles + label text) and `sv.EdgeAnnotator` driven by the shared semantic court template.
+- Homography uses the shared authoritative label -> court-coordinate map in `scripts/court_template.py`.
 
 Dry-run court keypoints on a video, no Roboflow call:
 
@@ -55,9 +152,9 @@ Defaults:
 Build a FIBA court homography from a keypoints JSON. This is the local-only
 step that maps detected keypoint labels to FIBA (28m x 15m) court
 coordinates. Output is a homography matrix plus reprojection stats. The
-internal `COURT_POINT_MAP` is a **best-guess approximation** inferred from a
-single broadcast-angle frame; replace it with a real measurement before
-trusting downstream stats. No Roboflow call is made.
+scripts share one explicit numbered court template and use the provided
+authoritative label -> coordinate map. Labels still missing from that map stay
+semantic-only and are skipped. No Roboflow call is made.
 
 ```bash
 python3 scripts/build_court_homography.py outputs/frame_court_keypoints.json \
@@ -82,7 +179,7 @@ Run sampled-frame court keypoint detection + FIBA homography on a video, no API 
 python3 scripts/build_court_homography_video.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
 ```
 
-Build a side-by-side debug video (original frame | FIBA 2D court with projected keypoints) per sampled frame. Reuses the same `COURT_POINT_MAP` and RANSAC math as `build_court_homography.py`; the map is still a best-guess approximation, see that script's section.
+Build a side-by-side debug video (original frame | FIBA 2D court with projected keypoints) per sampled frame. Reuses the same shared court template and RANSAC math as `build_court_homography.py`.
 
 ```bash
 python3 scripts/build_court_homography_video.py media/game.mp4 --frame-stride 30 --max-frames 300

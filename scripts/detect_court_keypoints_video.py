@@ -4,17 +4,20 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-API_URL = "https://serverless.roboflow.com"
-DEFAULT_MODEL_ID = "basketball-court-detection-2/22"
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+
+from env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key  # noqa: E402
+from annotation_helpers import DEFAULT_ANNOTATION_COLOR, format_label  # noqa: E402
+
+API_URL = ROBOFLOW_API_URL
+DEFAULT_MODEL_ID = COURT_MODEL_ID
 
 from detect_court_keypoints import parse_keypoints  # noqa: E402  (sys.path tweak above)
 from detect_players_video import (  # noqa: E402
@@ -49,13 +52,13 @@ def infer_frame(client, frame, suffix: str, model_id: str) -> dict:
 def draw_keypoints(frame, keypoints: list[dict]) -> None:
     import cv2
 
+    color = DEFAULT_ANNOTATION_COLOR
+
     for point in keypoints:
         x, y = int(round(point["x"])), int(round(point["y"]))
-        label = str(point["label"])
-        if point.get("confidence") is not None:
-            label = f"{label} {point['confidence']:.2f}"
-        cv2.circle(frame, (x, y), 5, (0, 255, 255), -1)
-        cv2.putText(frame, label, (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        label = format_label(point["label"], point.get("confidence"))
+        cv2.circle(frame, (x, y), 5, color, -1)
+        cv2.putText(frame, label, (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     if not keypoints:
         cv2.putText(
@@ -64,7 +67,7 @@ def draw_keypoints(frame, keypoints: list[dict]) -> None:
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
-            (0, 255, 255),
+            color,
             2,
         )
 
@@ -187,16 +190,10 @@ def main() -> None:
     if args.output_fps is not None and args.output_fps <= 0:
         raise SystemExit("--output-fps must be greater than 0")
 
-    try:
-        from dotenv import load_dotenv
-    except ModuleNotFoundError as error:
-        raise SystemExit("Missing dependency: python-dotenv. Run `python -m pip install -r requirements.txt`.") from error
-
-    load_dotenv()
-    api_key = os.getenv("ROBOFLOW_API_KEY")
+    api_key = get_roboflow_api_key()
     if not api_key and not args.dry_run:
         raise SystemExit("Missing ROBOFLOW_API_KEY environment variable")
-    model_id = args.model_id or os.getenv("COURT_MODEL_ID", DEFAULT_MODEL_ID)
+    model_id = args.model_id or DEFAULT_MODEL_ID
     args.output = args.output or Path("outputs") / f"{args.video.stem}_court_keypoints.mp4"
 
     try:
