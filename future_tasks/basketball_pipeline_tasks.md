@@ -13,7 +13,7 @@ This backlog documents the implementation work needed to evolve the current Robo
 | Tracking | Local ByteTrack script implemented for sampled inferred frames; API integration and smoothing are pending. |
 | Team identification | Not implemented yet. |
 | Jersey OCR | Not implemented yet. |
-| Court keypoints / homography | Not implemented yet. |
+| Court keypoints / homography | Local image/frame keypoint script implemented; local homography script implemented with a best-guess `COURT_POINT_MAP` (TODO: real measurement). |
 | SAM 2 tracking | Not implemented yet. Optional, not MVP-first. |
 
 ## Implementation Order
@@ -137,20 +137,41 @@ Acceptance criteria:
 
 ### Task 4.1: Integrate court keypoint model
 
-- [ ] Add model ID for `basketball-court-detection-2`.
-- [ ] Run court inference on sampled frames.
-- [ ] Save keypoints and confidence values.
+- [x] Add configurable model ID for `basketball-court-detection-2` in the local image/frame script.
+- [x] Run court inference on a single frame.
+- [x] Save keypoints and confidence values.
+- [x] Run court inference on sampled video frames.
 
 Acceptance criteria:
 
 - Court keypoints are visible on annotated debug frames.
 - The script reports when not enough keypoints are detected.
 
+Notes:
+
+- Implemented locally in `scripts/detect_court_keypoints.py` (single image) and `scripts/detect_court_keypoints_video.py` (sampled video). Not API-integrated yet.
+- Default model is `COURT_MODEL_ID` or `basketball-court-detection-2/22`.
+- Video script defaults: `--confidence 0.7` (model returns ~33 raw keypoints but most are noise <0.05; only ~10-12 are reliable >0.97), `--frame-stride 30`, `--sampled-output-only true`. Uses the same `parse_keypoints` helper as the image script.
+- Image visualization now uses Supervision `sv.KeyPoints` + `sv.VertexAnnotator` + `sv.EdgeAnnotator` (see `to_keypoints` and `draw_with_annotators` in `scripts/detect_court_keypoints.py`). The edges list is a placeholder that connects consecutive parsed keypoints — replace with the canonical court skeleton once labels are mapped.
+
 ### Task 4.2: Compute homography
 
-- [ ] Map detected court keypoints to canonical court coordinates.
-- [ ] Use OpenCV `findHomography` with RANSAC.
+- [x] Map detected court keypoints to canonical court coordinates.
+- [x] Use OpenCV `findHomography` with RANSAC.
+- [x] Per-sampled-frame homography in a debug video (original | FIBA 2D court with projected keypoints).
 - [ ] Project player foot points onto court coordinates.
+
+Notes:
+
+- Implemented locally in `scripts/build_court_homography.py` (RANSAC, 8 px
+  threshold by default; `--self-test` for a synthetic round-trip check; no
+  Roboflow call) and `scripts/build_court_homography_video.py` (sampled
+  frames, side-by-side debug MP4 with frame index, status, inliers count and
+  mean reprojection error in meters). The internal `COURT_POINT_MAP` is a
+  **best-guess approximation** inferred from a single broadcast-angle frame
+  and must be replaced with a real measurement before production use. Next
+  step is to wire this homography into the tracking pipeline so player foot
+  points can be projected onto court coordinates.
 
 Acceptance criteria:
 
@@ -366,10 +387,17 @@ These are valid directions, but they should wait until the simpler pipeline fail
 
 ## Next Immediate Task
 
-Implement Supervision conversion and annotation:
+Wire the homography into the tracking pipeline so player positions can be
+projected to FIBA court coordinates.
 
 ```text
-Roboflow result -> sv.Detections -> BoxAnnotator/LabelAnnotator -> video output
+court keypoints -> COURT_POINT_MAP -> cv2.findHomography
+tracked player foot points -> cv2.perspectiveTransform -> court coordinates
 ```
 
-Why this next: it deletes custom annotation code and prepares the project for ByteTrack, filtering, metrics, and dataset tooling.
+Why this next: the local homography script is in place
+(`scripts/build_court_homography.py`); the missing piece is using it on every
+tracked frame so downstream code can reason in meters instead of pixels. The
+mapping is still a best-guess, so any real measurement on the target court
+should land in `COURT_POINT_MAP` before relying on shot charts or spatial
+stats.
