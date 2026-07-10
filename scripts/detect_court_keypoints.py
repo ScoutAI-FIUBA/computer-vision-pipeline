@@ -11,6 +11,7 @@ from statistics import median
 from typing import Any
 
 try:
+    from scripts.annotation_helpers import annotate_points
     from scripts.court_template import (
         edges_for_labels,
         label_class_mapping as template_label_class_mapping,
@@ -19,6 +20,7 @@ try:
     )
     from scripts.env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
 except ModuleNotFoundError:
+    from annotation_helpers import annotate_points
     from court_template import (
         edges_for_labels,
         label_class_mapping as template_label_class_mapping,
@@ -149,13 +151,41 @@ def to_keypoints(parsed_keypoints: list[dict]):
     )
 
 
+def keypoint_records(key_points) -> list[dict[str, Any]]:
+    if len(key_points) == 0 or len(key_points.xy) == 0:
+        return []
+
+    data = key_points.data or {}
+    labels = data.get("labels") or [[]]
+    class_ids = data.get("class_ids") or [[]]
+    confidences = key_points.keypoint_confidence[0] if key_points.keypoint_confidence is not None else []
+
+    records: list[dict[str, Any]] = []
+    for index, point in enumerate(key_points.xy[0]):
+        if not hasattr(point, "__len__") or len(point) < 2:
+            continue
+        label = labels[0][index] if labels and index < len(labels[0]) else "keypoint"
+        class_id = class_ids[0][index] if class_ids and index < len(class_ids[0]) else None
+        confidence = float(confidences[index]) if index < len(confidences) else None
+        records.append(
+            {
+                "x": float(point[0]),
+                "y": float(point[1]),
+                "label": str(label),
+                "class_id": None if class_id is None else int(class_id),
+                "confidence": confidence,
+                "visible": True,
+            }
+        )
+    return records
+
+
 def draw_with_annotators(image, key_points) -> Any:
     """Annotate ``image`` with keypoint vertices and labels.
 
     Returns the annotated image. Label text is still drawn with cv2 since the
     Supervision VertexAnnotator only renders circles.
     """
-    import cv2
     import supervision as sv
 
     keypoint_count = len(key_points.xy[0]) if len(key_points) > 0 else 0
@@ -164,39 +194,17 @@ def draw_with_annotators(image, key_points) -> Any:
         vertex = sv.VertexAnnotator(color=sv.Color.YELLOW, radius=6)
         annotated = vertex.annotate(annotated, key_points)
 
-    nested_labels = (key_points.data or {}).get("labels") if key_points.data else None
-    labels = nested_labels[0] if nested_labels else []
-    for point, label in zip(key_points.xy[0], labels):
-        if hasattr(point, "__len__") and len(point) >= 2:
-            x, y = int(round(float(point[0]))), int(round(float(point[1])))
-        else:
-            continue
-        cv2.putText(
-            annotated,
-            str(label),
-            (x + 6, y - 6),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 255),
-            2,
-        )
-
-    if not labels:
-        cv2.putText(
-            annotated,
-            "No court keypoints found",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 255),
-            2,
-        )
-    return annotated
+    return annotate_points(
+        annotated,
+        keypoint_records(key_points),
+        empty_label="No court keypoints found",
+        draw_markers=False,
+    )
 
 
 def visible_edges_for_keypoints(key_points) -> list[tuple[int, int]]:
-    labels_data = (key_points.data or {}).get("labels") if key_points.data else None
-    labels = labels_data[0] if labels_data else []
+    records = keypoint_records(key_points)
+    labels = [record["label"] for record in records]
     if len(labels) < 2 or len(key_points.xy) == 0:
         return []
 
@@ -351,30 +359,18 @@ def main() -> None:
 def _supervision_summary(parsed_keypoints: list[dict]) -> dict[str, Any] | None:
     """Compact, JSON-friendly summary of the Supervision KeyPoints view."""
     try:
-        import numpy as np
+        key_points = to_keypoints(parsed_keypoints)
     except ModuleNotFoundError:
         return None
 
-    if not parsed_keypoints:
-        return {
-            "xy": [],
-            "labels": [],
-            "class_ids": [],
-            "keypoint_confidence": [],
-        }
-
-    class_lookup = label_class_mapping(parsed_keypoints)
-    xy = [[float(point["x"]), float(point["y"])] for point in parsed_keypoints]
-    labels = [point["label"] for point in parsed_keypoints]
-    class_ids = [class_lookup[label] for label in labels]
-    confidences = [point.get("confidence") for point in parsed_keypoints]
+    records = keypoint_records(key_points)
     return {
-        "xy": xy,
-        "labels": labels,
-        "class_ids": class_ids,
+        "xy": [[record["x"], record["y"]] for record in records],
+        "labels": [record["label"] for record in records],
+        "class_ids": [record["class_id"] for record in records],
         "keypoint_confidence": [
-            float(confidence) if confidence is not None else None
-            for confidence in confidences
+            None if record["confidence"] is None else float(record["confidence"])
+            for record in records
         ],
     }
 

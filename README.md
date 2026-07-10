@@ -1,6 +1,6 @@
 # computer-vision-pipeline
 
-Minimal Roboflow/Supervision prototype for basketball player detection.
+Minimal Roboflow/Supervision basketball pipeline for sampled video detection, tracking, and court-projection debugging.
 
 ## Setup
 
@@ -16,7 +16,7 @@ Video processing can make many Roboflow calls. Run `dry_run=true` first to estim
 
 ## Local Scripts
 
-These scripts are local pipeline steps only. The tracking and court keypoint scripts are not integrated into the API yet.
+These scripts are local pipeline steps first. The local CLI path is ahead of the API path.
 
 ## Script Roles
 
@@ -47,6 +47,7 @@ workflow.
 | `scripts/detect_court_keypoints_video.py` | Court keypoints on sampled video | Evaluate court keypoint behavior across a clip. |
 | `scripts/build_court_homography.py` | Homography from saved keypoints | Turn detected court keypoints into a FIBA homography and debug reprojection quality. |
 | `scripts/build_court_homography_video.py` | Video homography debug | Build a side-by-side debug video for court projection quality checks. |
+| `scripts/visualize_projected_tracks.py` | Top-down projected-track debug | Render projected player positions from JSONL onto a FIBA court as a PNG or simple MP4. |
 
 ### Shared infrastructure
 
@@ -57,10 +58,30 @@ workflow.
 ### Current direction
 
 - Treat `scripts/video_pipeline.py` as the canonical local video path.
-- Treat court/homography scripts as separate debug/evaluation tools until they
-  are intentionally integrated into the main pipeline.
+- Keep court/homography tools integrated only where they already help the local pipeline (`--court-keypoints` plus projected-track JSONL), and keep the heavier debug/evaluation scripts separate.
 - Add new stages to the pipeline by reusing these support tools first, then
   folding only the stable pieces into the main entrypoint.
+
+## Current Status
+
+Implemented now:
+
+- Shared annotation helpers now cover player detection, tracking, and court keypoint visualization.
+- `scripts/video_pipeline.py` can run sampled player tracking, optional court keypoints, and projected-track JSONL export in one local pass.
+- Homography fitting now includes geometric pre-validation before `cv2.findHomography`, so obviously degenerate keypoint layouts are rejected early.
+- Projected-track debugging is available through `scripts/visualize_projected_tracks.py`.
+- Tracking keeps short-lived predicted tracks for brief missed sampled detections.
+- A lightweight torso-color appearance re-ID baseline can reassign some recently lost tracks.
+
+Known limitations:
+
+- Player IDs still switch during crossings and occlusions.
+- Some crossing/occlusion cases still lose tracking entirely.
+- `--frame-stride 1` is slower and more expensive, and it still does not solve identity consistency by itself.
+- Current appearance re-ID is a cheap baseline, not a robust identity solution.
+- The current `sv.ByteTrack()` usage should be revisited because the tracker API now emits a deprecation warning.
+
+See `TRACKING_ISSUES.md` for the short list of unresolved tracking failures and recommended next actions.
 
 ## Integration roadmap
 
@@ -74,10 +95,10 @@ These belong in `scripts/video_pipeline.py` because they are part of the core
 | Stage | Status | Notes |
 | --- | --- | --- |
 | Player detection | Integrated | Current base stage. |
-| ByteTrack tracking | Integrated | Includes conservative smoothing and optional stale-track reuse. |
+| ByteTrack tracking | Integrated with limitations | Includes smoothing, short-lived predicted persistence, and lightweight appearance-based reassignment, but ID switches and full losses still happen in crossings/occlusions. |
 | Raw inference JSONL | Integrated | One record per inferred frame. |
-| Court keypoints | Next integration candidate | Integrate only after the current debug flow is stable enough. |
-| Court homography / player projection | Later integration candidate | Depends on trustworthy keypoint labels and court mapping. |
+| Court keypoints | Partially integrated | Available through `--court-keypoints` in the local video pipeline, with separate debug scripts still retained. |
+| Court homography / player projection | Partially integrated | Projected-track JSONL export exists in the local pipeline; broader downstream use still depends on trustworthy keypoints and mapping. |
 | Team identification | Future | Add after tracking and court projection are stable. |
 | Jersey OCR | Future | Add after track crops and team separation are reliable. |
 | Event logic / make-miss | Future | Depends on stable tracking + court geometry. |
@@ -115,6 +136,51 @@ their role is clear.
 - If a script exists to inspect, validate, calibrate, or debug one stage, keep
   it as a support tool until the stage is stable.
 
+Run the main local video pipeline, no Roboflow call:
+
+```bash
+python3 scripts/video_pipeline.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
+```
+
+Run the main local video pipeline with tracking only:
+
+```bash
+python3 scripts/video_pipeline.py media/game.mp4 --frame-stride 30 --max-frames 300
+```
+
+Run the main local video pipeline with court keypoints and projected-track export:
+
+```bash
+python3 scripts/video_pipeline.py media/game.mp4 \
+  --court-keypoints \
+  --frame-stride 30 \
+  --max-frames 300
+```
+
+Main pipeline defaults:
+
+- Output video: `outputs/<video-stem>_pipeline.mp4`.
+- Track records: `outputs/<video-stem>_tracks.jsonl`.
+- Raw inference JSONL: `outputs/<video-stem>_inference.jsonl`.
+- With `--court-keypoints`, also writes `outputs/<video-stem>_court_keypoints.jsonl` and `outputs/<video-stem>_projected_tracks.jsonl`.
+- `--save-json` defaults to `true`.
+- `--sampled-output-only` defaults to `true`.
+- `--persist-tracks` defaults to `true` with `--max-missing-sampled-frames 1`.
+- `--smoothing-window` defaults to `1`.
+- `--court-confidence` defaults to `0.7` when court keypoints are enabled.
+
+Projected-track visualization from pipeline output:
+
+```bash
+python3 scripts/visualize_projected_tracks.py outputs/game_projected_tracks.jsonl --output-video outputs/game_projected_tracks_court.mp4
+```
+
+Visualizer defaults:
+
+- Summary PNG: `outputs/<projected-jsonl-stem>_court_debug.png`.
+- Optional `--output-video` renders a simple top-down MP4 without new Roboflow calls.
+- `--pixels-per-meter` default `40`, `--point-radius` default `6`, `--output-fps` default `5.0`.
+
 Detect court keypoints on one frame:
 
 ```bash
@@ -149,12 +215,13 @@ Defaults:
 - `--frame-stride` default `30`; Roboflow calls are counted and printed at the end.
 - Drawing style mirrors `detect_court_keypoints.py`: yellow circle + label, with `no reliable keypoints` overlay when the filter empties a frame.
 
-Build a FIBA court homography from a keypoints JSON. This is the local-only
-step that maps detected keypoint labels to FIBA (28m x 15m) court
-coordinates. Output is a homography matrix plus reprojection stats. The
-scripts share one explicit numbered court template and use the provided
-authoritative label -> coordinate map. Labels still missing from that map stay
-semantic-only and are skipped. No Roboflow call is made.
+Build a FIBA court homography from a keypoints JSON. This local-only step maps
+detected court labels to FIBA (28m x 15m) coordinates. Output is a homography
+matrix plus reprojection stats. The scripts share one explicit numbered court
+template and use the authoritative label -> coordinate map. Labels missing
+from that map stay semantic-only and are skipped. A geometric pre-validation
+step now rejects obviously degenerate point layouts before homography fitting.
+No Roboflow call is made.
 
 ```bash
 python3 scripts/build_court_homography.py outputs/frame_court_keypoints.json \
@@ -170,6 +237,7 @@ Defaults:
 - `--min-confidence` default `0.7` (filters model noise; raise to drop more).
 - `--min-points` default `4` (minimum matched points to attempt a homography).
 - `--reproj-threshold` default `8.0` (RANSAC threshold in pixels).
+- Degenerate keypoint layouts are rejected before `cv2.findHomography` based on spread and convex-hull area checks.
 - `--self-test` runs a synthetic 4-point round-trip check and exits, useful
   for CI / wiring checks without needing a real keypoints JSON.
 
@@ -210,8 +278,11 @@ Defaults:
 
 - Output video: `outputs/<video-stem>_tracked.mp4`.
 - Track records: `outputs/<video-stem>_tracks.jsonl` with `frame_index`, `track_id`, `class_name`, `confidence`, and `xyxy`.
+- With `--court-keypoints`, also writes per-frame court keypoints JSONL and projected-track JSONL.
 - `--sampled-output-only` defaults to `true`, so only Roboflow-inferred frames are written and tracked.
 - `--no-sampled-output-only` writes skipped frames unannotated; it does not pretend tracking is continuous between sampled detections.
+- `--persist-tracks` defaults to `true` and keeps recent track IDs alive for brief missed sampled detections using predicted boxes.
+- The current appearance reassignment is a lightweight torso-color baseline, not a full re-ID system.
 - Tracking requires `ROBOFLOW_API_KEY` for non-dry runs.
 
 ## API

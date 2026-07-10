@@ -61,8 +61,23 @@ class HomographyResult:
     geometry_mode: str
     geometry_statuses_allowed: tuple[str, ...]
     point_map_used: dict[str, tuple[float, float]]
+    validation: dict[str, Any]
     matched: list[dict[str, Any]]
     skipped: list[dict[str, Any]]
+
+
+@dataclass
+class KeypointGeometryValidation:
+    ok: bool
+    reasons: list[str]
+    stats: dict[str, Any]
+
+
+class GeometryValidationError(ValueError):
+    def __init__(self, validation: KeypointGeometryValidation):
+        self.validation = validation
+        reason_text = ", ".join(validation.reasons) if validation.reasons else "unknown"
+        super().__init__(f"Keypoint geometry rejected before homography: {reason_text}")
 
 
 def load_keypoints_json(path: Path) -> dict[str, Any]:
@@ -95,6 +110,67 @@ def extract_keypoints(blob: dict[str, Any]) -> list[dict[str, Any]]:
         confidence = confidences[index] if index < len(confidences) else None
         out.append({"label": str(label), "x": float(point[0]), "y": float(point[1]), "confidence": confidence})
     return out
+
+
+def validate_keypoint_geometry(
+    matched: list[dict[str, Any]],
+    *,
+    min_points: int,
+    min_image_span_px: float = 40.0,
+    min_hull_area_px2: float = 1200.0,
+) -> KeypointGeometryValidation:
+    import numpy as np
+
+    image_points = np.asarray([entry["image_xy"] for entry in matched], dtype=np.float32) if matched else np.empty((0, 2), dtype=np.float32)
+    distinct_labels = len({entry["label"] for entry in matched})
+    x_span = float(np.ptp(image_points[:, 0])) if len(image_points) else 0.0
+    y_span = float(np.ptp(image_points[:, 1])) if len(image_points) else 0.0
+
+    hull_area = 0.0
+    if len(image_points) >= 3:
+        order = np.lexsort((image_points[:, 1], image_points[:, 0]))
+        sorted_points = image_points[order]
+
+        def cross(origin, a, b) -> float:
+            return float((a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0]))
+
+        lower: list[Any] = []
+        for point in sorted_points:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+                lower.pop()
+            lower.append(point)
+
+        upper: list[Any] = []
+        for point in reversed(sorted_points):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+                upper.pop()
+            upper.append(point)
+
+        hull = np.asarray(lower[:-1] + upper[:-1], dtype=np.float32)
+        if len(hull) >= 3:
+            x = hull[:, 0]
+            y = hull[:, 1]
+            hull_area = float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) * 0.5)
+
+    stats = {
+        "matched_points": len(matched),
+        "distinct_labels": distinct_labels,
+        "image_x_span_px": x_span,
+        "image_y_span_px": y_span,
+        "image_hull_area_px2": hull_area,
+    }
+    reasons: list[str] = []
+    if len(matched) < min_points:
+        reasons.append("insufficient_points")
+    if distinct_labels < min_points:
+        reasons.append("insufficient_distinct_labels")
+    if x_span < min_image_span_px:
+        reasons.append("insufficient_x_spread")
+    if y_span < min_image_span_px:
+        reasons.append("insufficient_y_spread")
+    if len(matched) >= 3 and hull_area < min_hull_area_px2:
+        reasons.append("degenerate_area")
+    return KeypointGeometryValidation(ok=not reasons, reasons=reasons, stats=stats)
 
 
 def compute_homography(
@@ -161,11 +237,9 @@ def compute_homography(
             }
         )
 
-    if len(matched) < min_points:
-        raise ValueError(
-            f"Need at least {min_points} matched points to fit a homography; got {len(matched)} "
-            f"(skipped: {len(skipped)}, geometry mode: {geometry_mode})."
-        )
+    validation = validate_keypoint_geometry(matched, min_points=min_points)
+    if not validation.ok:
+        raise GeometryValidationError(validation)
 
     src = np.asarray(src_pts, dtype=np.float32)
     dst = np.asarray(dst_pts, dtype=np.float32)
@@ -202,6 +276,7 @@ def compute_homography(
         geometry_mode=geometry_mode,
         geometry_statuses_allowed=allowed_statuses,
         point_map_used=mapping,
+        validation={"ok": validation.ok, "reasons": validation.reasons, "stats": validation.stats},
         matched=matched,
         skipped=skipped,
     )
@@ -381,6 +456,7 @@ def homography_result_to_dict(result: HomographyResult, *, blob: dict[str, Any],
         "reproj_threshold": reproj_threshold,
         "geometry_mode": result.geometry_mode,
         "geometry_statuses_allowed": list(result.geometry_statuses_allowed),
+        "geometry_validation": result.validation,
         "matched_points": result.matched,
         "skipped_points": result.skipped,
         "homography_matrix": result.matrix.tolist(),

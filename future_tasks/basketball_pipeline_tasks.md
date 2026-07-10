@@ -9,11 +9,11 @@ This backlog documents the implementation work needed to evolve the current Robo
 | Image detection | Implemented with Roboflow Inference and annotated image output. |
 | Video detection | Implemented with frame sampling, dry-run cost estimation, sampled-only output, and annotated MP4 output. |
 | Cost control | Basic controls exist: `--dry-run`, `--frame-stride`, `--max-frames`, `--sampled-output-only`. |
-| Supervision integration | Implemented for image/video annotation; reusable helpers are still pending. |
-| Tracking | Local ByteTrack script implemented for sampled inferred frames; API integration and smoothing are pending. |
+| Supervision integration | Implemented for image/video annotation with shared detection/keypoint annotation helpers. |
+| Tracking | Implemented locally in `scripts/video_pipeline.py` / `scripts/track_players_video.py` with smoothing, short-lived predicted persistence, and lightweight appearance-based reassignment. Identity consistency is still not reliable in crossings/occlusions. |
 | Team identification | Not implemented yet. |
 | Jersey OCR | Not implemented yet. |
-| Court keypoints / homography | Local image/frame keypoint script implemented; local homography script implemented with a best-guess `COURT_POINT_MAP` (TODO: real measurement). |
+| Court keypoints / homography | Implemented locally for single-frame, sampled-video, homography debug, and projected-track export. Homography now rejects obviously bad point layouts before fitting. |
 | SAM 2 tracking | Not implemented yet. Optional, not MVP-first. |
 
 ## Implementation Order
@@ -92,13 +92,22 @@ Acceptance criteria:
 
 ### Task 2.2: Create annotation helpers
 
-- [ ] Create reusable helpers for labels, colors, confidence thresholds, and class filtering.
-- [ ] Keep helpers model-agnostic.
+- [x] Create reusable helpers for labels, colors, confidence thresholds, and class filtering.
+- [x] Keep helpers model-agnostic.
 
 Acceptance criteria:
 
 - Image and video scripts use the same annotation code.
 - Adding court/player/jersey annotations does not duplicate drawing logic.
+
+Notes:
+
+- `scripts/annotation_helpers.py` now owns shared detection filtering, label formatting,
+  color lookup, and point/detection annotation helpers.
+- `scripts/track_players_video.py`, `scripts/detect_players.py`,
+  `scripts/detect_players_video.py`, `scripts/detect_court_keypoints.py`, and
+  `scripts/detect_court_keypoints_video.py` now reuse the shared helpers instead
+  of maintaining separate label or OpenCV text/color code paths.
 
 ## Phase 3 — Cheap Tracking First
 
@@ -118,41 +127,60 @@ Notes:
 - Implemented locally in `scripts/track_players_video.py` and exposed through the
   unified entrypoint `scripts/video_pipeline.py`; not API-integrated yet.
 - Default output writes only inferred frames to avoid implying continuous tracking across skipped frames.
-- Next step is track smoothing/interpolation and then API integration if local behavior is good enough.
+- Tracking quality is improved but not solved: IDs still switch in crossings/occlusions, some tracks still die entirely, and `--frame-stride 1` is too slow/costly to treat as the default fix.
+- The current tracker construction is still `sv.ByteTrack()`, and the deprecation warning means the tracker API choice should be revisited before treating this path as stable.
 
 ## Recommended next task
 
-**Recommended next implementation task: Task 3.2 — Add track-level smoothing.**
+**Recommended next implementation task: Task 3.3 — Evaluate tracker robustness on crossings/occlusions, then decide whether to replace or wrap the current tracker API.**
 
 Why this is next now:
 
 - The repo already has config centralization, raw inference JSONL output, and a
   unified video pipeline entrypoint for player detection + tracking.
-- The highest-value improvement for the current pipeline is visual stability and
-  less misleading tracked output between sampled frames.
+- The main blocker is no longer missing wiring. It is identity robustness under
+  real basketball crossings and occlusions.
+- The repo now has enough debug output (`tracks.jsonl`, `court_keypoints.jsonl`,
+  `projected_tracks.jsonl`, top-down visualization) to evaluate failures
+  directly instead of guessing.
 - `Task 1.3` (frame extraction utility) is still useful, but it is now a
   support tool rather than the main pipeline bottleneck.
 
 ### Task 3.2: Add track-level smoothing
 
-- [ ] Store detections per track.
-- [ ] Smooth boxes/labels over short windows.
-- [ ] Avoid drawing stale boxes by default unless explicitly requested.
+- [x] Store detections per track.
+- [x] Smooth boxes/labels over short windows.
+- [x] Avoid drawing stale boxes by default unless explicitly requested.
 
 Acceptance criteria:
 
 - Boxes no longer appear visually misleading between sampled frames.
 - Debug mode can show only sampled frames; tracking mode can show full video.
 
+Notes:
+
+- Implemented through `TrackSmoother` plus sampled-output defaults in
+  `scripts/track_players_video.py` and `scripts/video_pipeline.py`.
+- This improved visual stability, but it did not solve the harder identity
+  problem during player crossings and occlusions.
+
 ### Task 3.3: Compare ByteTrack vs SAM 2 need
 
 - [ ] Create a small evaluation clip set with occlusions and camera motion.
-- [ ] Count obvious ID switches manually.
-- [ ] Decide whether SAM 2 is justified.
+- [ ] Count ID switches, full track losses, and reassignment recoveries manually.
+- [ ] Compare current `sv.ByteTrack()` behavior against the current recommended Supervision tracker API.
+- [ ] Decide whether a stronger tracker or more robust re-ID is justified before considering SAM 2.
 
 Acceptance criteria:
 
 - SAM 2 is not added unless ByteTrack failure is proven on target footage.
+
+Notes:
+
+- `--frame-stride 1` is not an acceptable default answer by itself: it raises
+  Roboflow cost/runtime and still does not guarantee identity consistency.
+- The current torso-color appearance matching is only a cheap baseline. Treat it
+  as a recovery heuristic, not a production identity solution.
 
 ## Phase 4 — Court Keypoints and Homography
 
@@ -188,11 +216,13 @@ Notes:
   threshold by default; `--self-test` for a synthetic round-trip check; no
   Roboflow call) and `scripts/build_court_homography_video.py` (sampled
   frames, side-by-side debug MP4 with frame index, status, inliers count and
-  mean reprojection error in meters). The internal `COURT_POINT_MAP` is a
-  **best-guess approximation** inferred from a single broadcast-angle frame
-  and must be replaced with a real measurement before production use. Next
-  step is to wire this homography into the tracking pipeline so player foot
-  points can be projected onto court coordinates.
+  mean reprojection error in meters).
+- Homography now performs geometric pre-validation on the matched image points
+  and rejects degenerate layouts before calling `cv2.findHomography`.
+- Projected player foot points are now exported from the tracking pipeline as
+  JSONL when `--court-keypoints` is enabled.
+- The court mapping still depends on the current template assumptions and needs
+  continued validation before using projected coordinates for real stats.
 
 Acceptance criteria:
 
@@ -201,13 +231,31 @@ Acceptance criteria:
 
 ### Task 4.3: Generate shot/location debug view
 
-- [ ] Create a top-down court visualization.
-- [ ] Plot tracked player positions.
-- [ ] Save a PNG or simple MP4 overlay.
+- [x] Create a top-down court visualization.
+- [x] Plot tracked player positions.
+- [x] Save a PNG or simple MP4 overlay.
 
 Acceptance criteria:
 
 - A reviewer can visually confirm that court projection is plausible.
+
+Notes:
+
+- Implemented locally in `scripts/visualize_projected_tracks.py`.
+- Reuses `draw_fiba_court` from `scripts/build_court_homography.py` and consumes the existing projected-track JSONL emitted by `scripts/track_players_video.py` / `scripts/video_pipeline.py`.
+- Produces an offline top-down PNG summary by default and can optionally render a simple court-only MP4 for per-frame review, with no additional Roboflow calls.
+
+## Open Tracking Issues
+
+- Player IDs still switch during crossings and occlusions even after the recent
+  persistence/reassignment work.
+- Tracking can still be lost entirely in some crossings/occlusions.
+- `sv.ByteTrack()` currently emits a deprecation warning, so the tracker API
+  path itself should be treated as under review.
+- The current appearance re-ID baseline is intentionally cheap and should not be
+  mistaken for solved identity tracking.
+
+See `TRACKING_ISSUES.md` for the focused issue breakdown and recommended next actions.
 
 ## Phase 5 — Team Identification
 

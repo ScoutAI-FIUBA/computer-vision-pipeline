@@ -31,6 +31,7 @@ def main() -> None:
         help="Run court keypoint inference on sampled frames and overlay/export the results.",
     )
     parser.add_argument("--court-json-output", type=Path, help="Path for per-frame court keypoint JSONL records")
+    parser.add_argument("--projected-tracks-output", type=Path, help="Path for per-track projected court coordinate JSONL records")
     parser.add_argument(
         "--court-model-id",
         default=COURT_MODEL_ID,
@@ -65,6 +66,18 @@ def main() -> None:
         default=False,
         help="Reuse the last smoothed tracked boxes on skipped frames. Off by default to avoid stale overlays.",
     )
+    parser.add_argument(
+        "--persist-tracks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep recent track IDs alive briefly with predicted boxes on missed sampled detections. Default: on",
+    )
+    parser.add_argument(
+        "--max-missing-sampled-frames",
+        type=int,
+        default=1,
+        help="Maximum sampled-frame gap to keep a track alive with prediction. Default: 1",
+    )
     args = parser.parse_args()
 
     if args.frame_stride < 1:
@@ -75,6 +88,8 @@ def main() -> None:
         raise SystemExit("--output-fps must be greater than 0")
     if args.smoothing_window < 1:
         raise SystemExit("--smoothing-window must be at least 1")
+    if args.max_missing_sampled_frames < 0:
+        raise SystemExit("--max-missing-sampled-frames must be at least 0")
     if args.court_confidence < 0 or args.court_confidence > 1:
         raise SystemExit("--court-confidence must be between 0 and 1")
 
@@ -82,6 +97,7 @@ def main() -> None:
     args.tracks_output = args.tracks_output or Path("outputs") / f"{args.video.stem}_tracks.jsonl"
     args.json_output = args.json_output or Path("outputs") / f"{args.video.stem}_inference.jsonl"
     args.court_json_output = args.court_json_output or Path("outputs") / f"{args.video.stem}_court_keypoints.jsonl"
+    args.projected_tracks_output = args.projected_tracks_output or Path("outputs") / f"{args.video.stem}_projected_tracks.jsonl"
 
     try:
         info = inspect_video(args.video, args.frame_stride, args.max_frames)
@@ -119,10 +135,13 @@ def main() -> None:
             output_fps=args.output_fps,
             smoothing_window=args.smoothing_window,
             reuse_stale_tracks=args.reuse_stale_tracks,
+            persist_tracks=args.persist_tracks,
+            max_missing_sampled_frames=args.max_missing_sampled_frames,
             court_keypoints=args.court_keypoints,
             court_json_output=args.court_json_output if args.court_keypoints else None,
             court_model_id=args.court_model_id,
             court_confidence=args.court_confidence,
+            projected_tracks_output=args.projected_tracks_output if args.court_keypoints else None,
         )
     except RuntimeError as error:
         raise SystemExit(str(error)) from error
@@ -137,12 +156,15 @@ def main() -> None:
         print(f"Court frames: {stats['court_frames']}")
         print(f"Court Roboflow calls: {stats['court_roboflow_calls']}")
         print(f"Court keypoint records: {stats['court_inference_records']}")
+        print(f"Projected track records: {stats['projected_track_records']}")
+        print(f"Projected track frames: {stats['projected_track_frames']}")
     print(f"Tracked video saved to: {args.output}")
     print(f"Track JSONL saved to: {args.tracks_output}")
     if args.save_json:
         print(f"Inference JSONL saved to: {args.json_output}")
     if args.court_keypoints:
         print(f"Court JSONL saved to: {args.court_json_output}")
+        print(f"Projected track JSONL saved to: {args.projected_tracks_output}")
 
 
 if __name__ == "__main__":

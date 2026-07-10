@@ -38,18 +38,19 @@ from env_config import COURT_MODEL_ID, get_roboflow_api_key
 
 def _import_homography_helpers():
     from build_court_homography import (
+        GeometryValidationError,
         compute_homography,
         draw_fiba_court,
         draw_projected_keypoints,
     )
     from court_template import canonical_point_map
 
-    return canonical_point_map, compute_homography, draw_fiba_court, draw_projected_keypoints
+    return canonical_point_map, GeometryValidationError, compute_homography, draw_fiba_court, draw_projected_keypoints
 
 
 def _import_keypoint_parser():
-    from detect_court_keypoints import parse_keypoints
-    return parse_keypoints
+    from detect_court_keypoints import draw_with_annotators, to_keypoints, parse_keypoints
+    return draw_with_annotators, to_keypoints, parse_keypoints
 
 
 def _import_video_inference():
@@ -84,9 +85,15 @@ def composite_frame(
     import cv2
     import numpy as np
 
-    _, _, draw_fiba_court, draw_projected_keypoints = _import_homography_helpers()
+    _, _, _, draw_fiba_court, draw_projected_keypoints = _import_homography_helpers()
+    draw_with_annotators, _, _ = _import_keypoint_parser()
 
-    height, width = frame.shape[:2]
+    source = frame.copy()
+    key_points = homography_status.get("key_points")
+    if key_points is not None:
+        source = draw_with_annotators(source, key_points)
+
+    height, width = source.shape[:2]
     court = draw_fiba_court(pixels_per_meter=pixels_per_meter)
     if homography_status.get("status") == "ok":
         court_annotated = draw_projected_keypoints(
@@ -100,7 +107,7 @@ def composite_frame(
     court_resized = cv2.resize(court_annotated, (width, height), interpolation=cv2.INTER_AREA)
 
     sep = np.full((height, 4, 3), 32, dtype=np.uint8)
-    composite = np.hstack([frame, sep, court_resized])
+    composite = np.hstack([source, sep, court_resized])
 
     label = (
         f"frame={homography_status.get('frame_index', '?')} "
@@ -118,6 +125,13 @@ def composite_frame(
             f"  mode={homography_status.get('geometry_mode', '?')}"
             f"  matched={homography_status.get('matched_count', 0)}"
         )
+    reason_label = None
+    if homography_status.get("status") == "insufficient":
+        reasons = homography_status.get("reasons") or []
+        if reasons:
+            reason_label = "reject=" + ",".join(str(reason) for reason in reasons[:3])
+    elif homography_status.get("status") == "error" and homography_status.get("error"):
+        reason_label = str(homography_status["error"])
 
     cv2.putText(
         composite,
@@ -129,6 +143,17 @@ def composite_frame(
         2,
         cv2.LINE_AA,
     )
+    if reason_label:
+        cv2.putText(
+            composite,
+            reason_label,
+            (12, 54),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (80, 180, 255),
+            2,
+            cv2.LINE_AA,
+        )
     cv2.putText(
         composite,
         "FIBA court (28m x 15m) - authoritative label template",
@@ -158,8 +183,8 @@ def process_video(
 ) -> dict:
     import cv2
 
-    canonical_point_map, compute_homography, _, _ = _import_homography_helpers()
-    parse_keypoints = _import_keypoint_parser()
+    canonical_point_map, GeometryValidationError, compute_homography, _, _ = _import_homography_helpers()
+    _, to_keypoints, parse_keypoints = _import_keypoint_parser()
     infer_frame, roboflow_client = _import_video_inference()
     default_output_fps, _, open_video, video_info = _import_video_plumbing()
     point_map = canonical_point_map(geometry_mode)
@@ -206,12 +231,15 @@ def process_video(
                 "inliers_count": 0,
                 "reprojection_mean_m": 0.0,
                 "geometry_mode": geometry_mode,
+                "key_points": None,
             }
             if frame_index % frame_stride == 0:
                 result = infer_frame(client, frame, f"_{frame_index}.jpg", model_id)
                 calls += 1
                 inferred = True
                 keypoints = parse_keypoints(result, min_confidence, width, height)
+                key_points = to_keypoints(keypoints)
+                status["key_points"] = key_points
                 status["matched_count"] = sum(1 for point in keypoints if point.get("label") in point_map)
                 try:
                     homography = compute_homography(
@@ -233,10 +261,21 @@ def process_video(
                         "inliers_count": homography.inliers_count,
                         "reprojection_mean_m": homography.reprojection_mean_m,
                         "geometry_mode": homography.geometry_mode,
+                        "validation": homography.validation,
                         "matrix": homography.matrix,
                         "matched": homography.matched,
+                        "key_points": key_points,
                         "used_labels": [entry["label"] for entry in homography.matched],
                         "skipped": homography.skipped,
+                    }
+                except GeometryValidationError as error:
+                    status["status"] = "insufficient"
+                    status["error"] = str(error)
+                    status["reasons"] = error.validation.reasons
+                    status["validation"] = {
+                        "ok": error.validation.ok,
+                        "reasons": error.validation.reasons,
+                        "stats": error.validation.stats,
                     }
                 except ValueError as error:
                     status["status"] = "insufficient"

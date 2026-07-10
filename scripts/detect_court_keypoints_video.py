@@ -14,12 +14,11 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key  # noqa: E402
-from annotation_helpers import DEFAULT_ANNOTATION_COLOR, format_label  # noqa: E402
 
 API_URL = ROBOFLOW_API_URL
 DEFAULT_MODEL_ID = COURT_MODEL_ID
 
-from detect_court_keypoints import parse_keypoints  # noqa: E402  (sys.path tweak above)
+from detect_court_keypoints import draw_with_annotators, parse_keypoints, to_keypoints  # noqa: E402  (sys.path tweak above)
 from detect_players_video import (  # noqa: E402
     default_output_fps,
     inspect_video,
@@ -49,27 +48,8 @@ def infer_frame(client, frame, suffix: str, model_id: str) -> dict:
             temp_path.unlink(missing_ok=True)
 
 
-def draw_keypoints(frame, keypoints: list[dict]) -> None:
-    import cv2
-
-    color = DEFAULT_ANNOTATION_COLOR
-
-    for point in keypoints:
-        x, y = int(round(point["x"])), int(round(point["y"]))
-        label = format_label(point["label"], point.get("confidence"))
-        cv2.circle(frame, (x, y), 5, color, -1)
-        cv2.putText(frame, label, (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-    if not keypoints:
-        cv2.putText(
-            frame,
-            "no reliable keypoints",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            color,
-            2,
-        )
+def draw_keypoints(frame, keypoints: list[dict]):
+    return draw_with_annotators(frame, to_keypoints(keypoints))
 
 
 def filter_keypoints(result: Any, min_confidence: float, width: int, height: int) -> list[dict]:
@@ -120,7 +100,7 @@ def process_video(
                 calls += 1
                 inferred = True
                 keypoints = filter_keypoints(result, min_confidence, width, height)
-                draw_keypoints(frame, keypoints)
+                frame = draw_keypoints(frame, keypoints)
                 keypoints_total += len(keypoints)
 
             if inferred or not sampled_output_only:
