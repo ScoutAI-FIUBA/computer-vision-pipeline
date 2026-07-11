@@ -2,7 +2,7 @@
 """Build a local FIBA court homography from detected keypoints.
 
 This script uses the shared labeled court template from
-``scripts/court_template.py``. That template is the authoritative label ->
+``scripts/court/court_template.py``. That template is the authoritative label ->
 court-coordinate map for this repo.
 
 The script:
@@ -29,22 +29,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-try:
-    from scripts.court_template import (
-        COURT_TEMPLATE_LOOKUP,
-        GEOMETRY_MODE_STATUSES,
-        canonical_point_map,
-        geometry_statuses_for_mode,
-        template_points,
-    )
-except ModuleNotFoundError:
-    from court_template import (
-        COURT_TEMPLATE_LOOKUP,
-        GEOMETRY_MODE_STATUSES,
-        canonical_point_map,
-        geometry_statuses_for_mode,
-        template_points,
-    )
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.court.court_template import (
+    COURT_TEMPLATE_LOOKUP,
+    GEOMETRY_MODE_STATUSES,
+    canonical_point_map,
+    geometry_statuses_for_mode,
+    template_points,
+)
 
 # FIBA court dimensions: 28m long x 15m wide. Coordinate system: x_m along
 # court length and y_m across court width, with (0, 0) at the top-left corner.

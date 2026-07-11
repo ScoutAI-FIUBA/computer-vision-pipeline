@@ -1,0 +1,69 @@
+# Main Deep OC-SORT tuning file for this repo.
+#
+# Edit this file when you want to change Deep OC-SORT behavior without touching
+# Python code. The CLI still supports --deepocsort-* flags, but those are now
+# one-off overrides for a single run.
+
+[deepocsort.runtime]
+
+# BoxMOT ReID checkpoint used to extract appearance embeddings for identity
+# recovery after occlusions or close crossings.
+reid_weights = "osnet_x0_25_msmt17.pt"
+
+# Device used by the ReID model. Keep "cpu" for the safest default; switch to
+# "cuda" only if your local torch + BoxMOT stack is set up for GPU inference.
+device = "cpu"
+
+# Use half precision for the ReID model when your hardware/runtime supports it.
+# This can reduce memory use, but leave it false unless you have a proven reason.
+half = false
+
+[deepocsort.tuning]
+
+# Minimum detection confidence Deep OC-SORT keeps for its own association step.
+# Raise this to ignore weaker boxes; lower it if true players are getting dropped.
+det_thresh = 0.3
+
+# How many frames a lost track can coast before the tracker deletes it.
+# Higher keeps IDs alive longer through occlusion, but can also keep bad tracks around.
+max_age = 60
+
+# How many confirmed hits a new track needs before it is treated as stable.
+# Higher reduces noisy one-frame IDs, but delays new players getting a real ID.
+min_hits = 5
+
+# Minimum IOU needed when matching a detection back to an existing track.
+# Higher is stricter about box overlap; lower is more forgiving but can increase ID swaps.
+iou_threshold = 0.1
+
+# Motion-history window used when estimating track direction.
+# Higher can help smooth motion, but it reacts more slowly to sharp direction changes.
+delta_t = 3
+
+# Weight given to motion consistency during matching.
+# Raise this when boxes move smoothly; lower it when appearance should matter more.
+inertia = 0.15
+
+# Weight given to appearance similarity during matching.
+# Raise this to lean harder on ReID for crowded scenes and long occlusions.
+w_association_emb = 0.7
+
+# How slowly a track's stored appearance embedding is updated.
+# Closer to 1.0 means older appearance stays dominant for longer.
+alpha_fixed_emb = 0.9
+
+# Balance knob for adaptive motion-vs-appearance weighting.
+# Leave this near the default unless you are actively tuning crowded-scene behavior.
+aw_param = 0.5
+
+# Disable appearance embeddings entirely.
+# Only turn this on if you want to compare against motion-only behavior.
+embedding_off = false
+
+# Disable camera-motion compensation.
+# Turn this on only if camera-motion correction is making matches worse in your footage.
+cmc_off = false
+
+# Disable the adaptive weighting logic between motion and appearance.
+# Leave this false unless you are testing whether the adaptive blend is hurting your case.
+aw_off = false

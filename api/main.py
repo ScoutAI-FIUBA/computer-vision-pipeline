@@ -6,9 +6,9 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
-from scripts.detect_players import annotate_image, detect_players
-from scripts.detect_players_video import inspect_video, process_video
-from scripts.env_config import PLAYER_MODEL_ID, get_roboflow_api_key
+from scripts.tracking.detect_players import annotate_image, detect_players
+from scripts.tracking.detect_players_video import inspect_video, process_video
+from scripts.shared.env_config import PLAYER_MODEL_ID, get_roboflow_api_key
 
 
 app = FastAPI(title="Basketball Player Detection")

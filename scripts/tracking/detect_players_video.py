@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import tempfile
 from pathlib import Path
 
-try:
-    from scripts.annotation_helpers import annotate_detections, detections_from_inference
-    from scripts.env_config import PLAYER_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
-except ModuleNotFoundError:
-    from annotation_helpers import annotate_detections, detections_from_inference
-    from env_config import PLAYER_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.shared.annotation_helpers import annotate_detections, detections_from_inference
+from scripts.shared.env_config import PLAYER_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
 
 MODEL_ID = PLAYER_MODEL_ID
 API_URL = ROBOFLOW_API_URL

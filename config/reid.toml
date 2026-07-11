@@ -1,0 +1,45 @@
+# Main ReID tuning file for this repo.
+#
+# Edit this file when you want to tune appearance extraction and crop quality
+# without touching Python code.
+
+[reid.crop]
+
+# Turn the lightweight torso-color appearance feature on or off.
+# Keep this true unless you want to compare against motion-only reassignment.
+enabled = true
+
+# Trim this fraction from both the left and right sides of each player box
+# before building the torso crop.
+x_margin_fraction = 0.05
+
+# Start the torso crop this far down from the top of the player box.
+y_start_fraction = 0.15
+
+# End the torso crop this far down from the top of the player box.
+# Values below 1.0 keep the crop away from legs and shoes.
+y_end_fraction = 0.68
+
+[reid.overlap]
+
+# If this much of the torso crop is covered by other player boxes, skip
+# appearance extraction entirely and let reassignment fall back to motion.
+heavy_overlap_fraction = 0.45
+
+# Even below the heavy-overlap cutoff, require the single largest visible torso
+# region to cover at least this fraction of the original torso crop.
+min_visible_fraction = 0.35
+
+[reid.quality]
+
+# Skip appearance extraction for boxes narrower than this many pixels.
+min_box_width = 16
+
+# Skip appearance extraction for boxes shorter than this many pixels.
+min_box_height = 32
+
+# Skip the torso crop if the final crop is narrower than this many pixels.
+min_crop_width = 8
+
+# Skip the torso crop if the final crop is shorter than this many pixels.
+min_crop_height = 14

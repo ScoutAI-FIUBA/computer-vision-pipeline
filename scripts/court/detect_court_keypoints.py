@@ -6,28 +6,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from statistics import median
 from typing import Any
 
-try:
-    from scripts.annotation_helpers import annotate_points
-    from scripts.court_template import (
-        edges_for_labels,
-        label_class_mapping as template_label_class_mapping,
-        labeled_edges_for_labels,
-        sort_keypoints_by_template,
-    )
-    from scripts.env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
-except ModuleNotFoundError:
-    from annotation_helpers import annotate_points
-    from court_template import (
-        edges_for_labels,
-        label_class_mapping as template_label_class_mapping,
-        labeled_edges_for_labels,
-        sort_keypoints_by_template,
-    )
-    from env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.shared.annotation_helpers import annotate_points
+from scripts.court.court_template import (
+    edges_for_labels,
+    label_class_mapping as template_label_class_mapping,
+    labeled_edges_for_labels,
+    sort_keypoints_by_template,
+)
+from scripts.shared.env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key
 
 API_URL = ROBOFLOW_API_URL
 DEFAULT_MODEL_ID = COURT_MODEL_ID

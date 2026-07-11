@@ -8,11 +8,16 @@ import sys
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.detect_court_keypoints import DEFAULT_MODEL_ID as COURT_MODEL_ID  # noqa: E402
-from scripts.env_config import get_roboflow_api_key  # noqa: E402
-from scripts.track_players_video import inspect_video, process_video  # noqa: E402
+from scripts.court.detect_court_keypoints import DEFAULT_MODEL_ID as COURT_MODEL_ID  # noqa: E402
+from scripts.shared.env_config import get_roboflow_api_key  # noqa: E402
+from scripts.tracking.track_players_video import (  # noqa: E402
+    DEFAULT_DEEPOCSORT_CONFIG_PATH,
+    DEFAULT_REID_CONFIG_PATH,
+    inspect_video,
+    process_video,
+)
 
 
 def main() -> None:
@@ -47,6 +52,49 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, help="Maximum number of frames to read")
     parser.add_argument("--dry-run", action="store_true", help="Print video info and estimated calls without inference")
     parser.add_argument("--confidence", type=float, default=0.0, help="Minimum confidence to track and draw")
+    parser.add_argument(
+        "--tracker-backend",
+        choices=("bytetrack", "deepocsort"),
+        default="bytetrack",
+        help="Tracking backend. Default: bytetrack",
+    )
+    parser.add_argument(
+        "--tracker-config",
+        type=Path,
+        default=DEFAULT_DEEPOCSORT_CONFIG_PATH,
+        help=(
+            "Deep OC-SORT tracker config file. This is the main place to tune tracker behavior; "
+            "the --deepocsort-* flags only override values from this file. "
+            f"Default: {DEFAULT_DEEPOCSORT_CONFIG_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--reid-config",
+        type=Path,
+        default=DEFAULT_REID_CONFIG_PATH,
+        help=(
+            "ReID crop/quality config file for the lightweight appearance reassignment path. "
+            f"Default: {DEFAULT_REID_CONFIG_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--deepocsort-reid-weights",
+        default=None,
+        help=(
+            "Override reid_weights from --tracker-config when --tracker-backend deepocsort is selected."
+        ),
+    )
+    parser.add_argument(
+        "--deepocsort-device",
+        default=None,
+        help="Override device from --tracker-config when --tracker-backend deepocsort is selected.",
+    )
+    parser.add_argument(
+        "--deepocsort-half",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override half from --tracker-config when --tracker-backend deepocsort is selected.",
+    )
     parser.add_argument(
         "--sampled-output-only",
         action=argparse.BooleanOptionalAction,
@@ -133,6 +181,12 @@ def main() -> None:
             sampled_output_only=args.sampled_output_only,
             confidence=args.confidence,
             output_fps=args.output_fps,
+            tracker_backend=args.tracker_backend,
+            tracker_config=args.tracker_config,
+            reid_config=args.reid_config,
+            deepocsort_reid_weights=args.deepocsort_reid_weights,
+            deepocsort_device=args.deepocsort_device,
+            deepocsort_half=args.deepocsort_half,
             smoothing_window=args.smoothing_window,
             reuse_stale_tracks=args.reuse_stale_tracks,
             persist_tracks=args.persist_tracks,
@@ -149,6 +203,10 @@ def main() -> None:
     print(f"Frames read: {stats['frames_read']}/{stats['frame_count'] or 'unknown'}")
     print(f"Roboflow calls: {stats['roboflow_calls']}")
     print(f"Output FPS: {stats['output_fps']}")
+    print(f"Tracker backend: {stats['tracker_backend']}")
+    if stats["tracker_config"] is not None:
+        print(f"Tracker config: {stats['tracker_config']}")
+    print(f"ReID config: {stats['reid_config']}")
     print(f"Track records: {stats['track_records']}")
     if args.save_json:
         print(f"Inference records: {stats['inference_records']}")

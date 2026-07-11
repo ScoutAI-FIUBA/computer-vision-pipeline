@@ -9,17 +9,17 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key  # noqa: E402
+from scripts.shared.env_config import COURT_MODEL_ID, ROBOFLOW_API_URL, get_roboflow_api_key  # noqa: E402
 
 API_URL = ROBOFLOW_API_URL
 DEFAULT_MODEL_ID = COURT_MODEL_ID
 
-from detect_court_keypoints import draw_with_annotators, parse_keypoints, to_keypoints  # noqa: E402  (sys.path tweak above)
-from detect_players_video import (  # noqa: E402
+from scripts.court.detect_court_keypoints import draw_with_annotators, parse_keypoints, to_keypoints  # noqa: E402
+from scripts.tracking.detect_players_video import (  # noqa: E402
     default_output_fps,
     inspect_video,
     open_video,

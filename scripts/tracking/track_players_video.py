@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Roboflow player detection plus Supervision ByteTrack on sampled video frames."""
+"""Run Roboflow player detection plus a pluggable tracker on sampled video frames."""
 
 from __future__ import annotations
 
@@ -7,22 +7,23 @@ import argparse
 import json
 import sys
 import tempfile
+import tomllib
 from collections import Counter, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.annotation_helpers import (  # noqa: E402
+from scripts.shared.annotation_helpers import (  # noqa: E402
     annotate_detections,
     class_names_for,
     detections_from_inference,
     format_label,
     label_prefix,
 )
-from scripts.detect_players_video import (  # noqa: E402
+from scripts.tracking.detect_players_video import (  # noqa: E402
     MODEL_ID,
     default_output_fps,
     inspect_video,
@@ -30,15 +31,213 @@ from scripts.detect_players_video import (  # noqa: E402
     roboflow_client,
     video_info,
 )
-from scripts.build_court_homography import compute_homography, project_points  # noqa: E402
-from scripts.court_template import canonical_point_map  # noqa: E402
-from scripts.detect_court_keypoints import (  # noqa: E402
+from scripts.court.build_court_homography import compute_homography, project_points  # noqa: E402
+from scripts.court.court_template import canonical_point_map  # noqa: E402
+from scripts.court.detect_court_keypoints import (  # noqa: E402
     DEFAULT_MODEL_ID as COURT_MODEL_ID,
     draw_with_annotators,
     parse_keypoints,
     to_keypoints,
 )
-from scripts.env_config import get_roboflow_api_key  # noqa: E402
+from scripts.shared.env_config import get_roboflow_api_key  # noqa: E402
+
+
+DEFAULT_TRACKER_BACKEND = "bytetrack"
+DEFAULT_DEEPOCSORT_CONFIG_PATH = Path("config") / "deepocsort.toml"
+DEFAULT_REID_CONFIG_PATH = Path("config") / "reid.toml"
+DEFAULT_DEEPOCSORT_REID_WEIGHTS = "osnet_x0_25_msmt17.pt"
+DEFAULT_DEEPOCSORT_DEVICE = "cpu"
+TRACKER_BACKEND_CHOICES = (DEFAULT_TRACKER_BACKEND, "deepocsort")
+
+DEEPOCSORT_RUNTIME_DEFAULTS = {
+    "reid_weights": DEFAULT_DEEPOCSORT_REID_WEIGHTS,
+    "device": DEFAULT_DEEPOCSORT_DEVICE,
+    "half": False,
+}
+
+DEEPOCSORT_TUNING_DEFAULTS = {
+    "det_thresh": 0.3,
+    "max_age": 30,
+    "min_hits": 3,
+    "iou_threshold": 0.3,
+    "delta_t": 3,
+    "inertia": 0.2,
+    "w_association_emb": 0.5,
+    "alpha_fixed_emb": 0.95,
+    "aw_param": 0.5,
+    "embedding_off": False,
+    "cmc_off": False,
+    "aw_off": False,
+}
+
+DEEPOCSORT_CONFIG_TYPES = {
+    "reid_weights": str,
+    "device": str,
+    "half": bool,
+    "det_thresh": (int, float),
+    "max_age": int,
+    "min_hits": int,
+    "iou_threshold": (int, float),
+    "delta_t": int,
+    "inertia": (int, float),
+    "w_association_emb": (int, float),
+    "alpha_fixed_emb": (int, float),
+    "aw_param": (int, float),
+    "embedding_off": bool,
+    "cmc_off": bool,
+    "aw_off": bool,
+}
+
+REID_CROP_DEFAULTS = {
+    "enabled": True,
+    "x_margin_fraction": 0.2,
+    "y_start_fraction": 0.15,
+    "y_end_fraction": 0.65,
+}
+
+REID_OVERLAP_DEFAULTS = {
+    "heavy_overlap_fraction": 0.35,
+    "min_visible_fraction": 0.4,
+}
+
+REID_QUALITY_DEFAULTS = {
+    "min_box_width": 12,
+    "min_box_height": 24,
+    "min_crop_width": 8,
+    "min_crop_height": 12,
+}
+
+REID_CONFIG_TYPES = {
+    "enabled": bool,
+    "x_margin_fraction": (int, float),
+    "y_start_fraction": (int, float),
+    "y_end_fraction": (int, float),
+    "heavy_overlap_fraction": (int, float),
+    "min_visible_fraction": (int, float),
+    "min_box_width": int,
+    "min_box_height": int,
+    "min_crop_width": int,
+    "min_crop_height": int,
+}
+
+
+def load_deepocsort_config(config_path: Path) -> dict[str, object]:
+    try:
+        with config_path.open("rb") as config_file:
+            raw_config = tomllib.load(config_file)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Deep OC-SORT config file not found: {config_path}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError(f"Could not parse Deep OC-SORT config file {config_path}: {error}") from error
+
+    deepocsort_config = raw_config.get("deepocsort")
+    if deepocsort_config is None:
+        deepocsort_config = {}
+    if not isinstance(deepocsort_config, dict):
+        raise RuntimeError(f"Deep OC-SORT config file must define a [deepocsort] table: {config_path}")
+
+    runtime_config = deepocsort_config.get("runtime") or {}
+    tuning_config = deepocsort_config.get("tuning") or {}
+    if not isinstance(runtime_config, dict):
+        raise RuntimeError(f"[deepocsort.runtime] must be a table in {config_path}")
+    if not isinstance(tuning_config, dict):
+        raise RuntimeError(f"[deepocsort.tuning] must be a table in {config_path}")
+
+    merged = {
+        **DEEPOCSORT_RUNTIME_DEFAULTS,
+        **DEEPOCSORT_TUNING_DEFAULTS,
+        **runtime_config,
+        **tuning_config,
+    }
+    for key, expected_type in DEEPOCSORT_CONFIG_TYPES.items():
+        value = merged[key]
+        if not isinstance(value, expected_type):
+            expected_names = (
+                ", ".join(sorted(item.__name__ for item in expected_type))
+                if isinstance(expected_type, tuple)
+                else expected_type.__name__
+            )
+            raise RuntimeError(
+                f"Deep OC-SORT config value {key!r} in {config_path} must be {expected_names}, got {type(value).__name__}"
+            )
+
+    return merged
+
+
+def resolve_deepocsort_settings(
+    config_path: Path,
+    *,
+    deepocsort_reid_weights: str | None,
+    deepocsort_device: str | None,
+    deepocsort_half: bool | None,
+) -> dict[str, object]:
+    settings = load_deepocsort_config(config_path)
+    if deepocsort_reid_weights is not None:
+        settings["reid_weights"] = deepocsort_reid_weights
+    if deepocsort_device is not None:
+        settings["device"] = deepocsort_device
+    if deepocsort_half is not None:
+        settings["half"] = deepocsort_half
+    return settings
+
+
+def load_reid_config(config_path: Path) -> dict[str, object]:
+    try:
+        with config_path.open("rb") as config_file:
+            raw_config = tomllib.load(config_file)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"ReID config file not found: {config_path}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError(f"Could not parse ReID config file {config_path}: {error}") from error
+
+    reid_config = raw_config.get("reid")
+    if reid_config is None:
+        reid_config = {}
+    if not isinstance(reid_config, dict):
+        raise RuntimeError(f"ReID config file must define a [reid] table: {config_path}")
+
+    crop_config = reid_config.get("crop") or {}
+    overlap_config = reid_config.get("overlap") or {}
+    quality_config = reid_config.get("quality") or {}
+    if not isinstance(crop_config, dict):
+        raise RuntimeError(f"[reid.crop] must be a table in {config_path}")
+    if not isinstance(overlap_config, dict):
+        raise RuntimeError(f"[reid.overlap] must be a table in {config_path}")
+    if not isinstance(quality_config, dict):
+        raise RuntimeError(f"[reid.quality] must be a table in {config_path}")
+
+    merged = {
+        **REID_CROP_DEFAULTS,
+        **REID_OVERLAP_DEFAULTS,
+        **REID_QUALITY_DEFAULTS,
+        **crop_config,
+        **overlap_config,
+        **quality_config,
+    }
+    for key, expected_type in REID_CONFIG_TYPES.items():
+        value = merged[key]
+        if not isinstance(value, expected_type):
+            expected_names = (
+                ", ".join(sorted(item.__name__ for item in expected_type))
+                if isinstance(expected_type, tuple)
+                else expected_type.__name__
+            )
+            raise RuntimeError(
+                f"ReID config value {key!r} in {config_path} must be {expected_names}, got {type(value).__name__}"
+            )
+
+    if not 0.0 <= float(merged["x_margin_fraction"]) < 0.5:
+        raise RuntimeError(f"ReID config x_margin_fraction in {config_path} must be between 0.0 and 0.5")
+    if not 0.0 <= float(merged["y_start_fraction"]) < float(merged["y_end_fraction"]) <= 1.0:
+        raise RuntimeError(
+            f"ReID config y_start_fraction/y_end_fraction in {config_path} must satisfy 0.0 <= start < end <= 1.0"
+        )
+    if not 0.0 <= float(merged["heavy_overlap_fraction"]) <= 1.0:
+        raise RuntimeError(f"ReID config heavy_overlap_fraction in {config_path} must be between 0.0 and 1.0")
+    if not 0.0 <= float(merged["min_visible_fraction"]) <= 1.0:
+        raise RuntimeError(f"ReID config min_visible_fraction in {config_path} must be between 0.0 and 1.0")
+
+    return merged
 
 
 @dataclass
@@ -130,8 +329,9 @@ class TrackSmoother:
 
 
 class TrackPersistence:
-    def __init__(self, max_missing_sampled_frames: int = 1) -> None:
+    def __init__(self, max_missing_sampled_frames: int = 1, reid_config: dict[str, object] | None = None) -> None:
         self.max_missing_sampled_frames = max_missing_sampled_frames
+        self.reid_config = reid_config or {**REID_CROP_DEFAULTS, **REID_OVERLAP_DEFAULTS, **REID_QUALITY_DEFAULTS}
         self.history: dict[int, deque[PersistedTrackSample]] = defaultdict(lambda: deque(maxlen=2))
         self.last_detections = None
 
@@ -140,22 +340,16 @@ class TrackPersistence:
         import supervision as sv
 
         states = ["detected"] * len(detections)
-        reid_applied = [False] * len(detections)
-        reassigned_from_track_ids = [None] * len(detections)
-        reid_scores = [None] * len(detections)
         if self.max_missing_sampled_frames < 1:
             persisted = clone_detections_with_metadata(
                 detections,
                 track_states=states,
                 missing_sampled_frames=[0] * len(detections),
-                reid_applied=reid_applied,
-                reassigned_from_track_id=reassigned_from_track_ids,
-                reid_score=reid_scores,
             )
             self.last_detections = persisted
             return persisted
 
-        rows = build_detection_rows(detections, frame)
+        rows = build_detection_rows(detections, frame, self.reid_config)
         self.reassign_recent_tracks(rows, frame_index)
 
         present_track_ids: set[int] = set()
@@ -167,9 +361,6 @@ class TrackPersistence:
         track_id_rows: list[int | None] = []
         track_state_rows: list[str] = []
         missing_rows: list[int] = []
-        reid_applied_rows: list[bool] = []
-        reassigned_from_rows: list[int | None] = []
-        reid_score_rows: list[float | None] = []
 
         for row in rows:
             xyxy_rows.append(row["xyxy"])
@@ -179,9 +370,6 @@ class TrackPersistence:
             track_id_rows.append(row["track_id"])
             track_state_rows.append("detected")
             missing_rows.append(0)
-            reid_applied_rows.append(bool(row["reid_applied"]))
-            reassigned_from_rows.append(row["reassigned_from_track_id"])
-            reid_score_rows.append(row["reid_score"])
 
             track_id = row["track_id"]
             if track_id is None:
@@ -214,9 +402,6 @@ class TrackPersistence:
             track_id_rows.append(track_id)
             track_state_rows.append("predicted")
             missing_rows.append(missing_sampled_frames)
-            reid_applied_rows.append(False)
-            reassigned_from_rows.append(None)
-            reid_score_rows.append(None)
 
         persisted = sv.Detections(
             xyxy=np.asarray(xyxy_rows, dtype=float) if xyxy_rows else np.empty((0, 4), dtype=float),
@@ -238,9 +423,6 @@ class TrackPersistence:
                 "tracker_id": track_id_rows,
                 "track_state": track_state_rows,
                 "missing_sampled_frames": missing_rows,
-                "reid_applied": reid_applied_rows,
-                "reassigned_from_track_id": reassigned_from_rows,
-                "reid_score": reid_score_rows,
             },
             metadata=detections.metadata,
         )
@@ -305,8 +487,143 @@ class TrackPersistence:
             row["track_id"] = best_candidate["track_id"]
 
 
+class TrackerAdapter:
+    def __init__(
+        self,
+        backend: str = DEFAULT_TRACKER_BACKEND,
+        tracker_config: Path = DEFAULT_DEEPOCSORT_CONFIG_PATH,
+        deepocsort_reid_weights: str | None = None,
+        deepocsort_device: str | None = None,
+        deepocsort_half: bool | None = None,
+    ) -> None:
+        self.backend = backend
+
+        if backend == "bytetrack":
+            import supervision as sv
+
+            self._tracker = sv.ByteTrack()
+            return
+
+        if backend == "deepocsort":
+            try:
+                from boxmot.trackers.registry import create_tracker
+            except ImportError as error:
+                raise RuntimeError(
+                    "deepocsort requires a BoxMOT build that exposes boxmot.trackers.registry.create_tracker. Install dependencies from requirements.txt to enable it."
+                ) from error
+
+            resolved_settings = resolve_deepocsort_settings(
+                tracker_config,
+                deepocsort_reid_weights=deepocsort_reid_weights,
+                deepocsort_device=deepocsort_device,
+                deepocsort_half=deepocsort_half,
+            )
+            tracker_kwargs = {key: resolved_settings[key] for key in DEEPOCSORT_TUNING_DEFAULTS}
+            self._tracker = create_tracker(
+                "deepocsort",
+                reid_weights=str(resolved_settings["reid_weights"]),
+                device=str(resolved_settings["device"]),
+                half=bool(resolved_settings["half"]),
+                tracker_kwargs=tracker_kwargs,
+            )
+            return
+
+        raise RuntimeError(
+            f"Unsupported tracker backend: {backend}. Supported backends: {', '.join(TRACKER_BACKEND_CHOICES)}"
+        )
+
+    def update(self, detections, frame):
+        if self.backend == "bytetrack":
+            del frame
+            return self._tracker.update_with_detections(detections)
+
+        if self.backend == "deepocsort":
+            return boxmot_detections_to_supervision(
+                self._tracker.update(supervision_detections_to_boxmot(detections), frame),
+                detections,
+            )
+
+        raise RuntimeError(f"Unsupported tracker backend during update: {self.backend}")
+
+
 def detections_from_result(result: dict, min_confidence: float):
     return detections_from_inference(result, min_confidence=min_confidence)
+
+
+def supervision_detections_to_boxmot(detections):
+    import numpy as np
+
+    if len(detections) == 0:
+        return np.empty((0, 6), dtype=np.float32)
+
+    confidences = [0.0 if confidence is None else float(confidence) for confidence in confidences_for(detections)]
+    class_ids = [0 if class_id is None else int(class_id) for class_id in class_ids_for(detections)]
+    rows = [
+        [float(x1), float(y1), float(x2), float(y2), confidence, float(class_id)]
+        for (x1, y1, x2, y2), confidence, class_id in zip(detections.xyxy, confidences, class_ids)
+    ]
+    return np.asarray(rows, dtype=np.float32)
+
+
+def boxmot_detections_to_supervision(tracks, source_detections):
+    import numpy as np
+    import supervision as sv
+
+    track_array = np.asarray(tracks, dtype=float)
+    if track_array.size == 0:
+        return sv.Detections(
+            xyxy=np.empty((0, 4), dtype=float),
+            confidence=np.empty((0,), dtype=float),
+            class_id=np.empty((0,), dtype=int),
+            tracker_id=np.empty((0,), dtype=int),
+            data={
+                "confidence": [],
+                "class_id": [],
+                "class_name": [],
+                "tracker_id": [],
+            },
+            metadata=source_detections.metadata,
+        )
+    if track_array.ndim == 1:
+        track_array = track_array.reshape(1, -1)
+
+    source_class_names = class_names_for(source_detections)
+    source_class_ids = class_ids_for(source_detections)
+
+    xyxy = track_array[:, :4].astype(float, copy=False)
+    tracker_ids = track_array[:, 4].astype(int, copy=False)
+    confidences = track_array[:, 5].astype(float, copy=False)
+    class_ids = track_array[:, 6].astype(int, copy=False)
+
+    det_indices = track_array[:, 7].astype(int, copy=False) if track_array.shape[1] > 7 else None
+    class_names = []
+    original_class_ids = []
+    for row_index, class_id in enumerate(class_ids):
+        det_index = None if det_indices is None else int(det_indices[row_index])
+        if det_index is not None and 0 <= det_index < len(source_class_names):
+            class_names.append(str(source_class_names[det_index]))
+            original_class_ids.append(source_class_ids[det_index])
+            continue
+        class_names.append(str(class_id))
+        original_class_ids.append(int(class_id))
+
+    return sv.Detections(
+        xyxy=xyxy,
+        confidence=confidences,
+        class_id=(
+            None
+            if any(class_id is None for class_id in original_class_ids)
+            else np.asarray(original_class_ids, dtype=int)
+        ),
+        tracker_id=tracker_ids,
+        data={
+            "confidence": confidences.tolist(),
+            "class_id": original_class_ids,
+            "class_name": class_names,
+            "tracker_id": tracker_ids.tolist(),
+        },
+        metadata=source_detections.metadata,
+    )
 
 
 def infer_frame_with_model(client, frame, suffix: str, model_id: str) -> dict:
@@ -365,38 +682,18 @@ def missing_sampled_frames_for(detections) -> list[int]:
     return [int(value) for value in values]
 
 
-def reid_applied_for(detections) -> list[bool]:
-    values = detections.data.get("reid_applied")
-    if values is None:
-        values = [False] * len(detections)
-    return [bool(value) for value in values]
-
-
-def reassigned_from_track_ids_for(detections) -> list[int | None]:
-    values = detections.data.get("reassigned_from_track_id")
-    if values is None:
-        values = [None] * len(detections)
-    return [None if value is None else int(value) for value in values]
-
-
-def reid_scores_for(detections) -> list[float | None]:
-    values = detections.data.get("reid_score")
-    if values is None:
-        values = [None] * len(detections)
-    return [None if value is None else float(value) for value in values]
-
-
-def build_detection_rows(detections, frame) -> list[dict]:
+def build_detection_rows(detections, frame, reid_config: dict[str, object]) -> list[dict]:
     rows = []
     confidences = confidences_for(detections)
+    boxes = [[float(value) for value in xyxy] for xyxy in detections.xyxy]
     for track_id, class_id, class_name, confidence, xyxy in zip(
         track_ids_for(detections),
         class_ids_for(detections),
         class_names_for(detections),
         confidences,
-        detections.xyxy,
+        boxes,
     ):
-        xyxy_list = [float(value) for value in xyxy]
+        xyxy_list = list(xyxy)
         rows.append(
             {
                 "track_id": track_id,
@@ -404,7 +701,12 @@ def build_detection_rows(detections, frame) -> list[dict]:
                 "class_name": str(class_name),
                 "confidence": None if confidence is None else float(confidence),
                 "xyxy": xyxy_list,
-                "appearance": extract_torso_appearance(frame, xyxy_list),
+                "appearance": extract_torso_appearance(
+                    frame,
+                    xyxy_list,
+                    [other_box for other_box in boxes if other_box is not xyxy],
+                    reid_config,
+                ),
                 "reid_applied": False,
                 "reassigned_from_track_id": None,
                 "reid_score": None,
@@ -413,22 +715,50 @@ def build_detection_rows(detections, frame) -> list[dict]:
     return rows
 
 
-def extract_torso_appearance(frame, xyxy) -> list[float] | None:
+def extract_torso_appearance(frame, xyxy, other_boxes, reid_config: dict[str, object]) -> list[float] | None:
     import cv2
     import numpy as np
 
-    height, width = frame.shape[:2]
+    if not bool(reid_config["enabled"]):
+        return None
+
     x1, y1, x2, y2 = xyxy
     box_width = x2 - x1
     box_height = y2 - y1
-    if box_width < 12 or box_height < 24:
+    if box_width < int(reid_config["min_box_width"]) or box_height < int(reid_config["min_box_height"]):
         return None
 
-    torso_x1 = max(0, min(width, int(round(x1 + box_width * 0.2))))
-    torso_x2 = max(0, min(width, int(round(x2 - box_width * 0.2))))
-    torso_y1 = max(0, min(height, int(round(y1 + box_height * 0.15))))
-    torso_y2 = max(0, min(height, int(round(y1 + box_height * 0.65))))
-    if torso_x2 - torso_x1 < 8 or torso_y2 - torso_y1 < 12:
+    torso_xyxy = torso_crop_xyxy(frame.shape, xyxy, reid_config)
+    if torso_xyxy is None:
+        return None
+
+    visible_regions = [torso_xyxy]
+    for other_xyxy in other_boxes:
+        overlap = intersect_xyxy(torso_xyxy, other_xyxy)
+        if overlap is None:
+            continue
+        next_visible_regions = []
+        for region in visible_regions:
+            next_visible_regions.extend(subtract_xyxy(region, overlap))
+        visible_regions = next_visible_regions
+        if not visible_regions:
+            return None
+
+    torso_area = xyxy_area(torso_xyxy)
+    visible_area = sum(xyxy_area(region) for region in visible_regions)
+    if torso_area <= 0 or visible_area <= 0:
+        return None
+
+    overlap_fraction = 1.0 - (visible_area / torso_area)
+    if overlap_fraction >= float(reid_config["heavy_overlap_fraction"]):
+        return None
+
+    best_visible_region = max(visible_regions, key=xyxy_area)
+    if xyxy_area(best_visible_region) / torso_area < float(reid_config["min_visible_fraction"]):
+        return None
+
+    torso_x1, torso_y1, torso_x2, torso_y2 = best_visible_region
+    if torso_x2 - torso_x1 < int(reid_config["min_crop_width"]) or torso_y2 - torso_y1 < int(reid_config["min_crop_height"]):
         return None
 
     crop = frame[torso_y1:torso_y2, torso_x1:torso_x2]
@@ -451,6 +781,54 @@ def extract_torso_appearance(frame, xyxy) -> list[float] | None:
         return None
 
     return (features / norm).tolist()
+
+
+def torso_crop_xyxy(frame_shape, xyxy, reid_config: dict[str, object]) -> tuple[int, int, int, int] | None:
+    height, width = frame_shape[:2]
+    x1, y1, x2, y2 = xyxy
+    box_width = x2 - x1
+    box_height = y2 - y1
+
+    x_margin_fraction = float(reid_config["x_margin_fraction"])
+    y_start_fraction = float(reid_config["y_start_fraction"])
+    y_end_fraction = float(reid_config["y_end_fraction"])
+    torso_x1 = max(0, min(width, int(round(x1 + box_width * x_margin_fraction))))
+    torso_x2 = max(0, min(width, int(round(x2 - box_width * x_margin_fraction))))
+    torso_y1 = max(0, min(height, int(round(y1 + box_height * y_start_fraction))))
+    torso_y2 = max(0, min(height, int(round(y1 + box_height * y_end_fraction))))
+    if torso_x2 <= torso_x1 or torso_y2 <= torso_y1:
+        return None
+    return (torso_x1, torso_y1, torso_x2, torso_y2)
+
+
+def intersect_xyxy(left_xyxy, right_xyxy) -> tuple[int, int, int, int] | None:
+    x1 = max(int(left_xyxy[0]), int(right_xyxy[0]))
+    y1 = max(int(left_xyxy[1]), int(right_xyxy[1]))
+    x2 = min(int(left_xyxy[2]), int(right_xyxy[2]))
+    y2 = min(int(left_xyxy[3]), int(right_xyxy[3]))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def subtract_xyxy(source_xyxy, cut_xyxy) -> list[tuple[int, int, int, int]]:
+    overlap = intersect_xyxy(source_xyxy, cut_xyxy)
+    if overlap is None:
+        return [tuple(int(value) for value in source_xyxy)]
+
+    source_x1, source_y1, source_x2, source_y2 = (int(value) for value in source_xyxy)
+    cut_x1, cut_y1, cut_x2, cut_y2 = overlap
+    pieces = [
+        (source_x1, source_y1, source_x2, cut_y1),
+        (source_x1, cut_y2, source_x2, source_y2),
+        (source_x1, cut_y1, cut_x1, cut_y2),
+        (cut_x2, cut_y1, source_x2, cut_y2),
+    ]
+    return [piece for piece in pieces if piece[2] > piece[0] and piece[3] > piece[1]]
+
+
+def xyxy_area(xyxy) -> int:
+    return max(0, int(xyxy[2]) - int(xyxy[0])) * max(0, int(xyxy[3]) - int(xyxy[1]))
 
 
 def appearance_similarity(left: list[float], right: list[float]) -> float:
@@ -498,13 +876,8 @@ def clone_detections_with_metadata(
     detections,
     track_states: list[str],
     missing_sampled_frames: list[int],
-    reid_applied: list[bool] | None = None,
-    reassigned_from_track_id: list[int | None] | None = None,
-    reid_score: list[float | None] | None = None,
 ):
     import supervision as sv
-
-    detection_count = len(detections)
 
     return sv.Detections(
         xyxy=detections.xyxy.copy(),
@@ -519,11 +892,6 @@ def clone_detections_with_metadata(
             "missing_sampled_frames": missing_sampled_frames,
             "tracker_id": track_ids_for(detections),
             "class_name": class_names_for(detections),
-            "reid_applied": reid_applied if reid_applied is not None else [False] * detection_count,
-            "reassigned_from_track_id": (
-                reassigned_from_track_id if reassigned_from_track_id is not None else [None] * detection_count
-            ),
-            "reid_score": reid_score if reid_score is not None else [None] * detection_count,
         },
         metadata=detections.metadata,
     )
@@ -534,16 +902,11 @@ def labels_for(detections) -> list[str]:
     class_names = class_names_for(detections)
     confidences = confidences_for(detections)
     metadata_items = []
-    for state, missing_sampled_frames, reid_applied in zip(
-        track_states_for(detections),
-        missing_sampled_frames_for(detections),
-        reid_applied_for(detections),
-    ):
+    for state, missing_sampled_frames in zip(track_states_for(detections), missing_sampled_frames_for(detections)):
         metadata_items.append(
             [
                 f"[{state}]" if state != "detected" else None,
                 f"gap:{missing_sampled_frames}" if missing_sampled_frames else None,
-                "reid" if reid_applied else None,
             ]
         )
     return [
@@ -559,16 +922,13 @@ def draw_tracks(frame, detections):
 def write_track_records(handle, frame_index: int, detections) -> int:
     confidences = confidences_for(detections)
     count = 0
-    for track_id, class_name, confidence, xyxy, track_state, missing_sampled_frames, reid_applied, reassigned_from_track_id, reid_score in zip(
+    for track_id, class_name, confidence, xyxy, track_state, missing_sampled_frames in zip(
         track_ids_for(detections),
         class_names_for(detections),
         confidences,
         detections.xyxy,
         track_states_for(detections),
         missing_sampled_frames_for(detections),
-        reid_applied_for(detections),
-        reassigned_from_track_ids_for(detections),
-        reid_scores_for(detections),
     ):
         handle.write(
             json.dumps(
@@ -580,9 +940,6 @@ def write_track_records(handle, frame_index: int, detections) -> int:
                     "class_name": str(class_name),
                     "confidence": None if confidence is None else float(confidence),
                     "xyxy": [float(value) for value in xyxy],
-                    "reid_applied": reid_applied,
-                    "reassigned_from_track_id": reassigned_from_track_id,
-                    "reid_score": reid_score,
                 }
             )
             + "\n"
@@ -646,7 +1003,7 @@ def write_projected_track_records(handle, frame_index: int, detections, homograp
     image_points = [foot_point_for_bbox(xyxy) for xyxy in detections.xyxy]
     projected_points = project_points(homography_result.matrix, image_points)
     count = 0
-    for track_id, class_name, confidence, xyxy, image_point, projected_point, track_state, missing_sampled_frames, reid_applied, reassigned_from_track_id, reid_score in zip(
+    for track_id, class_name, confidence, xyxy, image_point, projected_point, track_state, missing_sampled_frames in zip(
         track_ids_for(detections),
         class_names_for(detections),
         confidences,
@@ -655,9 +1012,6 @@ def write_projected_track_records(handle, frame_index: int, detections, homograp
         projected_points,
         track_states_for(detections),
         missing_sampled_frames_for(detections),
-        reid_applied_for(detections),
-        reassigned_from_track_ids_for(detections),
-        reid_scores_for(detections),
     ):
         handle.write(
             json.dumps(
@@ -671,9 +1025,6 @@ def write_projected_track_records(handle, frame_index: int, detections, homograp
                     "xyxy": [float(value) for value in xyxy],
                     "image_foot_xy": image_point,
                     "court_xy_m": [float(projected_point[0]), float(projected_point[1])],
-                    "reid_applied": reid_applied,
-                    "reassigned_from_track_id": reassigned_from_track_id,
-                    "reid_score": reid_score,
                     "homography_frame_status": "ok",
                     "homography_inliers_count": homography_result.inliers_count,
                     "homography_reprojection_mean_m": homography_result.reprojection_mean_m,
@@ -696,6 +1047,12 @@ def process_video(
     sampled_output_only: bool = True,
     confidence: float = 0.0,
     output_fps: float | None = None,
+    tracker_backend: str = DEFAULT_TRACKER_BACKEND,
+    tracker_config: Path = DEFAULT_DEEPOCSORT_CONFIG_PATH,
+    reid_config: Path = DEFAULT_REID_CONFIG_PATH,
+    deepocsort_reid_weights: str | None = None,
+    deepocsort_device: str | None = None,
+    deepocsort_half: bool | None = None,
     smoothing_window: int = 3,
     reuse_stale_tracks: bool = False,
     persist_tracks: bool = True,
@@ -739,10 +1096,20 @@ def process_video(
     projected_track_frames = 0
 
     try:
+        resolved_reid_config = load_reid_config(reid_config)
         client = roboflow_client(api_key)
-        tracker = sv.ByteTrack()
+        tracker = TrackerAdapter(
+            backend=tracker_backend,
+            tracker_config=tracker_config,
+            deepocsort_reid_weights=deepocsort_reid_weights,
+            deepocsort_device=deepocsort_device,
+            deepocsort_half=deepocsort_half,
+        )
         smoother = TrackSmoother(window_size=smoothing_window)
-        persister = TrackPersistence(max_missing_sampled_frames=max_missing_sampled_frames if persist_tracks else 0)
+        persister = TrackPersistence(
+            max_missing_sampled_frames=max_missing_sampled_frames if persist_tracks else 0,
+            reid_config=resolved_reid_config,
+        )
         with tracks_output.open("w", encoding="utf-8") as tracks_file:
             json_context = json_output.open("w", encoding="utf-8") if json_output is not None else nullcontext()
             court_context = court_json_output.open("w", encoding="utf-8") if court_json_output is not None else nullcontext()
@@ -765,7 +1132,7 @@ def process_video(
                             write_inference_record(json_file, frame_index, timestamp_seconds, result)
                             inference_records += 1
                         detections = detections_from_result(result, confidence)
-                        detections = tracker.update_with_detections(detections)
+                        detections = tracker.update(detections, frame)
                         detections = smoother.update_with_detections(detections)
                         detections = persister.update_with_detections(detections, frame_index, frame)
                         track_records += write_track_records(tracks_file, frame_index, detections)
@@ -816,6 +1183,9 @@ def process_video(
         "frames_to_read": frames_to_read,
         "roboflow_calls": calls,
         "output_fps": output_fps,
+        "tracker_backend": tracker_backend,
+        "tracker_config": str(tracker_config) if tracker_backend == "deepocsort" else None,
+        "reid_config": str(reid_config),
         "track_records": track_records,
         "inference_records": inference_records,
         "court_model_id": court_model_id if court_keypoints else None,
@@ -828,7 +1198,7 @@ def process_video(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Track basketball players in sampled video frames with ByteTrack.")
+    parser = argparse.ArgumentParser(description="Track basketball players in sampled video frames.")
     parser.add_argument("video", type=Path, help="Path to the input video")
     parser.add_argument("--output", type=Path, help="Path for the tracked video")
     parser.add_argument("--tracks-output", type=Path, help="Path for JSONL track records")
@@ -856,6 +1226,49 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, help="Maximum number of frames to read")
     parser.add_argument("--dry-run", action="store_true", help="Print video info and estimated calls without inference")
     parser.add_argument("--confidence", type=float, default=0.0, help="Minimum confidence to track and draw")
+    parser.add_argument(
+        "--tracker-backend",
+        choices=TRACKER_BACKEND_CHOICES,
+        default=DEFAULT_TRACKER_BACKEND,
+        help="Tracking backend. Default: bytetrack",
+    )
+    parser.add_argument(
+        "--tracker-config",
+        type=Path,
+        default=DEFAULT_DEEPOCSORT_CONFIG_PATH,
+        help=(
+            "Deep OC-SORT tracker config file. This is the main place to tune tracker behavior; "
+            "the --deepocsort-* flags only override values from this file. "
+            f"Default: {DEFAULT_DEEPOCSORT_CONFIG_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--reid-config",
+        type=Path,
+        default=DEFAULT_REID_CONFIG_PATH,
+        help=(
+            "ReID crop/quality config file for the lightweight appearance reassignment path. "
+            f"Default: {DEFAULT_REID_CONFIG_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--deepocsort-reid-weights",
+        default=None,
+        help=(
+            "Override reid_weights from --tracker-config when --tracker-backend deepocsort is selected."
+        ),
+    )
+    parser.add_argument(
+        "--deepocsort-device",
+        default=None,
+        help="Override device from --tracker-config when --tracker-backend deepocsort is selected.",
+    )
+    parser.add_argument(
+        "--deepocsort-half",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override half from --tracker-config when --tracker-backend deepocsort is selected.",
+    )
     parser.add_argument(
         "--sampled-output-only",
         action=argparse.BooleanOptionalAction,
@@ -939,6 +1352,12 @@ def main() -> None:
             sampled_output_only=args.sampled_output_only,
             confidence=args.confidence,
             output_fps=args.output_fps,
+            tracker_backend=args.tracker_backend,
+            tracker_config=args.tracker_config,
+            reid_config=args.reid_config,
+            deepocsort_reid_weights=args.deepocsort_reid_weights,
+            deepocsort_device=args.deepocsort_device,
+            deepocsort_half=args.deepocsort_half,
             smoothing_window=args.smoothing_window,
             reuse_stale_tracks=args.reuse_stale_tracks,
             persist_tracks=args.persist_tracks,
@@ -955,6 +1374,10 @@ def main() -> None:
     print(f"Frames read: {stats['frames_read']}/{stats['frame_count'] or 'unknown'}")
     print(f"Roboflow calls: {stats['roboflow_calls']}")
     print(f"Output FPS: {stats['output_fps']}")
+    print(f"Tracker backend: {stats['tracker_backend']}")
+    if stats["tracker_config"] is not None:
+        print(f"Tracker config: {stats['tracker_config']}")
+    print(f"ReID config: {stats['reid_config']}")
     print(f"Track records: {stats['track_records']}")
     print(f"Inference records: {stats['inference_records']}")
     if args.court_keypoints:

@@ -10,7 +10,7 @@ This backlog documents the implementation work needed to evolve the current Robo
 | Video detection | Implemented with frame sampling, dry-run cost estimation, sampled-only output, and annotated MP4 output. |
 | Cost control | Basic controls exist: `--dry-run`, `--frame-stride`, `--max-frames`, `--sampled-output-only`. |
 | Supervision integration | Implemented for image/video annotation with shared detection/keypoint annotation helpers. |
-| Tracking | Implemented locally in `scripts/video_pipeline.py` / `scripts/track_players_video.py` with smoothing, short-lived predicted persistence, and lightweight appearance-based reassignment. Identity consistency is still not reliable in crossings/occlusions. |
+| Tracking | Implemented locally in `scripts/tracking/video_pipeline.py` / `scripts/tracking/track_players_video.py` with smoothing, short-lived predicted persistence, and lightweight appearance-based reassignment. Identity consistency is still not reliable in crossings/occlusions. |
 | Team identification | Not implemented yet. |
 | Jersey OCR | Not implemented yet. |
 | Court keypoints / homography | Implemented locally for single-frame, sampled-video, homography debug, and projected-track export. Homography now rejects obviously bad point layouts before fitting. |
@@ -61,8 +61,8 @@ Acceptance criteria:
 
 Notes:
 
-- Video raw inference output is now emitted as JSONL from `scripts/video_pipeline.py`
-  and `scripts/track_players_video.py`.
+- Video raw inference output is now emitted as JSONL from `scripts/tracking/video_pipeline.py`
+  and `scripts/tracking/track_players_video.py`.
 - Current per-inference record includes `frame_index`, `timestamp_seconds`,
   `model_id`, and `predictions`.
 
@@ -102,11 +102,11 @@ Acceptance criteria:
 
 Notes:
 
-- `scripts/annotation_helpers.py` now owns shared detection filtering, label formatting,
+- `scripts/shared/annotation_helpers.py` now owns shared detection filtering, label formatting,
   color lookup, and point/detection annotation helpers.
-- `scripts/track_players_video.py`, `scripts/detect_players.py`,
-  `scripts/detect_players_video.py`, `scripts/detect_court_keypoints.py`, and
-  `scripts/detect_court_keypoints_video.py` now reuse the shared helpers instead
+- `scripts/tracking/track_players_video.py`, `scripts/tracking/detect_players.py`,
+  `scripts/tracking/detect_players_video.py`, `scripts/court/detect_court_keypoints.py`, and
+  `scripts/court/detect_court_keypoints_video.py` now reuse the shared helpers instead
   of maintaining separate label or OpenCV text/color code paths.
 
 ## Phase 3 — Cheap Tracking First
@@ -124,8 +124,8 @@ Acceptance criteria:
 
 Notes:
 
-- Implemented locally in `scripts/track_players_video.py` and exposed through the
-  unified entrypoint `scripts/video_pipeline.py`; not API-integrated yet.
+- Implemented locally in `scripts/tracking/track_players_video.py` and exposed through the
+  unified entrypoint `scripts/tracking/video_pipeline.py`; not API-integrated yet.
 - Default output writes only inferred frames to avoid implying continuous tracking across skipped frames.
 - Tracking quality is improved but not solved: IDs still switch in crossings/occlusions, some tracks still die entirely, and `--frame-stride 1` is too slow/costly to treat as the default fix.
 - The current tracker construction is still `sv.ByteTrack()`, and the deprecation warning means the tracker API choice should be revisited before treating this path as stable.
@@ -160,7 +160,7 @@ Acceptance criteria:
 Notes:
 
 - Implemented through `TrackSmoother` plus sampled-output defaults in
-  `scripts/track_players_video.py` and `scripts/video_pipeline.py`.
+  `scripts/tracking/track_players_video.py` and `scripts/tracking/video_pipeline.py`.
 - This improved visual stability, but it did not solve the harder identity
   problem during player crossings and occlusions.
 
@@ -198,10 +198,10 @@ Acceptance criteria:
 
 Notes:
 
-- Implemented locally in `scripts/detect_court_keypoints.py` (single image) and `scripts/detect_court_keypoints_video.py` (sampled video). Not API-integrated yet.
+- Implemented locally in `scripts/court/detect_court_keypoints.py` (single image) and `scripts/court/detect_court_keypoints_video.py` (sampled video). Not API-integrated yet.
 - Default model is `COURT_MODEL_ID` or `basketball-court-detection-2/22`.
 - Video script defaults: `--confidence 0.7` (model returns ~33 raw keypoints but most are noise <0.05; only ~10-12 are reliable >0.97), `--frame-stride 30`, `--sampled-output-only true`. Uses the same `parse_keypoints` helper as the image script.
-- Image visualization now uses Supervision `sv.KeyPoints` + `sv.VertexAnnotator` + `sv.EdgeAnnotator` (see `to_keypoints` and `draw_with_annotators` in `scripts/detect_court_keypoints.py`). The edges list is a placeholder that connects consecutive parsed keypoints — replace with the canonical court skeleton once labels are mapped.
+- Image visualization now uses Supervision `sv.KeyPoints` + `sv.VertexAnnotator` + `sv.EdgeAnnotator` (see `to_keypoints` and `draw_with_annotators` in `scripts/court/detect_court_keypoints.py`). The edges list is a placeholder that connects consecutive parsed keypoints — replace with the canonical court skeleton once labels are mapped.
 
 ### Task 4.2: Compute homography
 
@@ -212,9 +212,9 @@ Notes:
 
 Notes:
 
-- Implemented locally in `scripts/build_court_homography.py` (RANSAC, 8 px
+- Implemented locally in `scripts/court/build_court_homography.py` (RANSAC, 8 px
   threshold by default; `--self-test` for a synthetic round-trip check; no
-  Roboflow call) and `scripts/build_court_homography_video.py` (sampled
+  Roboflow call) and `scripts/court/build_court_homography_video.py` (sampled
   frames, side-by-side debug MP4 with frame index, status, inliers count and
   mean reprojection error in meters).
 - Homography now performs geometric pre-validation on the matched image points
@@ -241,8 +241,8 @@ Acceptance criteria:
 
 Notes:
 
-- Implemented locally in `scripts/visualize_projected_tracks.py`.
-- Reuses `draw_fiba_court` from `scripts/build_court_homography.py` and consumes the existing projected-track JSONL emitted by `scripts/track_players_video.py` / `scripts/video_pipeline.py`.
+- Implemented locally in `scripts/court/visualize_projected_tracks.py`.
+- Reuses `draw_fiba_court` from `scripts/court/build_court_homography.py` and consumes the existing projected-track JSONL emitted by `scripts/tracking/track_players_video.py` / `scripts/tracking/video_pipeline.py`.
 - Produces an offline top-down PNG summary by default and can optionally render a simple court-only MP4 for per-frame review, with no additional Roboflow calls.
 
 ## Open Tracking Issues
@@ -256,6 +256,19 @@ Notes:
   mistaken for solved identity tracking.
 
 See `TRACKING_ISSUES.md` for the focused issue breakdown and recommended next actions.
+See `future_tasks/robust-player-tracking-plan.md` for the trackable rework plan,
+phase order, and success criteria that should guide Task 3.3 and the follow-on
+tracking changes.
+
+### Task 3.4: Use the tracking rework plan as the working reference
+
+- [ ] Use `future_tasks/robust-player-tracking-plan.md` as the planning reference for the tracking rework.
+- [ ] Finish the evaluation-first slice before changing the tracking architecture more aggressively.
+
+Acceptance criteria:
+
+- Tracking changes are evaluated against the same clip set before and after tracker/re-ID changes.
+- The backlog has one explicit reference doc for the tracking rework instead of scattered notes only.
 
 ## Phase 5 — Team Identification
 
@@ -465,7 +478,7 @@ tracked player foot points -> cv2.perspectiveTransform -> court coordinates
 ```
 
 Why this next: the local homography script is in place
-(`scripts/build_court_homography.py`); the missing piece is using it on every
+(`scripts/court/build_court_homography.py`); the missing piece is using it on every
 tracked frame so downstream code can reason in meters instead of pixels. The
 mapping is still a best-guess, so any real measurement on the target court
 should land in `COURT_POINT_MAP` before relying on shot charts or spatial

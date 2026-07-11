@@ -18,6 +18,12 @@ Video processing can make many Roboflow calls. Run `dry_run=true` first to estim
 
 These scripts are local pipeline steps first. The local CLI path is ahead of the API path.
 
+Implementations now live under:
+
+- `scripts/tracking/` for player detection, tracking, frame extraction, and tracking evaluation.
+- `scripts/court/` for court-keypoint, homography, and projected-track tooling.
+- `scripts/shared/` for shared config and annotation helpers.
+
 ## Script Roles
 
 This repo currently has one main local video entrypoint plus a set of focused
@@ -30,8 +36,8 @@ Use these first.
 
 | Script | Role | When to use it |
 | --- | --- | --- |
-| `scripts/video_pipeline.py` | Main local video pipeline | Run the current player-detection + tracking pipeline with annotated video, track JSONL, and raw inference JSONL. |
-| `scripts/detect_players.py` | Main single-image detector | Run player detection on one local image/frame. |
+| `scripts/tracking/video_pipeline.py` | Main local video pipeline | Run the current player-detection + tracking pipeline with annotated video, track JSONL, and raw inference JSONL. |
+| `scripts/tracking/detect_players.py` | Main single-image detector | Run player detection on one local image/frame. |
 
 ### Local support tools
 
@@ -40,24 +46,52 @@ workflow.
 
 | Script | Role | When to use it |
 | --- | --- | --- |
-| `scripts/extract_video_frames.py` | Offline frame extraction | Sample a local video into JPG frames without calling Roboflow. |
-| `scripts/detect_players_video.py` | Detection-only video helper | Inspect or run sampled video detection without tracking; also provides reusable video helpers. |
-| `scripts/track_players_video.py` | Tracking core | Core ByteTrack processing used by `video_pipeline.py`; still useful directly for focused tracking/debug work. |
-| `scripts/detect_court_keypoints.py` | Court keypoints on one image | Test court landmarks on a single frame. |
-| `scripts/detect_court_keypoints_video.py` | Court keypoints on sampled video | Evaluate court keypoint behavior across a clip. |
-| `scripts/build_court_homography.py` | Homography from saved keypoints | Turn detected court keypoints into a FIBA homography and debug reprojection quality. |
-| `scripts/build_court_homography_video.py` | Video homography debug | Build a side-by-side debug video for court projection quality checks. |
-| `scripts/visualize_projected_tracks.py` | Top-down projected-track debug | Render projected player positions from JSONL onto a FIBA court as a PNG or simple MP4. |
+| `scripts/tracking/extract_video_frames.py` | Offline frame extraction | Sample a local video into JPG frames without calling Roboflow. |
+| `scripts/tracking/detect_players_video.py` | Detection-only video helper | Inspect or run sampled video detection without tracking; also provides reusable video helpers. |
+| `scripts/tracking/track_players_video.py` | Tracking core | Tracker adapter point used by `video_pipeline.py`; keeps ByteTrack and Deep OC-SORT backend logic in one place. |
+| `scripts/tracking/evaluate_tracking.py` | Baseline tracking review | Turn manual review events into baseline counts for ID switches, full losses, and successful recoveries. |
+| `scripts/tracking/summarize_tracking_run.py` | Automatic track-file summary | Print technical summary metrics that are directly derivable from one `tracks.jsonl` file. |
+| `scripts/court/detect_court_keypoints.py` | Court keypoints on one image | Test court landmarks on a single frame. |
+| `scripts/court/detect_court_keypoints_video.py` | Court keypoints on sampled video | Evaluate court keypoint behavior across a clip. |
+| `scripts/court/build_court_homography.py` | Homography from saved keypoints | Turn detected court keypoints into a FIBA homography and debug reprojection quality. |
+| `scripts/court/build_court_homography_video.py` | Video homography debug | Build a side-by-side debug video for court projection quality checks. |
+| `scripts/court/visualize_projected_tracks.py` | Top-down projected-track debug | Render projected player positions from JSONL onto a FIBA court as a PNG or simple MP4. |
 
 ### Shared infrastructure
 
 | Script | Role |
 | --- | --- |
-| `scripts/env_config.py` | Shared `.env`-backed configuration for model IDs, API key, and Roboflow endpoint. |
+| `scripts/shared/env_config.py` | Shared `.env`-backed configuration for model IDs, API key, and Roboflow endpoint. |
+
+### Tracking evaluation baseline
+
+Use `scripts/tracking/evaluate_tracking.py` to summarize manual review events against the current `tracks.jsonl` workflow.
+
+Manual review input is one JSON object per line. Keep it small and explicit:
+
+```json
+{"clip":"crossing_clip_01","frame_index":120,"event":"id_switch","track_id":7,"notes":"blue guard swaps with wing after overlap"}
+{"clip":"crossing_clip_01","frame_index":188,"event":"full_loss","track_id":12,"notes":"player disappears behind screener and returns with new ID"}
+{"clip":"crossing_clip_01","frame_index":214,"event":"successful_recovery","track_id":5,"notes":"same player returns with original ID"}
+```
+
+Run it like this:
+
+```bash
+python3 scripts/tracking/evaluate_tracking.py review/tracking_events.jsonl --tracks-jsonl outputs/game_tracks.jsonl
+```
+
+The report prints the three baseline counts plus a simple occlusion recovery rate.
+
+For an automatic summary from the track file alone:
+
+```bash
+python3 scripts/tracking/summarize_tracking_run.py outputs/game_tracks.jsonl
+```
 
 ### Current direction
 
-- Treat `scripts/video_pipeline.py` as the canonical local video path.
+- Treat `scripts/tracking/video_pipeline.py` as the canonical local video path.
 - Keep court/homography tools integrated only where they already help the local pipeline (`--court-keypoints` plus projected-track JSONL), and keep the heavier debug/evaluation scripts separate.
 - Add new stages to the pipeline by reusing these support tools first, then
   folding only the stable pieces into the main entrypoint.
@@ -67,9 +101,9 @@ workflow.
 Implemented now:
 
 - Shared annotation helpers now cover player detection, tracking, and court keypoint visualization.
-- `scripts/video_pipeline.py` can run sampled player tracking, optional court keypoints, and projected-track JSONL export in one local pass.
+- `scripts/tracking/video_pipeline.py` can run sampled player tracking, optional court keypoints, and projected-track JSONL export in one local pass.
 - Homography fitting now includes geometric pre-validation before `cv2.findHomography`, so obviously degenerate keypoint layouts are rejected early.
-- Projected-track debugging is available through `scripts/visualize_projected_tracks.py`.
+- Projected-track debugging is available through `scripts/court/visualize_projected_tracks.py`.
 - Tracking keeps short-lived predicted tracks for brief missed sampled detections.
 - A lightweight torso-color appearance re-ID baseline can reassign some recently lost tracks.
 
@@ -80,6 +114,7 @@ Known limitations:
 - `--frame-stride 1` is slower and more expensive, and it still does not solve identity consistency by itself.
 - Current appearance re-ID is a cheap baseline, not a robust identity solution.
 - The current `sv.ByteTrack()` usage should be revisited because the tracker API now emits a deprecation warning.
+- Deep OC-SORT now routes through BoxMOT and adds a ReID-model dependency plus runtime cost compared with ByteTrack.
 
 See `TRACKING_ISSUES.md` for the short list of unresolved tracking failures and recommended next actions.
 
@@ -89,13 +124,13 @@ This is the intended path so future work stays understandable.
 
 ### 1. Keep as the main pipeline
 
-These belong in `scripts/video_pipeline.py` because they are part of the core
+These belong in `scripts/tracking/video_pipeline.py` because they are part of the core
 "process one local video and inspect the result" workflow.
 
 | Stage | Status | Notes |
 | --- | --- | --- |
 | Player detection | Integrated | Current base stage. |
-| ByteTrack tracking | Integrated with limitations | Includes smoothing, short-lived predicted persistence, and lightweight appearance-based reassignment, but ID switches and full losses still happen in crossings/occlusions. |
+| Tracker backend (`--tracker-backend`) | Integrated | The pipeline routes tracking through one adapter point in `scripts/tracking/track_players_video.py`; `bytetrack` stays as the light default and `deepocsort` is available through BoxMOT. |
 | Raw inference JSONL | Integrated | One record per inferred frame. |
 | Court keypoints | Partially integrated | Available through `--court-keypoints` in the local video pipeline, with separate debug scripts still retained. |
 | Court homography / player projection | Partially integrated | Projected-track JSONL export exists in the local pipeline; broader downstream use still depends on trustworthy keypoints and mapping. |
@@ -110,21 +145,21 @@ their role is clear.
 
 | Script | Why it stays external for now |
 | --- | --- |
-| `scripts/extract_video_frames.py` | Operator tooling for offline inspection, not part of inference/render. |
-| `scripts/detect_players_video.py` | Detection-only helper and source of reusable video utilities. |
-| `scripts/track_players_video.py` | Processing core used by the main pipeline, but still useful as a focused debug tool. |
-| `scripts/detect_court_keypoints.py` | Single-frame evaluation tool for court landmarks. |
-| `scripts/detect_court_keypoints_video.py` | Sampled-video evaluation tool for court landmarks. |
-| `scripts/build_court_homography.py` | Local geometry/debug tool for checking court mapping quality. |
-| `scripts/build_court_homography_video.py` | Side-by-side projection debug tool before main-pipeline integration. |
+| `scripts/tracking/extract_video_frames.py` | Operator tooling for offline inspection, not part of inference/render. |
+| `scripts/tracking/detect_players_video.py` | Detection-only helper and source of reusable video utilities. |
+| `scripts/tracking/track_players_video.py` | Processing core used by the main pipeline, but still useful as a focused debug tool. |
+| `scripts/court/detect_court_keypoints.py` | Single-frame evaluation tool for court landmarks. |
+| `scripts/court/detect_court_keypoints_video.py` | Sampled-video evaluation tool for court landmarks. |
+| `scripts/court/build_court_homography.py` | Local geometry/debug tool for checking court mapping quality. |
+| `scripts/court/build_court_homography_video.py` | Side-by-side projection debug tool before main-pipeline integration. |
 
 ### 3. Candidates to merge or retire later
 
-- `scripts/detect_players_video.py`: keep while it provides reusable helpers;
-  retire it as a user-facing entrypoint once `video_pipeline.py` fully replaces
+- `scripts/tracking/detect_players_video.py`: keep while it provides reusable helpers;
+  retire it as a user-facing entrypoint once `scripts/tracking/video_pipeline.py` fully replaces
   it for normal video work.
-- `scripts/track_players_video.py`: keep as the implementation core unless it
-  becomes thin enough to fold directly into `video_pipeline.py` without making
+- `scripts/tracking/track_players_video.py`: keep as the implementation core unless it
+  becomes thin enough to fold directly into `scripts/tracking/video_pipeline.py` without making
   that file ugly.
 - Court and homography scripts: keep separate until the integration path is
   proven; do not merge them early just to reduce file count.
@@ -132,26 +167,60 @@ their role is clear.
 ### Rule of thumb
 
 - If a script is used to process the normal local video workflow, it belongs in
-  or behind `scripts/video_pipeline.py`.
+  or behind `scripts/tracking/video_pipeline.py`.
 - If a script exists to inspect, validate, calibrate, or debug one stage, keep
   it as a support tool until the stage is stable.
 
 Run the main local video pipeline, no Roboflow call:
 
 ```bash
-python3 scripts/video_pipeline.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
+python3 scripts/tracking/video_pipeline.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
 ```
 
 Run the main local video pipeline with tracking only:
 
 ```bash
-python3 scripts/video_pipeline.py media/game.mp4 --frame-stride 30 --max-frames 300
+python3 scripts/tracking/video_pipeline.py media/game.mp4 --frame-stride 30 --max-frames 300
 ```
+
+Run the same pipeline with Deep OC-SORT through BoxMOT:
+
+```bash
+python3 scripts/tracking/video_pipeline.py media/game.mp4 \
+  --tracker-backend deepocsort \
+  --frame-stride 30 \
+  --max-frames 300
+```
+
+Deep OC-SORT notes:
+
+- Install `boxmot==22.0.0` from `requirements.txt` before using `--tracker-backend deepocsort`.
+- Imports stay lazy, so ByteTrack users do not pay the BoxMOT import/runtime cost unless they select `deepocsort`.
+- Edit `config/deepocsort.toml` first. That file is now the main place to tune Deep OC-SORT behavior.
+- Edit `config/reid.toml` when you want to tune the lightweight torso-crop appearance path used for recent-track reassignment.
+- `--tracker-config` defaults to `config/deepocsort.toml`.
+- `--reid-config` defaults to `config/reid.toml`.
+- `--deepocsort-reid-weights`, `--deepocsort-device`, and `--deepocsort-half` still exist, but now they only override the file for one run.
+
+Minimal Deep OC-SORT workflow:
+
+1. Open `config/deepocsort.toml` and adjust the comments-backed values you care about.
+2. Open `config/reid.toml` if you want to tune torso crop bounds or minimum crop/box sizes for ReID.
+3. Run the pipeline with `--tracker-backend deepocsort`.
+4. Only use the `--deepocsort-*` flags when you want a one-off override without editing the file.
+
+ReID crop tuning quick path:
+
+1. Edit `config/reid.toml`.
+2. Start with `[reid.crop]` if you want to try a tighter or lower torso band.
+3. Use `[reid.overlap]` to reject heavily occluded torso crops so local reassignment falls back to motion instead of contaminated color.
+4. Use `[reid.quality]` to reject tiny boxes/crops that produce noisy appearance features.
+5. Run the same command again; the pipeline loads the file on each run.
 
 Run the main local video pipeline with court keypoints and projected-track export:
 
 ```bash
-python3 scripts/video_pipeline.py media/game.mp4 \
+python3 scripts/tracking/video_pipeline.py media/game.mp4 \
   --court-keypoints \
   --frame-stride 30 \
   --max-frames 300
@@ -172,7 +241,7 @@ Main pipeline defaults:
 Projected-track visualization from pipeline output:
 
 ```bash
-python3 scripts/visualize_projected_tracks.py outputs/game_projected_tracks.jsonl --output-video outputs/game_projected_tracks_court.mp4
+python3 scripts/court/visualize_projected_tracks.py outputs/game_projected_tracks.jsonl --output-video outputs/game_projected_tracks_court.mp4
 ```
 
 Visualizer defaults:
@@ -184,7 +253,7 @@ Visualizer defaults:
 Detect court keypoints on one frame:
 
 ```bash
-python3 scripts/detect_court_keypoints.py media/frame.jpg --confidence 0.0
+python3 scripts/court/detect_court_keypoints.py media/frame.jpg --confidence 0.0
 ```
 
 Defaults:
@@ -193,18 +262,18 @@ Defaults:
 - Keypoint JSON: `outputs/<image-stem>_court_keypoints.json` with `model_id`, `raw_result`, normalized `keypoints`, and a `keypoints_sv` summary (`xy`, `labels`, `class_ids`, `keypoint_confidence`).
 - Court model: `COURT_MODEL_ID` or `basketball-court-detection-2/22`.
 - Visualization uses Supervision `sv.KeyPoints` with `sv.VertexAnnotator` (yellow circles + label text) and `sv.EdgeAnnotator` driven by the shared semantic court template.
-- Homography uses the shared authoritative label -> court-coordinate map in `scripts/court_template.py`.
+- Homography uses the shared authoritative label -> court-coordinate map in `scripts/court/court_template.py`.
 
 Dry-run court keypoints on a video, no Roboflow call:
 
 ```bash
-python3 scripts/detect_court_keypoints_video.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
+python3 scripts/court/detect_court_keypoints_video.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
 ```
 
 Run sampled-frame court keypoint detection on a video:
 
 ```bash
-python3 scripts/detect_court_keypoints_video.py media/game.mp4 --frame-stride 30 --max-frames 300
+python3 scripts/court/detect_court_keypoints_video.py media/game.mp4 --frame-stride 30 --max-frames 300
 ```
 
 Defaults:
@@ -224,7 +293,7 @@ step now rejects obviously degenerate point layouts before homography fitting.
 No Roboflow call is made.
 
 ```bash
-python3 scripts/build_court_homography.py outputs/frame_court_keypoints.json \
+python3 scripts/court/build_court_homography.py outputs/frame_court_keypoints.json \
   --court-image
 ```
 
@@ -244,13 +313,13 @@ Defaults:
 Run sampled-frame court keypoint detection + FIBA homography on a video, no API call:
 
 ```bash
-python3 scripts/build_court_homography_video.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
+python3 scripts/court/build_court_homography_video.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
 ```
 
-Build a side-by-side debug video (original frame | FIBA 2D court with projected keypoints) per sampled frame. Reuses the same shared court template and RANSAC math as `build_court_homography.py`.
+Build a side-by-side debug video (original frame | FIBA 2D court with projected keypoints) per sampled frame. Reuses the same shared court template and RANSAC math as `scripts/court/build_court_homography.py`.
 
 ```bash
-python3 scripts/build_court_homography_video.py media/game.mp4 --frame-stride 30 --max-frames 300
+python3 scripts/court/build_court_homography_video.py media/game.mp4 --frame-stride 30 --max-frames 300
 ```
 
 Defaults:
@@ -265,13 +334,13 @@ Defaults:
 Dry-run video tracking, no Roboflow call:
 
 ```bash
-python3 scripts/track_players_video.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
+python3 scripts/tracking/track_players_video.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
 ```
 
 Run sampled-frame ByteTrack tracking:
 
 ```bash
-python3 scripts/track_players_video.py media/game.mp4 --frame-stride 30 --max-frames 300
+python3 scripts/tracking/track_players_video.py media/game.mp4 --frame-stride 30 --max-frames 300
 ```
 
 Defaults:

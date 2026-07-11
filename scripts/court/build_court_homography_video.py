@@ -2,7 +2,7 @@
 """Run sampled-frame court keypoint detection + FIBA homography on a video.
 
 This script reuses the shared labeled template from
-``scripts/court_template.py`` via ``scripts/build_court_homography.py``. That
+``scripts/court/court_template.py`` via ``scripts/court/build_court_homography.py``. That
 template is the authoritative label -> court-coordinate map for this repo.
 
 The script:
@@ -11,12 +11,12 @@ The script:
   homography per inferred frame, and writes a side-by-side debug video:
   original frame on the left, FIBA 2D court with projected keypoints on the
   right.
-- Reuses ``parse_keypoints`` from ``scripts/detect_court_keypoints``,
+- Reuses ``parse_keypoints`` from ``scripts/court/detect_court_keypoints``,
   ``infer_frame`` / ``roboflow_client`` from
-  ``scripts/detect_court_keypoints_video``, the ``compute_homography`` /
+  ``scripts/court/detect_court_keypoints_video``, the ``compute_homography`` /
   ``draw_fiba_court`` / ``draw_projected_keypoints`` math from
-  ``scripts/build_court_homography``, and video plumbing from
-  ``scripts/detect_players_video``.
+  ``scripts/court/build_court_homography``, and video plumbing from
+  ``scripts/tracking/detect_players_video``.
 - Defaults to ``--sampled-output-only true`` so only inferred frames are
   written (the homography per frame is the only one we have, so showing
   un-inferred frames would be misleading).
@@ -29,37 +29,37 @@ import sys
 from pathlib import Path
 from typing import Any
 
-SCRIPTS_DIR = Path(__file__).resolve().parent
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from env_config import COURT_MODEL_ID, get_roboflow_api_key
+from scripts.shared.env_config import COURT_MODEL_ID, get_roboflow_api_key
 
 
 def _import_homography_helpers():
-    from build_court_homography import (
+    from scripts.court.build_court_homography import (
         GeometryValidationError,
         compute_homography,
         draw_fiba_court,
         draw_projected_keypoints,
     )
-    from court_template import canonical_point_map
+    from scripts.court.court_template import canonical_point_map
 
     return canonical_point_map, GeometryValidationError, compute_homography, draw_fiba_court, draw_projected_keypoints
 
 
 def _import_keypoint_parser():
-    from detect_court_keypoints import draw_with_annotators, to_keypoints, parse_keypoints
+    from scripts.court.detect_court_keypoints import draw_with_annotators, to_keypoints, parse_keypoints
     return draw_with_annotators, to_keypoints, parse_keypoints
 
 
 def _import_video_inference():
-    from detect_court_keypoints_video import infer_frame, roboflow_client
+    from scripts.court.detect_court_keypoints_video import infer_frame, roboflow_client
     return infer_frame, roboflow_client
 
 
 def _import_video_plumbing():
-    from detect_players_video import (
+    from scripts.tracking.detect_players_video import (
         default_output_fps,
         inspect_video,
         open_video,
