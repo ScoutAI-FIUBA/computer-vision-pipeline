@@ -1,0 +1,26 @@
+# Main adaptive frame-stride tuning file for this repo.
+#
+# Edit this file when you want to tune how aggressively the pipeline samples
+# risky player interactions without touching Python code.
+
+[adaptive_frame_stride]
+
+# Turn adaptive frame-stride on or off.
+# false preserves the old fixed-stride behavior exactly.
+enabled = false
+
+# Lower stride to use temporarily after a risky sampled frame.
+# Keep this less than or equal to the main --frame-stride value.
+risk_frame_stride = 5
+
+# Trigger risky-scene mode when two player boxes overlap by at least this
+# fraction of the smaller box.
+risk_overlap_fraction = 0.3
+
+# Trigger risky-scene mode when two player centers are this many player-heights
+# apart or closer.
+risk_proximity_heights = 0.9
+
+# Keep the lower stride active for this many frames after a risky sampled frame
+# so the pipeline does not flap immediately back to the base stride.
+risk_hold_frames = 10

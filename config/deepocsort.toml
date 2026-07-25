@@ -8,7 +8,7 @@
 
 # BoxMOT ReID checkpoint used to extract appearance embeddings for identity
 # recovery after occlusions or close crossings.
-reid_weights = "osnet_x0_25_msmt17.pt"
+reid_weights = "osnet_x1_0_msmt17.pt"
 
 # Device used by the ReID model. Keep "cpu" for the safest default; switch to
 # "cuda" only if your local torch + BoxMOT stack is set up for GPU inference.

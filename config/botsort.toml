@@ -1,0 +1,73 @@
+# Main BoT-SORT tuning file for this repo.
+#
+# Edit this file when you want to change BoT-SORT behavior without touching
+# Python code. The CLI still supports --deepocsort-* flags, but those are now
+# one-off BoxMOT runtime overrides for a single run.
+#
+# Note: this file cannot be copied 1:1 from deepocsort.toml because BoT-SORT
+# and Deep OC-SORT expose different tuning keys. Shared runtime settings are
+# mirrored here; tracker-specific thresholds stay BoT-SORT-specific.
+
+[botsort.runtime]
+
+# BoxMOT ReID checkpoint used to extract appearance embeddings for identity
+# recovery after occlusions or close crossings.
+reid_weights = "osnet_x1_0_msmt17.pt"
+
+# Device used by the ReID model. Keep "cpu" for the safest default; switch to
+# "cuda" only if your local torch + BoxMOT stack is set up for GPU inference.
+device = "cpu"
+
+# Use half precision for the ReID model when your hardware/runtime supports it.
+# Leave it false unless you have a proven reason to change it.
+half = false
+
+[botsort.tuning]
+
+# Minimum confidence for the first-pass association stage.
+track_high_thresh = 0.63
+
+# Lower confidence floor used during the second-pass association stage.
+track_low_thresh = 0.10
+
+# Minimum confidence required before a fresh detection becomes a new track.
+new_track_thresh = 0.62
+
+# How long a lost track can coast before the tracker deletes it.
+track_buffer = 60
+
+# Main association threshold between predicted tracks and detections.
+match_thresh = 0.77
+
+# Enable camera-motion compensation for panning footage.
+use_cmc = true
+
+# Camera-motion compensation method supported by BoxMOT.
+cmc_method = "sof"
+
+# Expected source frame rate for motion modeling.
+frame_rate = 30
+
+# Fuse motion and confidence in the first association stage.
+fuse_first_associate = true
+
+# Keep ReID active. Turn this off only for motion-only comparisons.
+with_reid = true
+
+# IoU gate before appearance matching is allowed.
+proximity_thresh = 0.61
+
+# Minimum appearance similarity accepted during ReID matching.
+appearance_thresh = 0.70
+
+# Extra embedding weight for unconfirmed tracks.
+unconfirmed_emb_scale = 2.54
+
+# Association threshold used by the second-pass matcher.
+second_match_thresh = 0.29
+
+# Association threshold used while confirming tentative tracks.
+unconfirmed_match_thresh = 0.41
+
+# Buffer for recently removed tracks kept for possible re-activation.
+removed_stracks_buffer = 329

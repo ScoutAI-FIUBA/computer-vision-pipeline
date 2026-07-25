@@ -13,10 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.court.detect_court_keypoints import DEFAULT_MODEL_ID as COURT_MODEL_ID  # noqa: E402
 from scripts.shared.env_config import get_roboflow_api_key  # noqa: E402
 from scripts.tracking.track_players_video import (  # noqa: E402
+    DEFAULT_ADAPTIVE_FRAME_STRIDE_CONFIG_PATH,
+    DEFAULT_BOTSORT_CONFIG_PATH,
     DEFAULT_DEEPOCSORT_CONFIG_PATH,
     DEFAULT_REID_CONFIG_PATH,
     inspect_video,
     process_video,
+    resolve_adaptive_frame_stride_settings,
 )
 
 
@@ -49,23 +52,62 @@ def main() -> None:
         help="Minimum court keypoint confidence to keep. Default: 0.7",
     )
     parser.add_argument("--frame-stride", type=int, default=30, help="Infer every N frames. Default: 30")
+    parser.add_argument(
+        "--adaptive-config",
+        type=Path,
+        default=DEFAULT_ADAPTIVE_FRAME_STRIDE_CONFIG_PATH,
+        help=(
+            "Adaptive frame-stride config file. Edit this file first; the --adaptive-* flags only override it for one run. "
+            f"Default: {DEFAULT_ADAPTIVE_FRAME_STRIDE_CONFIG_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-frame-stride",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override adaptive enable/disable from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-frame-stride",
+        type=int,
+        default=None,
+        help="Override risk_frame_stride from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-overlap-fraction",
+        type=float,
+        default=None,
+        help="Override risk_overlap_fraction from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-proximity-heights",
+        type=float,
+        default=None,
+        help="Override risk_proximity_heights from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-hold-frames",
+        type=int,
+        default=None,
+        help="Override risk_hold_frames from --adaptive-config for one run.",
+    )
     parser.add_argument("--max-frames", type=int, help="Maximum number of frames to read")
     parser.add_argument("--dry-run", action="store_true", help="Print video info and estimated calls without inference")
     parser.add_argument("--confidence", type=float, default=0.0, help="Minimum confidence to track and draw")
     parser.add_argument(
         "--tracker-backend",
-        choices=("bytetrack", "deepocsort"),
+        choices=("bytetrack", "deepocsort", "botsort"),
         default="bytetrack",
         help="Tracking backend. Default: bytetrack",
     )
     parser.add_argument(
         "--tracker-config",
         type=Path,
-        default=DEFAULT_DEEPOCSORT_CONFIG_PATH,
+        default=None,
         help=(
-            "Deep OC-SORT tracker config file. This is the main place to tune tracker behavior; "
-            "the --deepocsort-* flags only override values from this file. "
-            f"Default: {DEFAULT_DEEPOCSORT_CONFIG_PATH}"
+            "BoxMOT tracker config file. When omitted, the pipeline picks the backend default "
+            f"({DEFAULT_DEEPOCSORT_CONFIG_PATH} for deepocsort, {DEFAULT_BOTSORT_CONFIG_PATH} for botsort). "
+            "The --deepocsort-* flags still act as one-run BoxMOT runtime overrides."
         ),
     )
     parser.add_argument(
@@ -81,19 +123,19 @@ def main() -> None:
         "--deepocsort-reid-weights",
         default=None,
         help=(
-            "Override reid_weights from --tracker-config when --tracker-backend deepocsort is selected."
+            "Override reid_weights from --tracker-config when a BoxMOT backend is selected."
         ),
     )
     parser.add_argument(
         "--deepocsort-device",
         default=None,
-        help="Override device from --tracker-config when --tracker-backend deepocsort is selected.",
+        help="Override device from --tracker-config when a BoxMOT backend is selected.",
     )
     parser.add_argument(
         "--deepocsort-half",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Override half from --tracker-config when --tracker-backend deepocsort is selected.",
+        help="Override half from --tracker-config when a BoxMOT backend is selected.",
     )
     parser.add_argument(
         "--sampled-output-only",
@@ -140,6 +182,18 @@ def main() -> None:
         raise SystemExit("--max-missing-sampled-frames must be at least 0")
     if args.court_confidence < 0 or args.court_confidence > 1:
         raise SystemExit("--court-confidence must be between 0 and 1")
+    if args.adaptive_risk_frame_stride is not None and args.adaptive_risk_frame_stride < 1:
+        raise SystemExit("--adaptive-risk-frame-stride must be at least 1")
+    if args.adaptive_risk_frame_stride is not None and args.adaptive_risk_frame_stride > args.frame_stride:
+        raise SystemExit("--adaptive-risk-frame-stride must be less than or equal to --frame-stride")
+    if args.adaptive_risk_overlap_fraction is not None and (
+        args.adaptive_risk_overlap_fraction < 0 or args.adaptive_risk_overlap_fraction > 1
+    ):
+        raise SystemExit("--adaptive-risk-overlap-fraction must be between 0 and 1")
+    if args.adaptive_risk_proximity_heights is not None and args.adaptive_risk_proximity_heights <= 0:
+        raise SystemExit("--adaptive-risk-proximity-heights must be greater than 0")
+    if args.adaptive_risk_hold_frames is not None and args.adaptive_risk_hold_frames < 0:
+        raise SystemExit("--adaptive-risk-hold-frames must be at least 0")
 
     args.output = args.output or Path("outputs") / f"{args.video.stem}_pipeline.mp4"
     args.tracks_output = args.tracks_output or Path("outputs") / f"{args.video.stem}_tracks.jsonl"
@@ -151,11 +205,27 @@ def main() -> None:
         info = inspect_video(args.video, args.frame_stride, args.max_frames)
         if args.dry_run:
             estimated_calls = info["estimated_roboflow_calls"] * (2 if args.court_keypoints else 1)
+            adaptive_settings = resolve_adaptive_frame_stride_settings(
+                args.adaptive_config,
+                adaptive_frame_stride=args.adaptive_frame_stride,
+                adaptive_risk_frame_stride=args.adaptive_risk_frame_stride,
+                adaptive_risk_overlap_fraction=args.adaptive_risk_overlap_fraction,
+                adaptive_risk_proximity_heights=args.adaptive_risk_proximity_heights,
+                adaptive_risk_hold_frames=args.adaptive_risk_hold_frames,
+            )
+            if int(adaptive_settings["risk_frame_stride"]) > args.frame_stride:
+                raise SystemExit(
+                    f"Adaptive frame-stride risk_frame_stride in {args.adaptive_config} must be less than or equal to --frame-stride ({args.frame_stride})"
+                )
             print(f"Video: {args.video}")
             print(f"FPS: {info['fps'] or 'unknown'}")
             print(f"Frame count: {info['frame_count'] or 'unknown'}")
             print(f"Frames to read: {info['frames_to_read'] or 'unknown'}")
             print(f"Estimated Roboflow calls: {estimated_calls}")
+            if bool(adaptive_settings["enabled"]):
+                adaptive_calls = inspect_video(args.video, int(adaptive_settings["risk_frame_stride"]), args.max_frames)["estimated_roboflow_calls"]
+                adaptive_calls *= 2 if args.court_keypoints else 1
+                print(f"Adaptive call ceiling: {adaptive_calls}")
             print(f"Sampled output only: {args.sampled_output_only}")
             print(f"Save JSONL: {args.save_json}")
             print(f"Court keypoints: {args.court_keypoints}")
@@ -184,6 +254,7 @@ def main() -> None:
             tracker_backend=args.tracker_backend,
             tracker_config=args.tracker_config,
             reid_config=args.reid_config,
+            adaptive_config=args.adaptive_config,
             deepocsort_reid_weights=args.deepocsort_reid_weights,
             deepocsort_device=args.deepocsort_device,
             deepocsort_half=args.deepocsort_half,
@@ -196,6 +267,11 @@ def main() -> None:
             court_model_id=args.court_model_id,
             court_confidence=args.court_confidence,
             projected_tracks_output=args.projected_tracks_output if args.court_keypoints else None,
+            adaptive_frame_stride=args.adaptive_frame_stride,
+            adaptive_risk_frame_stride=args.adaptive_risk_frame_stride,
+            adaptive_risk_overlap_fraction=args.adaptive_risk_overlap_fraction,
+            adaptive_risk_proximity_heights=args.adaptive_risk_proximity_heights,
+            adaptive_risk_hold_frames=args.adaptive_risk_hold_frames,
         )
     except RuntimeError as error:
         raise SystemExit(str(error)) from error
@@ -207,6 +283,7 @@ def main() -> None:
     if stats["tracker_config"] is not None:
         print(f"Tracker config: {stats['tracker_config']}")
     print(f"ReID config: {stats['reid_config']}")
+    print(f"Adaptive config: {stats['adaptive_config']}")
     print(f"Track records: {stats['track_records']}")
     if args.save_json:
         print(f"Inference records: {stats['inference_records']}")

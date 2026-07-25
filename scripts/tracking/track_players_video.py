@@ -44,10 +44,13 @@ from scripts.shared.env_config import get_roboflow_api_key  # noqa: E402
 
 DEFAULT_TRACKER_BACKEND = "bytetrack"
 DEFAULT_DEEPOCSORT_CONFIG_PATH = Path("config") / "deepocsort.toml"
+DEFAULT_BOTSORT_CONFIG_PATH = Path("config") / "botsort.toml"
 DEFAULT_REID_CONFIG_PATH = Path("config") / "reid.toml"
-DEFAULT_DEEPOCSORT_REID_WEIGHTS = "osnet_x0_25_msmt17.pt"
+DEFAULT_ADAPTIVE_FRAME_STRIDE_CONFIG_PATH = Path("config") / "adaptive_frame_stride.toml"
+DEFAULT_DEEPOCSORT_REID_WEIGHTS = "osnet_x1_0_msmt17.pt"
 DEFAULT_DEEPOCSORT_DEVICE = "cpu"
-TRACKER_BACKEND_CHOICES = (DEFAULT_TRACKER_BACKEND, "deepocsort")
+TRACKER_BACKEND_CHOICES = (DEFAULT_TRACKER_BACKEND, "deepocsort", "botsort")
+BOXMOT_TRACKER_BACKENDS = TRACKER_BACKEND_CHOICES[1:]
 
 DEEPOCSORT_RUNTIME_DEFAULTS = {
     "reid_weights": DEFAULT_DEEPOCSORT_REID_WEIGHTS,
@@ -88,6 +91,53 @@ DEEPOCSORT_CONFIG_TYPES = {
     "aw_off": bool,
 }
 
+BOTSORT_RUNTIME_DEFAULTS = {
+    "reid_weights": DEFAULT_DEEPOCSORT_REID_WEIGHTS,
+    "device": DEFAULT_DEEPOCSORT_DEVICE,
+    "half": False,
+}
+
+BOTSORT_TUNING_DEFAULTS = {
+    "track_high_thresh": 0.6296854875023994,
+    "track_low_thresh": 0.1014392537025336,
+    "new_track_thresh": 0.6246494191492591,
+    "track_buffer": 40,
+    "match_thresh": 0.7722224024589055,
+    "use_cmc": True,
+    "cmc_method": "sof",
+    "frame_rate": 30,
+    "fuse_first_associate": True,
+    "with_reid": True,
+    "proximity_thresh": 0.6084297894561342,
+    "appearance_thresh": 0.6188818853936099,
+    "unconfirmed_emb_scale": 2.5445206391993294,
+    "second_match_thresh": 0.28795081514328974,
+    "unconfirmed_match_thresh": 0.41148010638233784,
+    "removed_stracks_buffer": 329,
+}
+
+BOTSORT_CONFIG_TYPES = {
+    "reid_weights": str,
+    "device": str,
+    "half": bool,
+    "track_high_thresh": (int, float),
+    "track_low_thresh": (int, float),
+    "new_track_thresh": (int, float),
+    "track_buffer": int,
+    "match_thresh": (int, float),
+    "use_cmc": bool,
+    "cmc_method": str,
+    "frame_rate": int,
+    "fuse_first_associate": bool,
+    "with_reid": bool,
+    "proximity_thresh": (int, float),
+    "appearance_thresh": (int, float),
+    "unconfirmed_emb_scale": (int, float),
+    "second_match_thresh": (int, float),
+    "unconfirmed_match_thresh": (int, float),
+    "removed_stracks_buffer": int,
+}
+
 REID_CROP_DEFAULTS = {
     "enabled": True,
     "x_margin_fraction": 0.2,
@@ -105,6 +155,27 @@ REID_QUALITY_DEFAULTS = {
     "min_box_height": 24,
     "min_crop_width": 8,
     "min_crop_height": 12,
+}
+
+ADAPTIVE_RISK_FRAME_STRIDE = 5
+ADAPTIVE_RISK_OVERLAP_FRACTION = 0.2
+ADAPTIVE_RISK_PROXIMITY_HEIGHTS = 0.9
+ADAPTIVE_RISK_HOLD_FRAMES = 20
+
+ADAPTIVE_FRAME_STRIDE_DEFAULTS = {
+    "enabled": False,
+    "risk_frame_stride": ADAPTIVE_RISK_FRAME_STRIDE,
+    "risk_overlap_fraction": ADAPTIVE_RISK_OVERLAP_FRACTION,
+    "risk_proximity_heights": ADAPTIVE_RISK_PROXIMITY_HEIGHTS,
+    "risk_hold_frames": ADAPTIVE_RISK_HOLD_FRAMES,
+}
+
+ADAPTIVE_FRAME_STRIDE_CONFIG_TYPES = {
+    "enabled": bool,
+    "risk_frame_stride": int,
+    "risk_overlap_fraction": (int, float),
+    "risk_proximity_heights": (int, float),
+    "risk_hold_frames": int,
 }
 
 REID_CONFIG_TYPES = {
@@ -164,6 +235,49 @@ def load_deepocsort_config(config_path: Path) -> dict[str, object]:
     return merged
 
 
+def load_botsort_config(config_path: Path) -> dict[str, object]:
+    try:
+        with config_path.open("rb") as config_file:
+            raw_config = tomllib.load(config_file)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"BoT-SORT config file not found: {config_path}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError(f"Could not parse BoT-SORT config file {config_path}: {error}") from error
+
+    botsort_config = raw_config.get("botsort")
+    if botsort_config is None:
+        botsort_config = {}
+    if not isinstance(botsort_config, dict):
+        raise RuntimeError(f"BoT-SORT config file must define a [botsort] table: {config_path}")
+
+    runtime_config = botsort_config.get("runtime") or {}
+    tuning_config = botsort_config.get("tuning") or {}
+    if not isinstance(runtime_config, dict):
+        raise RuntimeError(f"[botsort.runtime] must be a table in {config_path}")
+    if not isinstance(tuning_config, dict):
+        raise RuntimeError(f"[botsort.tuning] must be a table in {config_path}")
+
+    merged = {
+        **BOTSORT_RUNTIME_DEFAULTS,
+        **BOTSORT_TUNING_DEFAULTS,
+        **runtime_config,
+        **tuning_config,
+    }
+    for key, expected_type in BOTSORT_CONFIG_TYPES.items():
+        value = merged[key]
+        if not isinstance(value, expected_type):
+            expected_names = (
+                ", ".join(sorted(item.__name__ for item in expected_type))
+                if isinstance(expected_type, tuple)
+                else expected_type.__name__
+            )
+            raise RuntimeError(
+                f"BoT-SORT config value {key!r} in {config_path} must be {expected_names}, got {type(value).__name__}"
+            )
+
+    return merged
+
+
 def resolve_deepocsort_settings(
     config_path: Path,
     *,
@@ -179,6 +293,35 @@ def resolve_deepocsort_settings(
     if deepocsort_half is not None:
         settings["half"] = deepocsort_half
     return settings
+
+
+def resolve_botsort_settings(
+    config_path: Path,
+    *,
+    deepocsort_reid_weights: str | None,
+    deepocsort_device: str | None,
+    deepocsort_half: bool | None,
+) -> dict[str, object]:
+    settings = load_botsort_config(config_path)
+    if deepocsort_reid_weights is not None:
+        settings["reid_weights"] = deepocsort_reid_weights
+    if deepocsort_device is not None:
+        settings["device"] = deepocsort_device
+    if deepocsort_half is not None:
+        settings["half"] = deepocsort_half
+    return settings
+
+
+def default_tracker_config_path(backend: str) -> Path | None:
+    if backend == "deepocsort":
+        return DEFAULT_DEEPOCSORT_CONFIG_PATH
+    if backend == "botsort":
+        return DEFAULT_BOTSORT_CONFIG_PATH
+    return None
+
+
+def resolve_tracker_config_path(backend: str, tracker_config: Path | None) -> Path | None:
+    return tracker_config if tracker_config is not None else default_tracker_config_path(backend)
 
 
 def load_reid_config(config_path: Path) -> dict[str, object]:
@@ -238,6 +381,71 @@ def load_reid_config(config_path: Path) -> dict[str, object]:
         raise RuntimeError(f"ReID config min_visible_fraction in {config_path} must be between 0.0 and 1.0")
 
     return merged
+
+
+def load_adaptive_frame_stride_config(config_path: Path) -> dict[str, object]:
+    try:
+        with config_path.open("rb") as config_file:
+            raw_config = tomllib.load(config_file)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Adaptive frame-stride config file not found: {config_path}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError(f"Could not parse adaptive frame-stride config file {config_path}: {error}") from error
+
+    adaptive_config = raw_config.get("adaptive_frame_stride")
+    if adaptive_config is None:
+        adaptive_config = {}
+    if not isinstance(adaptive_config, dict):
+        raise RuntimeError(f"Adaptive frame-stride config file must define an [adaptive_frame_stride] table: {config_path}")
+
+    merged = {**ADAPTIVE_FRAME_STRIDE_DEFAULTS, **adaptive_config}
+    for key, expected_type in ADAPTIVE_FRAME_STRIDE_CONFIG_TYPES.items():
+        value = merged[key]
+        if not isinstance(value, expected_type):
+            expected_names = (
+                ", ".join(sorted(item.__name__ for item in expected_type))
+                if isinstance(expected_type, tuple)
+                else expected_type.__name__
+            )
+            raise RuntimeError(
+                f"Adaptive frame-stride config value {key!r} in {config_path} must be {expected_names}, got {type(value).__name__}"
+            )
+
+    if merged["risk_frame_stride"] < 1:
+        raise RuntimeError(f"Adaptive frame-stride risk_frame_stride in {config_path} must be at least 1")
+    if not 0.0 <= float(merged["risk_overlap_fraction"]) <= 1.0:
+        raise RuntimeError(
+            f"Adaptive frame-stride risk_overlap_fraction in {config_path} must be between 0.0 and 1.0"
+        )
+    if float(merged["risk_proximity_heights"]) <= 0:
+        raise RuntimeError(f"Adaptive frame-stride risk_proximity_heights in {config_path} must be greater than 0")
+    if merged["risk_hold_frames"] < 0:
+        raise RuntimeError(f"Adaptive frame-stride risk_hold_frames in {config_path} must be at least 0")
+
+    return merged
+
+
+def resolve_adaptive_frame_stride_settings(
+    config_path: Path,
+    *,
+    adaptive_frame_stride: bool | None,
+    adaptive_risk_frame_stride: int | None,
+    adaptive_risk_overlap_fraction: float | None,
+    adaptive_risk_proximity_heights: float | None,
+    adaptive_risk_hold_frames: int | None,
+) -> dict[str, object]:
+    settings = load_adaptive_frame_stride_config(config_path)
+    if adaptive_frame_stride is not None:
+        settings["enabled"] = adaptive_frame_stride
+    if adaptive_risk_frame_stride is not None:
+        settings["risk_frame_stride"] = adaptive_risk_frame_stride
+    if adaptive_risk_overlap_fraction is not None:
+        settings["risk_overlap_fraction"] = adaptive_risk_overlap_fraction
+    if adaptive_risk_proximity_heights is not None:
+        settings["risk_proximity_heights"] = adaptive_risk_proximity_heights
+    if adaptive_risk_hold_frames is not None:
+        settings["risk_hold_frames"] = adaptive_risk_hold_frames
+    return settings
 
 
 @dataclass
@@ -491,7 +699,7 @@ class TrackerAdapter:
     def __init__(
         self,
         backend: str = DEFAULT_TRACKER_BACKEND,
-        tracker_config: Path = DEFAULT_DEEPOCSORT_CONFIG_PATH,
+        tracker_config: Path | None = None,
         deepocsort_reid_weights: str | None = None,
         deepocsort_device: str | None = None,
         deepocsort_half: bool | None = None,
@@ -504,23 +712,37 @@ class TrackerAdapter:
             self._tracker = sv.ByteTrack()
             return
 
-        if backend == "deepocsort":
+        if backend in BOXMOT_TRACKER_BACKENDS:
             try:
                 from boxmot.trackers.registry import create_tracker
             except ImportError as error:
                 raise RuntimeError(
-                    "deepocsort requires a BoxMOT build that exposes boxmot.trackers.registry.create_tracker. Install dependencies from requirements.txt to enable it."
+                    f"{backend} requires a BoxMOT build that exposes boxmot.trackers.registry.create_tracker. Install dependencies from requirements.txt to enable it."
                 ) from error
 
-            resolved_settings = resolve_deepocsort_settings(
-                tracker_config,
-                deepocsort_reid_weights=deepocsort_reid_weights,
-                deepocsort_device=deepocsort_device,
-                deepocsort_half=deepocsort_half,
-            )
-            tracker_kwargs = {key: resolved_settings[key] for key in DEEPOCSORT_TUNING_DEFAULTS}
+            resolved_config_path = resolve_tracker_config_path(backend, tracker_config)
+            if resolved_config_path is None:
+                raise RuntimeError(f"No tracker config available for backend: {backend}")
+
+            if backend == "deepocsort":
+                resolved_settings = resolve_deepocsort_settings(
+                    resolved_config_path,
+                    deepocsort_reid_weights=deepocsort_reid_weights,
+                    deepocsort_device=deepocsort_device,
+                    deepocsort_half=deepocsort_half,
+                )
+                tracker_kwargs = {key: resolved_settings[key] for key in DEEPOCSORT_TUNING_DEFAULTS}
+            else:
+                resolved_settings = resolve_botsort_settings(
+                    resolved_config_path,
+                    deepocsort_reid_weights=deepocsort_reid_weights,
+                    deepocsort_device=deepocsort_device,
+                    deepocsort_half=deepocsort_half,
+                )
+                tracker_kwargs = {key: resolved_settings[key] for key in BOTSORT_TUNING_DEFAULTS}
+
             self._tracker = create_tracker(
-                "deepocsort",
+                backend,
                 reid_weights=str(resolved_settings["reid_weights"]),
                 device=str(resolved_settings["device"]),
                 half=bool(resolved_settings["half"]),
@@ -537,7 +759,7 @@ class TrackerAdapter:
             del frame
             return self._tracker.update_with_detections(detections)
 
-        if self.backend == "deepocsort":
+        if self.backend in BOXMOT_TRACKER_BACKENDS:
             return boxmot_detections_to_supervision(
                 self._tracker.update(supervision_detections_to_boxmot(detections), frame),
                 detections,
@@ -546,8 +768,8 @@ class TrackerAdapter:
         raise RuntimeError(f"Unsupported tracker backend during update: {self.backend}")
 
 
-def detections_from_result(result: dict, min_confidence: float):
-    return detections_from_inference(result, min_confidence=min_confidence)
+def detections_from_result(result: dict, min_confidence: float, allowed_classes=None):
+    return detections_from_inference(result, min_confidence=min_confidence, allowed_classes=allowed_classes)
 
 
 def supervision_detections_to_boxmot(detections):
@@ -842,6 +1064,44 @@ def bbox_center(xyxy) -> tuple[float, float]:
     return (float((x1 + x2) / 2.0), float((y1 + y2) / 2.0))
 
 
+def overlap_fraction(left_xyxy, right_xyxy) -> float:
+    overlap = intersect_xyxy(left_xyxy, right_xyxy)
+    if overlap is None:
+        return 0.0
+
+    overlap_area = xyxy_area(overlap)
+    smaller_area = min(xyxy_area(left_xyxy), xyxy_area(right_xyxy))
+    if overlap_area <= 0 or smaller_area <= 0:
+        return 0.0
+    return float(overlap_area) / float(smaller_area)
+
+
+def proximity_in_player_heights(left_xyxy, right_xyxy) -> float:
+    import math
+
+    left_center = bbox_center(left_xyxy)
+    right_center = bbox_center(right_xyxy)
+    left_height = max(1.0, float(left_xyxy[3]) - float(left_xyxy[1]))
+    right_height = max(1.0, float(right_xyxy[3]) - float(right_xyxy[1]))
+    return math.dist(left_center, right_center) / max(1.0, min(left_height, right_height))
+
+
+def has_risky_player_interaction(
+    detections,
+    *,
+    overlap_fraction_threshold: float,
+    proximity_height_threshold: float,
+) -> bool:
+    boxes = [[float(value) for value in xyxy] for xyxy in detections.xyxy]
+    for left_index, left_xyxy in enumerate(boxes):
+        for right_xyxy in boxes[left_index + 1 :]:
+            if overlap_fraction(left_xyxy, right_xyxy) >= overlap_fraction_threshold:
+                return True
+            if proximity_in_player_heights(left_xyxy, right_xyxy) <= proximity_height_threshold:
+                return True
+    return False
+
+
 def is_reid_spatial_match(current_xyxy, candidate_xyxy) -> bool:
     import math
 
@@ -1048,8 +1308,9 @@ def process_video(
     confidence: float = 0.0,
     output_fps: float | None = None,
     tracker_backend: str = DEFAULT_TRACKER_BACKEND,
-    tracker_config: Path = DEFAULT_DEEPOCSORT_CONFIG_PATH,
+    tracker_config: Path | None = None,
     reid_config: Path = DEFAULT_REID_CONFIG_PATH,
+    adaptive_config: Path = DEFAULT_ADAPTIVE_FRAME_STRIDE_CONFIG_PATH,
     deepocsort_reid_weights: str | None = None,
     deepocsort_device: str | None = None,
     deepocsort_half: bool | None = None,
@@ -1062,6 +1323,11 @@ def process_video(
     court_model_id: str = COURT_MODEL_ID,
     court_confidence: float = 0.7,
     projected_tracks_output: Path | None = None,
+    adaptive_frame_stride: bool | None = None,
+    adaptive_risk_frame_stride: int | None = None,
+    adaptive_risk_overlap_fraction: float | None = None,
+    adaptive_risk_proximity_heights: float | None = None,
+    adaptive_risk_hold_frames: int | None = None,
 ) -> dict:
     import cv2
     import supervision as sv
@@ -1087,6 +1353,8 @@ def process_video(
         raise RuntimeError(f"Could not write output video: {output_path}")
 
     frame_index = 0
+    next_inference_frame = 0
+    risk_hold_until_frame = -1
     calls = 0
     track_records = 0
     inference_records = 0
@@ -1094,13 +1362,32 @@ def process_video(
     court_frames = 0
     projected_track_records = 0
     projected_track_frames = 0
+    adaptive_low_stride_activations = 0
 
     try:
+        resolved_tracker_config = resolve_tracker_config_path(tracker_backend, tracker_config)
         resolved_reid_config = load_reid_config(reid_config)
+        resolved_adaptive_config = resolve_adaptive_frame_stride_settings(
+            adaptive_config,
+            adaptive_frame_stride=adaptive_frame_stride,
+            adaptive_risk_frame_stride=adaptive_risk_frame_stride,
+            adaptive_risk_overlap_fraction=adaptive_risk_overlap_fraction,
+            adaptive_risk_proximity_heights=adaptive_risk_proximity_heights,
+            adaptive_risk_hold_frames=adaptive_risk_hold_frames,
+        )
+        adaptive_frame_stride_enabled = bool(resolved_adaptive_config["enabled"])
+        adaptive_risk_frame_stride_value = int(resolved_adaptive_config["risk_frame_stride"])
+        adaptive_risk_overlap_fraction_value = float(resolved_adaptive_config["risk_overlap_fraction"])
+        adaptive_risk_proximity_heights_value = float(resolved_adaptive_config["risk_proximity_heights"])
+        adaptive_risk_hold_frames_value = int(resolved_adaptive_config["risk_hold_frames"])
+        if adaptive_risk_frame_stride_value > frame_stride:
+            raise RuntimeError(
+                f"Adaptive frame-stride risk_frame_stride in {adaptive_config} must be less than or equal to frame_stride ({frame_stride})"
+            )
         client = roboflow_client(api_key)
         tracker = TrackerAdapter(
             backend=tracker_backend,
-            tracker_config=tracker_config,
+            tracker_config=resolved_tracker_config,
             deepocsort_reid_weights=deepocsort_reid_weights,
             deepocsort_device=deepocsort_device,
             deepocsort_half=deepocsort_half,
@@ -1124,7 +1411,7 @@ def process_video(
                     if not ok:
                         break
 
-                    if frame_index % frame_stride == 0:
+                    if frame_index >= next_inference_frame:
                         timestamp_seconds = None if fps <= 0 else frame_index / fps
                         result = infer_frame_with_model(client, frame, f"_{frame_index}.jpg", MODEL_ID)
                         calls += 1
@@ -1137,6 +1424,20 @@ def process_video(
                         detections = persister.update_with_detections(detections, frame_index, frame)
                         track_records += write_track_records(tracks_file, frame_index, detections)
                         annotated_frame = draw_tracks(frame, detections)
+
+                        current_stride = frame_stride
+                        if adaptive_frame_stride_enabled:
+                            risky_scene = has_risky_player_interaction(
+                                detections,
+                                overlap_fraction_threshold=adaptive_risk_overlap_fraction_value,
+                                proximity_height_threshold=adaptive_risk_proximity_heights_value,
+                            )
+                            if risky_scene:
+                                risk_hold_until_frame = max(risk_hold_until_frame, frame_index + adaptive_risk_hold_frames_value)
+                            if frame_index < risk_hold_until_frame:
+                                current_stride = adaptive_risk_frame_stride_value
+                                adaptive_low_stride_activations += 1
+                        next_inference_frame = frame_index + current_stride
 
                         if court_keypoints:
                             court_result = infer_frame_with_model(client, frame, f"_court_{frame_index}.jpg", court_model_id)
@@ -1184,8 +1485,9 @@ def process_video(
         "roboflow_calls": calls,
         "output_fps": output_fps,
         "tracker_backend": tracker_backend,
-        "tracker_config": str(tracker_config) if tracker_backend == "deepocsort" else None,
+        "tracker_config": str(resolved_tracker_config) if tracker_backend in BOXMOT_TRACKER_BACKENDS else None,
         "reid_config": str(reid_config),
+        "adaptive_config": str(adaptive_config),
         "track_records": track_records,
         "inference_records": inference_records,
         "court_model_id": court_model_id if court_keypoints else None,
@@ -1194,6 +1496,9 @@ def process_video(
         "court_inference_records": court_inference_records,
         "projected_track_records": projected_track_records,
         "projected_track_frames": projected_track_frames,
+        "adaptive_frame_stride": adaptive_frame_stride_enabled,
+        "adaptive_risk_frame_stride": adaptive_risk_frame_stride_value if adaptive_frame_stride_enabled else None,
+        "adaptive_low_stride_activations": adaptive_low_stride_activations,
     }
 
 
@@ -1223,6 +1528,45 @@ def main() -> None:
         help="Minimum court keypoint confidence to keep. Default: 0.7",
     )
     parser.add_argument("--frame-stride", type=int, default=30, help="Infer every N frames. Default: 30")
+    parser.add_argument(
+        "--adaptive-config",
+        type=Path,
+        default=DEFAULT_ADAPTIVE_FRAME_STRIDE_CONFIG_PATH,
+        help=(
+            "Adaptive frame-stride config file. Edit this file first; the --adaptive-* flags only override it for one run. "
+            f"Default: {DEFAULT_ADAPTIVE_FRAME_STRIDE_CONFIG_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-frame-stride",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override adaptive enable/disable from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-frame-stride",
+        type=int,
+        default=None,
+        help="Override risk_frame_stride from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-overlap-fraction",
+        type=float,
+        default=None,
+        help="Override risk_overlap_fraction from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-proximity-heights",
+        type=float,
+        default=None,
+        help="Override risk_proximity_heights from --adaptive-config for one run.",
+    )
+    parser.add_argument(
+        "--adaptive-risk-hold-frames",
+        type=int,
+        default=None,
+        help="Override risk_hold_frames from --adaptive-config for one run.",
+    )
     parser.add_argument("--max-frames", type=int, help="Maximum number of frames to read")
     parser.add_argument("--dry-run", action="store_true", help="Print video info and estimated calls without inference")
     parser.add_argument("--confidence", type=float, default=0.0, help="Minimum confidence to track and draw")
@@ -1235,11 +1579,11 @@ def main() -> None:
     parser.add_argument(
         "--tracker-config",
         type=Path,
-        default=DEFAULT_DEEPOCSORT_CONFIG_PATH,
+        default=None,
         help=(
-            "Deep OC-SORT tracker config file. This is the main place to tune tracker behavior; "
-            "the --deepocsort-* flags only override values from this file. "
-            f"Default: {DEFAULT_DEEPOCSORT_CONFIG_PATH}"
+            "BoxMOT tracker config file. When omitted, the pipeline picks the backend default "
+            f"({DEFAULT_DEEPOCSORT_CONFIG_PATH} for deepocsort, {DEFAULT_BOTSORT_CONFIG_PATH} for botsort). "
+            "The --deepocsort-* flags still act as one-run BoxMOT runtime overrides."
         ),
     )
     parser.add_argument(
@@ -1255,19 +1599,19 @@ def main() -> None:
         "--deepocsort-reid-weights",
         default=None,
         help=(
-            "Override reid_weights from --tracker-config when --tracker-backend deepocsort is selected."
+            "Override reid_weights from --tracker-config when a BoxMOT backend is selected."
         ),
     )
     parser.add_argument(
         "--deepocsort-device",
         default=None,
-        help="Override device from --tracker-config when --tracker-backend deepocsort is selected.",
+        help="Override device from --tracker-config when a BoxMOT backend is selected.",
     )
     parser.add_argument(
         "--deepocsort-half",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Override half from --tracker-config when --tracker-backend deepocsort is selected.",
+        help="Override half from --tracker-config when a BoxMOT backend is selected.",
     )
     parser.add_argument(
         "--sampled-output-only",
@@ -1314,6 +1658,18 @@ def main() -> None:
         raise SystemExit("--max-missing-sampled-frames must be at least 0")
     if args.court_confidence < 0 or args.court_confidence > 1:
         raise SystemExit("--court-confidence must be between 0 and 1")
+    if args.adaptive_risk_frame_stride is not None and args.adaptive_risk_frame_stride < 1:
+        raise SystemExit("--adaptive-risk-frame-stride must be at least 1")
+    if args.adaptive_risk_frame_stride is not None and args.adaptive_risk_frame_stride > args.frame_stride:
+        raise SystemExit("--adaptive-risk-frame-stride must be less than or equal to --frame-stride")
+    if args.adaptive_risk_overlap_fraction is not None and (
+        args.adaptive_risk_overlap_fraction < 0 or args.adaptive_risk_overlap_fraction > 1
+    ):
+        raise SystemExit("--adaptive-risk-overlap-fraction must be between 0 and 1")
+    if args.adaptive_risk_proximity_heights is not None and args.adaptive_risk_proximity_heights <= 0:
+        raise SystemExit("--adaptive-risk-proximity-heights must be greater than 0")
+    if args.adaptive_risk_hold_frames is not None and args.adaptive_risk_hold_frames < 0:
+        raise SystemExit("--adaptive-risk-hold-frames must be at least 0")
 
     args.output = args.output or Path("outputs") / f"{args.video.stem}_tracked.mp4"
     args.tracks_output = args.tracks_output or Path("outputs") / f"{args.video.stem}_tracks.jsonl"
@@ -1330,6 +1686,22 @@ def main() -> None:
             print(f"Frame count: {info['frame_count'] or 'unknown'}")
             print(f"Frames to read: {info['frames_to_read'] or 'unknown'}")
             print(f"Estimated Roboflow calls: {estimated_calls}")
+            adaptive_settings = resolve_adaptive_frame_stride_settings(
+                args.adaptive_config,
+                adaptive_frame_stride=args.adaptive_frame_stride,
+                adaptive_risk_frame_stride=args.adaptive_risk_frame_stride,
+                adaptive_risk_overlap_fraction=args.adaptive_risk_overlap_fraction,
+                adaptive_risk_proximity_heights=args.adaptive_risk_proximity_heights,
+                adaptive_risk_hold_frames=args.adaptive_risk_hold_frames,
+            )
+            if int(adaptive_settings["risk_frame_stride"]) > args.frame_stride:
+                raise RuntimeError(
+                    f"Adaptive frame-stride risk_frame_stride in {args.adaptive_config} must be less than or equal to --frame-stride ({args.frame_stride})"
+                )
+            if adaptive_settings["enabled"]:
+                adaptive_calls = inspect_video(args.video, int(adaptive_settings["risk_frame_stride"]), args.max_frames)["estimated_roboflow_calls"]
+                adaptive_calls *= 2 if args.court_keypoints else 1
+                print(f"Adaptive call ceiling: {adaptive_calls}")
             print(f"Sampled output only: {args.sampled_output_only}")
             print(f"Court keypoints: {args.court_keypoints}")
             return
@@ -1355,6 +1727,7 @@ def main() -> None:
             tracker_backend=args.tracker_backend,
             tracker_config=args.tracker_config,
             reid_config=args.reid_config,
+            adaptive_config=args.adaptive_config,
             deepocsort_reid_weights=args.deepocsort_reid_weights,
             deepocsort_device=args.deepocsort_device,
             deepocsort_half=args.deepocsort_half,
@@ -1367,6 +1740,11 @@ def main() -> None:
             court_model_id=args.court_model_id,
             court_confidence=args.court_confidence,
             projected_tracks_output=args.projected_tracks_output if args.court_keypoints else None,
+            adaptive_frame_stride=args.adaptive_frame_stride,
+            adaptive_risk_frame_stride=args.adaptive_risk_frame_stride,
+            adaptive_risk_overlap_fraction=args.adaptive_risk_overlap_fraction,
+            adaptive_risk_proximity_heights=args.adaptive_risk_proximity_heights,
+            adaptive_risk_hold_frames=args.adaptive_risk_hold_frames,
         )
     except RuntimeError as error:
         raise SystemExit(str(error)) from error

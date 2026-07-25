@@ -26,9 +26,8 @@ Implementations now live under:
 
 ## Script Roles
 
-This repo currently has one main local video entrypoint plus a set of focused
-tools. Keep that distinction clear so the pipeline can evolve without turning
-every experiment into the "official" path.
+This repo currently has one official local tracking entrypoint plus a set of
+focused support tools.
 
 ### Main entrypoints
 
@@ -36,7 +35,8 @@ Use these first.
 
 | Script | Role | When to use it |
 | --- | --- | --- |
-| `scripts/tracking/video_pipeline.py` | Main local video pipeline | Run the current player-detection + tracking pipeline with annotated video, track JSONL, and raw inference JSONL. |
+| `scripts/tracking/track_players_sam2.py` | Official local SAM2 tracker | Run the detector-seeded SAM2 tracking pipeline with annotated video, track JSONL, and raw inference JSONL. |
+| `scripts/tracking/video_pipeline.py` | ByteTrack/BoxMOT video pipeline | Run the older box-tracker pipeline when you need the existing ByteTrack, Deep OC-SORT, or BoT-SORT path. |
 | `scripts/tracking/detect_players.py` | Main single-image detector | Run player detection on one local image/frame. |
 
 ### Local support tools
@@ -49,6 +49,7 @@ workflow.
 | `scripts/tracking/extract_video_frames.py` | Offline frame extraction | Sample a local video into JPG frames without calling Roboflow. |
 | `scripts/tracking/detect_players_video.py` | Detection-only video helper | Inspect or run sampled video detection without tracking; also provides reusable video helpers. |
 | `scripts/tracking/track_players_video.py` | Tracking core | Tracker adapter point used by `video_pipeline.py`; keeps ByteTrack and Deep OC-SORT backend logic in one place. |
+| `scripts/tracking/track_players_sam2_experiment.py` | SAM2 implementation module | Keeps the current SAM2 CLI implementation that the stable wrapper calls. |
 | `scripts/tracking/evaluate_tracking.py` | Baseline tracking review | Turn manual review events into baseline counts for ID switches, full losses, and successful recoveries. |
 | `scripts/tracking/summarize_tracking_run.py` | Automatic track-file summary | Print technical summary metrics that are directly derivable from one `tracks.jsonl` file. |
 | `scripts/court/detect_court_keypoints.py` | Court keypoints on one image | Test court landmarks on a single frame. |
@@ -91,7 +92,7 @@ python3 scripts/tracking/summarize_tracking_run.py outputs/game_tracks.jsonl
 
 ### Current direction
 
-- Treat `scripts/tracking/video_pipeline.py` as the canonical local video path.
+- Treat `scripts/tracking/track_players_sam2.py` as the canonical local tracking path.
 - Keep court/homography tools integrated only where they already help the local pipeline (`--court-keypoints` plus projected-track JSONL), and keep the heavier debug/evaluation scripts separate.
 - Add new stages to the pipeline by reusing these support tools first, then
   folding only the stable pieces into the main entrypoint.
@@ -101,20 +102,23 @@ python3 scripts/tracking/summarize_tracking_run.py outputs/game_tracks.jsonl
 Implemented now:
 
 - Shared annotation helpers now cover player detection, tracking, and court keypoint visualization.
-- `scripts/tracking/video_pipeline.py` can run sampled player tracking, optional court keypoints, and projected-track JSONL export in one local pass.
+- `scripts/tracking/track_players_sam2.py` is now the official local tracker path for player tracking with annotated video, track JSONL, and raw inference JSONL.
+- `scripts/tracking/video_pipeline.py` still exists for the older ByteTrack/BoxMOT path plus optional court keypoints and projected-track JSONL export.
 - Homography fitting now includes geometric pre-validation before `cv2.findHomography`, so obviously degenerate keypoint layouts are rejected early.
 - Projected-track debugging is available through `scripts/court/visualize_projected_tracks.py`.
 - Tracking keeps short-lived predicted tracks for brief missed sampled detections.
 - A lightweight torso-color appearance re-ID baseline can reassign some recently lost tracks.
+- The main tracking pipeline can temporarily lower frame stride around close-player or overlapping-player interactions, with tuning now stored in `config/adaptive_frame_stride.toml`.
 
 Known limitations:
 
 - Player IDs still switch during crossings and occlusions.
 - Some crossing/occlusion cases still lose tracking entirely.
 - `--frame-stride 1` is slower and more expensive, and it still does not solve identity consistency by itself.
+- Adaptive stride only reacts on sampled frames, so it can still miss risk that starts and ends entirely between two sampled frames.
 - Current appearance re-ID is a cheap baseline, not a robust identity solution.
 - The current `sv.ByteTrack()` usage should be revisited because the tracker API now emits a deprecation warning.
-- Deep OC-SORT now routes through BoxMOT and adds a ReID-model dependency plus runtime cost compared with ByteTrack.
+- Deep OC-SORT and BoT-SORT now route through BoxMOT and add a ReID-model dependency plus runtime cost compared with ByteTrack.
 
 See `TRACKING_ISSUES.md` for the short list of unresolved tracking failures and recommended next actions.
 
@@ -130,7 +134,7 @@ These belong in `scripts/tracking/video_pipeline.py` because they are part of th
 | Stage | Status | Notes |
 | --- | --- | --- |
 | Player detection | Integrated | Current base stage. |
-| Tracker backend (`--tracker-backend`) | Integrated | The pipeline routes tracking through one adapter point in `scripts/tracking/track_players_video.py`; `bytetrack` stays as the light default and `deepocsort` is available through BoxMOT. |
+| Tracker backend (`--tracker-backend`) | Legacy integrated path | `scripts/tracking/video_pipeline.py` still routes tracking through `scripts/tracking/track_players_video.py` for ByteTrack, Deep OC-SORT, and BoT-SORT, but SAM2 is now the official tracker path. |
 | Raw inference JSONL | Integrated | One record per inferred frame. |
 | Court keypoints | Partially integrated | Available through `--court-keypoints` in the local video pipeline, with separate debug scripts still retained. |
 | Court homography / player projection | Partially integrated | Projected-track JSONL export exists in the local pipeline; broader downstream use still depends on trustworthy keypoints and mapping. |
@@ -161,23 +165,38 @@ their role is clear.
 - `scripts/tracking/track_players_video.py`: keep as the implementation core unless it
   becomes thin enough to fold directly into `scripts/tracking/video_pipeline.py` without making
   that file ugly.
+- `scripts/tracking/track_players_sam2_experiment.py`: keep as the implementation module behind `scripts/tracking/track_players_sam2.py` unless it gets folded into the stable wrapper later.
 - Court and homography scripts: keep separate until the integration path is
   proven; do not merge them early just to reduce file count.
 
 ### Rule of thumb
 
-- If a script is used to process the normal local video workflow, it belongs in
-  or behind `scripts/tracking/video_pipeline.py`.
+- If a script is used to process the normal local tracking workflow, it belongs in
+  or behind `scripts/tracking/track_players_sam2.py`.
 - If a script exists to inspect, validate, calibrate, or debug one stage, keep
   it as a support tool until the stage is stable.
 
-Run the main local video pipeline, no Roboflow call:
+Run the official SAM2 tracker, no Roboflow call:
 
 ```bash
-python3 scripts/tracking/video_pipeline.py media/game.mp4 --dry-run --frame-stride 30 --max-frames 300
+python3 scripts/tracking/track_players_sam2.py media/game.mp4 --dry-run --frame-stride 15 --max-frames 300
 ```
 
-Run the main local video pipeline with tracking only:
+Run the official SAM2 tracker:
+
+```bash
+python3 scripts/tracking/track_players_sam2.py media/game.mp4 --frame-stride 15 --max-frames 300
+```
+
+Install the full SAM2 tracker stack first:
+
+```bash
+python3 -m pip install -r requirements.txt
+# install torch/torchvision from pytorch.org for your machine first
+python3 -m pip install -r requirements-sam2.txt
+```
+
+Use the older box-tracker pipeline when you specifically want ByteTrack, Deep OC-SORT, or BoT-SORT:
 
 ```bash
 python3 scripts/tracking/video_pipeline.py media/game.mp4 --frame-stride 30 --max-frames 300
@@ -192,15 +211,76 @@ python3 scripts/tracking/video_pipeline.py media/game.mp4 \
   --max-frames 300
 ```
 
+Run the same pipeline with BoT-SORT through BoxMOT:
+
+```bash
+python3 scripts/tracking/video_pipeline.py media/game.mp4 \
+  --tracker-backend botsort \
+  --frame-stride 30 \
+  --max-frames 300
+```
+
+Run the pipeline after editing the adaptive frame-stride file:
+
+```bash
+python3 scripts/tracking/video_pipeline.py media/game.mp4 \
+  --frame-stride 30
+```
+
+Adaptive frame-stride workflow:
+
+1. Edit `config/adaptive_frame_stride.toml`.
+2. Set `enabled = true` when you want the adaptive mode on.
+3. Re-run the same pipeline command.
+4. Use `--adaptive-*` flags only when you want a one-run override without editing the file.
+
+```bash
+python3 scripts/tracking/video_pipeline.py media/game.mp4 \
+  --frame-stride 30 \
+  --max-frames 300
+```
+
+Adaptive stride quick path:
+
+| Knob | What it does |
+| --- | --- |
+| `enabled` | Turns the feature on. `false` keeps the old fixed-stride behavior. |
+| `risk_frame_stride` | Lower stride used after a risky sampled frame. |
+| `risk_overlap_fraction` | Triggers risk when two player boxes overlap enough relative to the smaller box. |
+| `risk_proximity_heights` | Triggers risk when two player centers are very close relative to player size. |
+| `risk_hold_frames` | Keeps the lower stride on briefly so the pipeline does not flap every sampled frame. |
+
+The default dry run still reports the base stride estimate. When adaptive mode is enabled in the file or via a one-run override, it also prints an adaptive call ceiling using the lower risk stride.
+
+One-run override example:
+
+```bash
+python3 scripts/tracking/video_pipeline.py media/game.mp4 \
+  --frame-stride 30 \
+  --adaptive-frame-stride \
+  --adaptive-risk-frame-stride 5
+```
+
 Deep OC-SORT notes:
 
-- Install `boxmot==22.0.0` from `requirements.txt` before using `--tracker-backend deepocsort`.
-- Imports stay lazy, so ByteTrack users do not pay the BoxMOT import/runtime cost unless they select `deepocsort`.
+- Install `boxmot==22.0.0` from `requirements.txt` before using `--tracker-backend deepocsort` or `--tracker-backend botsort`.
+- Imports stay lazy, so ByteTrack users do not pay the BoxMOT import/runtime cost unless they select a BoxMOT backend.
 - Edit `config/deepocsort.toml` first. That file is now the main place to tune Deep OC-SORT behavior.
+- Edit `config/botsort.toml` first when you want to tune BoT-SORT behavior.
+- The repo now defaults Deep OC-SORT and BoT-SORT to `osnet_x1_0_msmt17.pt`, matching the shipped BoxMOT config files.
+- BoT-SORT currently reuses the same BoxMOT runtime override flags (`--deepocsort-reid-weights`, `--deepocsort-device`, `--deepocsort-half`) to avoid expanding the CLI surface.
 - Edit `config/reid.toml` when you want to tune the lightweight torso-crop appearance path used for recent-track reassignment.
-- `--tracker-config` defaults to `config/deepocsort.toml`.
+- `--tracker-config` defaults to `config/deepocsort.toml` for `deepocsort` and `config/botsort.toml` for `botsort`.
 - `--reid-config` defaults to `config/reid.toml`.
-- `--deepocsort-reid-weights`, `--deepocsort-device`, and `--deepocsort-half` still exist, but now they only override the file for one run.
+- `--deepocsort-reid-weights`, `--deepocsort-device`, and `--deepocsort-half` still exist, but now they only override the chosen BoxMOT config file for one run.
+- On first use, BoxMOT may need to download that checkpoint into its weights directory. Keep `device = "cpu"` unless your local torch + BoxMOT stack is already proven on CUDA.
+
+Minimal BoT-SORT workflow:
+
+1. Open `config/botsort.toml` and adjust the comments-backed values you care about.
+2. Open `config/reid.toml` if you want to tune torso crop bounds or minimum crop/box sizes for ReID.
+3. Run the pipeline with `--tracker-backend botsort`.
+4. Only use the `--deepocsort-*` flags when you want a one-off BoxMOT runtime override without editing the file.
 
 Minimal Deep OC-SORT workflow:
 
@@ -208,6 +288,35 @@ Minimal Deep OC-SORT workflow:
 2. Open `config/reid.toml` if you want to tune torso crop bounds or minimum crop/box sizes for ReID.
 3. Run the pipeline with `--tracker-backend deepocsort`.
 4. Only use the `--deepocsort-*` flags when you want a one-off override without editing the file.
+
+SAM2 tracking notes:
+
+- SAM2 is now the official local tracker path. It still depends on the same Roboflow player detections for seeding; it is not a detector replacement.
+- Install `requirements.txt` first because the SAM2 script also imports the main repo stack, then install PyTorch for your machine, then `requirements-sam2.txt`.
+- This path is heavier than ByteTrack, Deep OC-SORT, or BoT-SORT, and it is most realistic on a short local clip with a GPU.
+- The current implementation re-seeds SAM2 from detector boxes every `--frame-stride` frames and propagates masks between those refreshes.
+
+Install the SAM2 dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
+# install torch/torchvision from pytorch.org for your machine first
+python3 -m pip install -r requirements-sam2.txt
+```
+
+Run the official detector-seeded SAM2 tracker on a short clip:
+
+```bash
+python3 scripts/tracking/track_players_sam2.py media/game.mp4 \
+  --frame-stride 15 \
+  --max-frames 300
+```
+
+Run the same clip summary on the output:
+
+```bash
+python3 scripts/tracking/summarize_tracking_run.py outputs/game_sam2_tracks.jsonl
+```
 
 ReID crop tuning quick path:
 

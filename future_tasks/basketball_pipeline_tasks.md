@@ -1,6 +1,6 @@
 # Future Tasks: Basketball Video Analysis Pipeline
 
-This backlog documents the implementation work needed to evolve the current Roboflow player-detection prototype into a full basketball video-analysis pipeline. The shortest useful path is: stabilize video detection, normalize model outputs with Supervision, add tracking, then add court geometry, team identification, jersey OCR, and only later SAM 2 / VLM-heavy components.
+This backlog documents the implementation work needed to evolve the current Roboflow player-detection prototype into a full basketball video-analysis pipeline. The shortest useful path is: stabilize video detection, normalize model outputs with Supervision, use the current SAM2 tracking path, then add court geometry, team identification, jersey OCR, and later heavier event logic or VLM components.
 
 ## Current State
 
@@ -10,11 +10,11 @@ This backlog documents the implementation work needed to evolve the current Robo
 | Video detection | Implemented with frame sampling, dry-run cost estimation, sampled-only output, and annotated MP4 output. |
 | Cost control | Basic controls exist: `--dry-run`, `--frame-stride`, `--max-frames`, `--sampled-output-only`. |
 | Supervision integration | Implemented for image/video annotation with shared detection/keypoint annotation helpers. |
-| Tracking | Implemented locally in `scripts/tracking/video_pipeline.py` / `scripts/tracking/track_players_video.py` with smoothing, short-lived predicted persistence, and lightweight appearance-based reassignment. Identity consistency is still not reliable in crossings/occlusions. |
+| Tracking | Implemented locally with official SAM2 entrypoint `scripts/tracking/track_players_sam2.py`. The older `scripts/tracking/video_pipeline.py` / `scripts/tracking/track_players_video.py` box-tracker path still exists for comparison and support tooling. |
 | Team identification | Not implemented yet. |
 | Jersey OCR | Not implemented yet. |
 | Court keypoints / homography | Implemented locally for single-frame, sampled-video, homography debug, and projected-track export. Homography now rejects obviously bad point layouts before fitting. |
-| SAM 2 tracking | Not implemented yet. Optional, not MVP-first. |
+| SAM 2 tracking | Implemented and now the tracker path to use going forward. |
 
 ## Implementation Order
 
@@ -22,11 +22,11 @@ This backlog documents the implementation work needed to evolve the current Robo
 |---|---|---|
 | 1 | Stabilize detection outputs | Everything depends on trustworthy detections. |
 | 2 | Convert to Supervision | Avoid custom drawing/tracking glue. |
-| 3 | Add ByteTrack | Cheap tracking before expensive SAM 2. |
+| 3 | Keep the existing box-tracker path available for comparison | Useful baseline and support path beside the official SAM2 tracker. |
 | 4 | Add court keypoints and homography | Needed for positions, shot charts, and spatial stats. |
 | 5 | Add team identification | Needed to separate possessions and stats. |
 | 6 | Add jersey OCR | Useful but noisy; depends on good crops/tracks. |
-| 7 | Add SAM 2 only if needed | Expensive; use when ByteTrack fails. |
+| 7 | Improve SAM2 robustness and operating cost | SAM2 is now the chosen tracker path; optimize it instead of deferring it. |
 | 8 | Add make/miss and event logic | Depends on stable tracking, court geometry, and ball/rim signals. |
 | 9 | Add evaluation and regression set | Needed before production. |
 | 10 | Decide deployment path | Local/serverless/dedicated depends on measured cost and latency. |
@@ -164,16 +164,16 @@ Notes:
 - This improved visual stability, but it did not solve the harder identity
   problem during player crossings and occlusions.
 
-### Task 3.3: Compare ByteTrack vs SAM 2 need
+### Task 3.3: Compare the legacy box-tracker path against SAM2
 
 - [ ] Create a small evaluation clip set with occlusions and camera motion.
 - [ ] Count ID switches, full track losses, and reassignment recoveries manually.
 - [ ] Compare current `sv.ByteTrack()` behavior against the current recommended Supervision tracker API.
-- [ ] Decide whether a stronger tracker or more robust re-ID is justified before considering SAM 2.
+- [ ] Decide whether any legacy box-tracker path is still worth keeping once SAM2 baselines are stable.
 
 Acceptance criteria:
 
-- SAM 2 is not added unless ByteTrack failure is proven on target footage.
+- SAM2 remains the official path unless target-footage evaluation shows a clear reason to fall back.
 
 Notes:
 
