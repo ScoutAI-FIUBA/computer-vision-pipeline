@@ -1,3 +1,22 @@
-git+https://github.com/facebookresearch/sam2.git
-huggingface_hub>=1.7.1
-decord>=0.6.0
+# SAM2 tracking dependencies (GPU path).
+#
+# These are pinned to match the Modal image in `modal_app.py` exactly. If you
+# change a version here, change it there too — a mismatch means local results
+# and deployed results can differ for reasons nobody will enjoy debugging.
+#
+# NOTE: the `sam2` package on PyPI is NOT published by Meta. Always install from
+# the official repository below, pinned to a commit.
+#
+# Install PyTorch first if your platform needs a specific CUDA build:
+#   https://pytorch.org/get-started/locally/
+
+torch==2.5.1
+torchvision==0.20.1
+huggingface_hub==1.7.1
+# Plain URL form is required. The repo declares its project name as "sam-2", so
+# the `sam2 @ git+...` form fails pip's name check and then falls back to the
+# unrelated third-party `sam2` package on PyPI.
+git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4
+
+# `decord` is no longer needed: the pipeline decodes with OpenCV and hands SAM2
+# one segment of frames at a time, so SAM2 never opens the video itself.

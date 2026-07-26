@@ -14,6 +14,43 @@ uvicorn api.main:app --reload
 
 Video processing can make many Roboflow calls. Run `dry_run=true` first to estimate cost before processing.
 
+## Deployed pipeline (`pipeline/` + Modal)
+
+`pipeline/` is a deployment-agnostic package that runs detection and SAM2
+tracking end to end, and `modal_app.py` is a thin Modal wrapper around it. This
+is the path that runs on GPUs rather than on a laptop or in Colab.
+
+`pipeline/` contains **no Modal imports** — it is plain Python, so it stays
+testable locally and is not tied to one vendor.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+```
+
+Estimate cost before spending anything (no GPU, no API key needed):
+
+```bash
+python -m pipeline.cli path/to/clip.mp4 --dry-run
+```
+
+Run it on a GPU:
+
+```bash
+modal run modal_app.py --video-path path/to/clip.mp4 --max-frames 90
+```
+
+See `SETUP.md` for secrets, deployment, measured cost per configuration, and the
+cost-relevant knobs. Tests run without a GPU:
+
+```bash
+python -m pytest tests/
+```
+
+Read `future_tasks/TRACKING_ISSUES.md` before tuning tracking — several obvious
+ideas (lowering `--frame-stride`, using a bigger SAM2 checkpoint) were measured
+and do not do what you would expect.
+
 ## Local Scripts
 
 These scripts are local pipeline steps first. The local CLI path is ahead of the API path.

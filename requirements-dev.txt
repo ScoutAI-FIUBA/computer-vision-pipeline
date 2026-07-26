@@ -1,0 +1,15 @@
+# Local tooling for working on the pipeline and deploying it to Modal.
+#
+# Deliberately standalone rather than `-r requirements.txt`: that file pulls in
+# boxmot (the older ByteTrack path), which drags along torch and the whole CUDA
+# toolkit — several GB you do not need on a laptop, since the heavy work runs in
+# the Modal container.
+#
+# For the legacy BoxMOT scripts, install requirements.txt separately.
+
+modal==1.5.3
+pytest==8.3.5
+
+# Needed by the tests and by `python -m pipeline.cli --dry-run`.
+opencv-python==4.10.0.84
+python-dotenv==1.2.2
