@@ -68,17 +68,39 @@ Other measurements worth keeping:
   cuts to a close-up and detections drop to zero. Real games contain a lot of
   replays, close-ups and crowd shots that cost GPU time and yield nothing.
 
-Still unresolved after all of the above: **players still swap IDs during
-crossings.** Reviewed visually and rejected as not good enough. The fixes reduce
-lost-and-renumbered tracks; they do not solve identity handoff during overlap.
+### Resolved: `frame_stride` is U-shaped, and 10 is the answer
+
+Default changed from 15 to **10** (processed frames, at the default 15fps
+sampling). Measured on the full clip with carry-forward and osnet re-ID enabled:
+
+| stride @ 15fps | 2.5s | 5.0s | 6.7s | 9.7s |
+| --- | --- | --- | --- | --- |
+| 4 | 10 | 12 | 15 | 18 |
+| **10** | **10** | **10** | **10** | **10** |
+| 15 | 10 | 10 | 11 | 11 |
+
+Stride 10 is the only configuration that holds the correct count for the whole
+clip. It also costs the same (36 s vs 38 s). Quality is **not** monotonic in this
+value: too few detector calls lets identity drift, too many multiplies the
+drop-on-miss failure. Do not lower it "to detect more" — that was measured worse.
+
+Read stride together with `target_fps`. Stride 10 at 15fps sampling is a 0.67s
+detector interval; stride 10 with `--native-fps` on 60fps footage is 0.17s and
+measured **20** IDs. The same number means very different things.
+
+Still open: **ID swaps during crossings.** Reduced but not eliminated — the
+current config still reports a handful of `suspected_swaps`, and those are
+lower-bound estimates. The fixes address lost-and-renumbered tracks; they do not
+fully solve identity handoff while two players overlap.
 
 Suggested next investigation, in order:
 
-1. Run the existing BoT-SORT / DeepOCSORT path (`video_pipeline.py`, which
-   already uses osnet re-ID) head-to-head on this same clip. It is purpose-built
-   for identity through occlusion; the SAM2 path may simply be the wrong tool.
-2. Build the crossing/occlusion evaluation set below, so quality stops depending
-   on someone watching a video.
+1. Build the crossing/occlusion evaluation set below, so quality stops depending
+   on someone watching a video. Note that clips must be **longer than ~5
+   seconds** — every configuration above scores a perfect 10 at 2.5s, which is
+   how a broken config previously looked fine.
+2. Run the existing BoT-SORT / DeepOCSORT path (`video_pipeline.py`, which
+   already uses osnet re-ID) head-to-head on the same clips.
 3. Only then consider retroactively relabelling frames during an occlusion once
    a swap is detected on recovery.
 

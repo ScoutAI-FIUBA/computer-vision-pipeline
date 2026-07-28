@@ -223,22 +223,35 @@ Two results that contradict the obvious guess, both measured:
   visually and judged not better. Prefer the cheap default until there is
   evidence otherwise.
 
-### Why lowering `frame_stride` backfires
+### `frame_stride` is U-shaped — 10 is the minimum
 
-Intuition says calling the detector more often should improve tracking. Measured
-on the test clip, it does the opposite:
+Neither "more detections" nor "fewer detections" is better. Measured on the test
+clip at the default 15fps sampling, with carry-forward and re-ID on, counting
+distinct track IDs for 10 players on court:
 
-| Config | Detector calls | Distinct IDs (10 players on court) |
-|---|---|---|
-| stride 15 | 10 | 14 |
-| stride 4 | 37 | **32** |
-| stride 15 + carry-forward | 10 | **11** |
+| stride | Detector calls | 2.5s | 5.0s | 6.7s | 9.7s |
+|---|---|---|---|---|---|
+| 4 | 37 | 10 | 12 | 15 | 18 |
+| **10 (default)** | **15** | **10** | **10** | **10** | **10** |
+| 15 | 10 | 10 | 10 | 11 | 11 |
 
-SAM2 is re-seeded from scratch at every detector call. Seeding it with only the
-current detections means a player the detector misses for one frame is erased,
-and gets a new ID when found again. More detector calls means more chances to
-drop a track. `max_missed_detections` fixes the underlying problem by keeping
-unclaimed tracks alive for a couple of calls; stride tuning does not.
+Stride 10 is the only setting that stays correct for the whole clip. Both
+directions away from it get worse, for different reasons:
+
+- **Too low**: SAM2 is re-seeded from scratch at every detector call, so a player
+  the detector misses for one frame is erased and comes back with a new ID. More
+  calls means more chances to drop a track. (`max_missed_detections` reduces this
+  but does not eliminate it.)
+- **Too high**: SAM2 propagates unaided for longer and identities drift.
+
+Two traps when comparing against the Colab notebook:
+
+- **Always read stride together with `target_fps`.** Stride 10 at 15fps sampling
+  is a 0.67s detector interval; stride 10 at `--native-fps` on 60fps footage is
+  0.17s. Same number, 4x apart — and at native fps stride 10 measured **20** IDs,
+  not 10.
+- **Short clips hide everything.** At 2.5s every configuration above scores 10.
+  Differences only appear past ~5s, so never judge tracking on a short clip.
 
 Two safety habits worth keeping:
 

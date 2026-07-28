@@ -28,12 +28,20 @@ except ModuleNotFoundError:  # dotenv is a convenience, not a requirement
 # Start on small while iterating; switch to large only for final demo runs.
 DEFAULT_SAM2_MODEL_ID = "facebook/sam2-hiera-small"
 
-# COST: run the detector every N frames. SAM2 propagates masks in between.
-# Roboflow's free plan is metered per call, so this directly sets your API spend:
-# at 30fps and stride 15 you make 2 calls per second of footage.
-# Lower  = more detector calls, better identity refresh, more money.
-# Higher = fewer calls, longer propagation, more identity drift.
-DEFAULT_FRAME_STRIDE = 15
+# COST: run the detector every N processed frames. SAM2 propagates in between.
+# Roboflow's free plan is metered per call, so this also sets your API spend.
+#
+# Identity quality is NOT monotonic in this value — it is U-shaped, and 10 was
+# measured as the minimum. On the test clip (146 processed frames, 10 players),
+# distinct track IDs came out as:
+#
+#     stride  4 -> 18      too many detector calls; each is a chance to drop a
+#                          track the detector momentarily missed
+#     stride 10 -> 10      correct, and flat across the whole clip
+#     stride 15 -> 11      long propagation lets identities drift
+#
+# Do not "improve" this by lowering it. That was tried and measured worse.
+DEFAULT_FRAME_STRIDE = 10
 
 # COST: process the video at this rate rather than its native one. Measured
 # throughput is ~3.3 frames/sec end to end on an L4, so 60fps source footage
