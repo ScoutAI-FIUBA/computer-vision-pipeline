@@ -11,7 +11,7 @@ This backlog documents the implementation work needed to evolve the current Robo
 | Cost control | Basic controls exist: `--dry-run`, `--frame-stride`, `--max-frames`, `--sampled-output-only`. |
 | Supervision integration | Implemented for image/video annotation with shared detection/keypoint annotation helpers. |
 | Tracking | Implemented locally with official SAM2 entrypoint `scripts/tracking/track_players_sam2.py`. The older `scripts/tracking/video_pipeline.py` / `scripts/tracking/track_players_video.py` box-tracker path still exists for comparison and support tooling. |
-| Team identification | Not implemented yet. |
+| Team identification | Implemented experimentally in `pipeline/` and Modal. End-of-run assignment writes `teams.json` and rewrites `tracks.jsonl`. It is still not considered production-stable. |
 | Jersey OCR | Not implemented yet. |
 | Court keypoints / homography | Implemented locally for single-frame, sampled-video, homography debug, and projected-track export. Homography now rejects obviously bad point layouts before fitting. |
 | SAM 2 tracking | Implemented and now the tracker path to use going forward. |
@@ -24,7 +24,7 @@ This backlog documents the implementation work needed to evolve the current Robo
 | 2 | Convert to Supervision | Avoid custom drawing/tracking glue. |
 | 3 | Keep the existing box-tracker path available for comparison | Useful baseline and support path beside the official SAM2 tracker. |
 | 4 | Add court keypoints and homography | Needed for positions, shot charts, and spatial stats. |
-| 5 | Add team identification | Needed to separate possessions and stats. |
+| 5 | Improve team identification quality and validation | The baseline is already wired; the remaining work is evidence quality, validation, and output confidence. |
 | 6 | Add jersey OCR | Useful but noisy; depends on good crops/tracks. |
 | 7 | Improve SAM2 robustness and operating cost | SAM2 is now the chosen tracker path; optimize it instead of deferring it. |
 | 8 | Add make/miss and event logic | Depends on stable tracking, court geometry, and ball/rim signals. |
@@ -244,6 +244,41 @@ Notes:
 - Implemented locally in `scripts/court/visualize_projected_tracks.py`.
 - Reuses `draw_fiba_court` from `scripts/court/build_court_homography.py` and consumes the existing projected-track JSONL emitted by `scripts/tracking/track_players_video.py` / `scripts/tracking/video_pipeline.py`.
 - Produces an offline top-down PNG summary by default and can optionally render a simple court-only MP4 for per-frame review, with no additional Roboflow calls.
+
+## Phase 5 — Team identification
+
+### Task 5.1: Keep the current config and docs aligned with the deployed path
+
+- [x] Document `PipelineConfig` as the source of truth.
+- [x] Document the current team-ID environment variables and override surfaces.
+- [x] Remove outdated notes that described team ID as not implemented or as a different algorithm.
+
+Acceptance criteria:
+
+- README, setup notes, and task docs all describe the same current team-ID flow.
+- The documented knobs match `pipeline/config.py`, `pipeline/cli.py`, and `modal_app.py`.
+
+### Task 5.2: Validate team-ID quality across multiple clips
+
+- [ ] Create a small review set with at least two team-color combinations.
+- [ ] Measure wrong-team assignments, unassigned tracks, and obviously contaminated evidence.
+- [ ] Save example `team_debug/` artifacts for each recurring failure mode.
+
+Acceptance criteria:
+
+- Threshold changes are judged on more than one clip.
+- Reviewers can point to concrete debug artifacts instead of tuning blindly.
+
+### Task 5.3: Improve evidence quality before adding more classifier stages
+
+- [ ] Review `team_debug.json` and `team_debug/` to find the most common contamination pattern.
+- [ ] Tighten crop, mask, or sample-acceptance logic only where the debug artifacts justify it.
+- [ ] Re-run the same multi-clip review set before changing defaults.
+
+Acceptance criteria:
+
+- Any new threshold or crop change is backed by before/after evidence.
+- The pipeline keeps the same output contract: `results.json`, `tracks.jsonl`, `teams.json`, optional `annotated.mp4`.
 
 ## Open Tracking Issues
 

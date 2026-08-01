@@ -13,3 +13,4 @@ pytest==8.3.5
 # Needed by the tests and by `python -m pipeline.cli --dry-run`.
 opencv-python==4.10.0.84
 python-dotenv==1.2.2
+umap-learn==0.5.9.post2

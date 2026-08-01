@@ -47,6 +47,7 @@ class PipelineResults:
     summary: RunSummary
     device: str
     tracks_file: str = "tracks.jsonl"
+    teams_file: str | None = None
     annotated_video_file: str | None = None
 
     def to_dict(self) -> dict:
@@ -78,6 +79,7 @@ class TrackWriter:
                     {
                         "frame_index": frame_index,
                         "track_id": None if track_id is None else int(track_id),
+                        "team_id": None if row.get("team_id") is None else int(row["team_id"]),
                         "track_state": row.get("track_state"),
                         "class_name": str(row.get("class_name", "player")),
                         "confidence": None if row.get("confidence") is None else float(row["confidence"]),

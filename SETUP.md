@@ -178,7 +178,70 @@ for the GPU.
 
 ---
 
-## The cost knobs, and what they cost
+## 7. Configuration quick path
+
+`pipeline/config.py` is the source of truth for the deployed pipeline.
+
+How configuration is resolved:
+
+1. `PipelineConfig.from_env()` loads environment variables and optional `.env`.
+2. `pipeline.cli` overrides a smaller local subset for ad hoc runs.
+3. `modal_app.py` exposes the full current remote override surface.
+
+Core environment variables:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ROBOFLOW_API_KEY` | required | Private Roboflow key. |
+| `ROBOFLOW_API_URL` | `https://serverless.roboflow.com` | Hosted inference endpoint. |
+| `PLAYER_MODEL_ID` | `basketball-player-detection-3-ycjdo/16` | Player detector model id. |
+| `SAM2_MODEL_ID` | `facebook/sam2-hiera-small` | Default SAM2 checkpoint. |
+| `TEAM_EMBEDDER_BACKEND` | `siglip` | `siglip`, `colour`, or `none`. |
+| `TEAM_EMBEDDER_MODEL_ID` | `vit_base_patch16_siglip_224` | Used only for `siglip`. |
+| `TEAM_COUNT` | `2` | Current clustering target. |
+| `MIN_TEAM_SAMPLES_PER_TRACK` | `3` | Minimum selected samples before assigning a track. |
+| `TEAM_SAMPLE_STRIDE` | `5` | Propagated-frame team-evidence sampling rate. |
+| `MIN_TEAM_SAMPLE_QUALITY` | `0.0` | Minimum quality score for an accepted sample. |
+| `MAX_TEAM_SAMPLES_PER_TRACK` | `12` | Per-track cap before global clustering. |
+| `TEAM_ASSIGNMENT_MARGIN` | `0.03` | Required vote margin for a final assignment. |
+| `TEAM_DEBUG_ENABLED` | `true` | Writes `team_debug.json` plus crop/mask artifacts. |
+
+Local CLI overrides available today:
+
+- `--frame-stride`
+- `--max-frames`
+- `--confidence`
+- `--target-fps`
+- `--sam2-model-id`
+- `--team-embedder-backend`
+- `--team-embedder-model-id`
+- `--team-count`
+- `--min-team-samples-per-track`
+- `--team-assignment-margin`
+- `--annotated-video`
+
+Modal overrides additionally expose:
+
+- `team_sample_stride`
+- `min_team_sample_quality`
+- `max_team_samples_per_track`
+- `team_debug_enabled`
+- `max_missed_detections`
+- `appearance_weight`
+
+Current team-ID flow, as implemented:
+
+1. Collect team evidence on each detector frame.
+2. Collect extra evidence on propagated frames every `TEAM_SAMPLE_STRIDE` offsets.
+3. Keep only accepted samples above `MIN_TEAM_SAMPLE_QUALITY`, then select the best `MAX_TEAM_SAMPLES_PER_TRACK` samples per track.
+4. Cluster all selected samples globally and vote one label per track.
+5. Leave tracks unassigned when they are under-sampled or ambiguous.
+
+This matters because several older notes in `future_tasks/` describe a more elaborate planned design. The code today is one global clustering pass plus per-track voting, not a staged colour-first / SigLIP-refinement pipeline.
+
+---
+
+## 8. The cost knobs, and what they cost
 
 All of these live in `modal_app.py` and `pipeline/config.py`, each with a `COST:`
 comment next to it. Summary:
@@ -248,7 +311,7 @@ Two safety habits worth keeping:
 
 ---
 
-## Running without Modal
+## 9. Running without Modal
 
 The pipeline is plain Python and imports nothing from Modal. On a machine with a
 GPU:

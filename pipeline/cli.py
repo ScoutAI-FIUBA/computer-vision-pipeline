@@ -45,6 +45,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also write annotated.mp4. Costs extra runtime; off by default.",
     )
     parser.add_argument(
+        "--team-embedder-backend",
+        choices=("siglip", "colour", "none"),
+        help="Team ID embedder backend",
+    )
+    parser.add_argument(
+        "--team-embedder-model-id",
+        help="SigLIP model id for team embeddings, e.g. vit_base_patch16_siglip_224",
+    )
+    parser.add_argument("--team-count", type=int, help="Number of teams to cluster")
+    parser.add_argument(
+        "--min-team-samples-per-track",
+        type=int,
+        help="Skip tracks with fewer team-embedding samples than this",
+    )
+    parser.add_argument(
+        "--team-assignment-margin",
+        type=float,
+        help="Leave a track unassigned when both team clusters score too similarly",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Probe the video and estimate detector calls without running anything",
@@ -103,6 +123,11 @@ def main(argv: list[str] | None = None) -> int:
         confidence=args.confidence,
         target_fps=args.target_fps,
         sam2_model_id=args.sam2_model_id,
+        team_embedder_backend=args.team_embedder_backend,
+        team_embedder_model_id=args.team_embedder_model_id,
+        team_count=args.team_count,
+        min_team_samples_per_track=args.min_team_samples_per_track,
+        team_assignment_margin=args.team_assignment_margin,
         write_annotated_video=True if args.annotated_video else None,
     )
 

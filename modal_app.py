@@ -45,12 +45,14 @@ image = (
         # container. Bump deliberately, never implicitly.
         "torch==2.5.1",
         "torchvision==0.20.1",
+        "timm==1.0.22",
         "opencv-python-headless==4.10.0.84",
         "supervision==0.29.1",
         # Used for optimal (Hungarian) detection-to-track assignment. Pinned
         # explicitly rather than relying on it arriving as someone else's
         # transitive dependency.
         "scipy==1.18.0",
+        "umap-learn==0.5.9.post2",
         "inference-sdk==1.3.3",
         "boto3==1.35.36",
         "huggingface_hub==1.7.1",
@@ -139,6 +141,14 @@ class Pipeline:
         sam2_model_id: str | None = None,
         max_missed_detections: int | None = None,
         appearance_weight: float | None = None,
+        team_embedder_backend: str | None = None,
+        team_embedder_model_id: str | None = None,
+        team_count: int | None = None,
+        min_team_samples_per_track: int | None = None,
+        team_sample_stride: int | None = None,
+        min_team_sample_quality: float | None = None,
+        max_team_samples_per_track: int | None = None,
+        team_debug_enabled: bool | None = None,
         write_annotated_video: bool = False,
         return_artifacts: bool = False,
     ) -> dict:
@@ -167,6 +177,14 @@ class Pipeline:
             sam2_model_id=sam2_model_id,
             max_missed_detections=max_missed_detections,
             appearance_weight=appearance_weight,
+            team_embedder_backend=team_embedder_backend,
+            team_embedder_model_id=team_embedder_model_id,
+            team_count=team_count,
+            min_team_samples_per_track=min_team_samples_per_track,
+            team_sample_stride=team_sample_stride,
+            min_team_sample_quality=min_team_sample_quality,
+            max_team_samples_per_track=max_team_samples_per_track,
+            team_debug_enabled=team_debug_enabled,
             write_annotated_video=True if write_annotated_video else None,
         )
 
@@ -210,8 +228,8 @@ class Pipeline:
                 # video without wiring up R2. Only sensible for short clips: a
                 # long run's artifacts belong in R2, not a return value.
                 payload["artifacts"] = {
-                    path.name: path.read_bytes()
-                    for path in sorted(output_dir.iterdir())
+                    str(path.relative_to(output_dir)): path.read_bytes()
+                    for path in sorted(output_dir.rglob("*"))
                     if path.is_file()
                 }
             elif not output_prefix:
@@ -252,6 +270,14 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
         frame_stride=payload.get("frame_stride"),
         max_frames=payload.get("max_frames"),
         confidence=payload.get("confidence"),
+        team_embedder_backend=payload.get("team_embedder_backend"),
+        team_embedder_model_id=payload.get("team_embedder_model_id"),
+        team_count=payload.get("team_count"),
+        min_team_samples_per_track=payload.get("min_team_samples_per_track"),
+        team_sample_stride=payload.get("team_sample_stride"),
+        min_team_sample_quality=payload.get("min_team_sample_quality"),
+        max_team_samples_per_track=payload.get("max_team_samples_per_track"),
+        team_debug_enabled=payload.get("team_debug_enabled"),
         write_annotated_video=bool(payload.get("write_annotated_video", False)),
     )
     return {"call_id": call.object_id, "status": "queued"}
@@ -271,6 +297,14 @@ def main(
     sam2_model_id: str = "",
     max_missed_detections: int = -1,
     appearance_weight: float = -1.0,
+    team_embedder_backend: str = "",
+    team_embedder_model_id: str = "",
+    team_count: int = 0,
+    min_team_samples_per_track: int = 0,
+    team_sample_stride: int = 0,
+    min_team_sample_quality: float = -1.0,
+    max_team_samples_per_track: int = 0,
+    team_debug_enabled: bool | None = None,
     annotated: bool = False,
 ) -> None:
     """Run one job without deploying. Start here.
@@ -306,6 +340,14 @@ def main(
         "sam2_model_id": sam2_model_id or None,
         "max_missed_detections": None if max_missed_detections < 0 else max_missed_detections,
         "appearance_weight": None if appearance_weight < 0 else appearance_weight,
+        "team_embedder_backend": team_embedder_backend or None,
+        "team_embedder_model_id": team_embedder_model_id or None,
+        "team_count": team_count or None,
+        "min_team_samples_per_track": min_team_samples_per_track or None,
+        "team_sample_stride": team_sample_stride or None,
+        "min_team_sample_quality": None if min_team_sample_quality < 0 else min_team_sample_quality,
+        "max_team_samples_per_track": max_team_samples_per_track or None,
+        "team_debug_enabled": team_debug_enabled,
         "write_annotated_video": annotated,
         "return_artifacts": destination is not None,
     }
@@ -329,5 +371,6 @@ def main(
         destination.mkdir(parents=True, exist_ok=True)
         print(f"\nSaved to {destination}:")
         for name, data in artifacts.items():
+            (destination / name).parent.mkdir(parents=True, exist_ok=True)
             (destination / name).write_bytes(data)
             print(f"  {name}  ({len(data) / 1024:.0f} KB)")

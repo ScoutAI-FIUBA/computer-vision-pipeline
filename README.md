@@ -1,55 +1,117 @@
 # computer-vision-pipeline
 
-Minimal Roboflow/Supervision basketball pipeline for sampled video detection, tracking, and court-projection debugging.
+GPU-first basketball pipeline for Roboflow player detection, SAM2 tracking, and end-of-run team identification.
 
-## Setup
+## Current pipeline
 
-Install dependencies, set your Roboflow key, and run the API:
+The current production path is `pipeline/` plus `modal_app.py`.
 
-```bash
-python3 -m pip install -r requirements.txt
-printf 'ROBOFLOW_API_KEY=your_key_here\n' > .env
-uvicorn api.main:app --reload
-```
+High-level flow:
 
-Video processing can make many Roboflow calls. Run `dry_run=true` first to estimate cost before processing.
+1. Detect players on the first frame of each segment.
+2. Match detections back to active tracks and propagate them with SAM2.
+3. Collect team evidence from the detector frame and from selected propagated frames.
+4. Cluster accepted team samples at the end of the run and vote one `team_id` per track.
+5. Rewrite `tracks.jsonl`, write `teams.json`, and optionally render `annotated.mp4`.
 
-## Deployed pipeline (`pipeline/` + Modal)
+`pipeline/` contains no Modal imports, so the same code runs from local CLI, tests, notebooks, or Modal.
 
-`pipeline/` is a deployment-agnostic package that runs detection and SAM2
-tracking end to end, and `modal_app.py` is a thin Modal wrapper around it. This
-is the path that runs on GPUs rather than on a laptop or in Colab.
-
-`pipeline/` contains **no Modal imports** — it is plain Python, so it stays
-testable locally and is not tied to one vendor.
+## Quick start
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
 
-Estimate cost before spending anything (no GPU, no API key needed):
+Estimate cost before spending anything:
 
 ```bash
 python -m pipeline.cli path/to/clip.mp4 --dry-run
 ```
 
-Run it on a GPU:
+Run the current pipeline on Modal:
 
 ```bash
 modal run modal_app.py --video-path path/to/clip.mp4 --max-frames 90
 ```
 
-See `SETUP.md` for secrets, deployment, measured cost per configuration, and the
-cost-relevant knobs. Tests run without a GPU:
+See `SETUP.md` for secrets, deployment, and the configuration surface.
+
+## Configuration
+
+`PipelineConfig` in `pipeline/config.py` is the single source of truth for the deployed pipeline.
+
+Configuration sources, from broadest to narrowest:
+
+1. Environment variables via `PipelineConfig.from_env()`.
+2. Explicit local CLI overrides in `pipeline.cli`.
+3. Explicit Modal/local-entrypoint overrides in `modal_app.py`.
+
+Current environment-backed knobs:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ROBOFLOW_API_KEY` | required | Roboflow private API key. |
+| `ROBOFLOW_API_URL` | `https://serverless.roboflow.com` | Hosted inference endpoint. |
+| `PLAYER_MODEL_ID` | `basketball-player-detection-3-ycjdo/16` | Player detector model. |
+| `SAM2_MODEL_ID` | `facebook/sam2-hiera-small` | SAM2 checkpoint. |
+| `TEAM_EMBEDDER_BACKEND` | `siglip` | `siglip`, `colour`, or `none`. |
+| `TEAM_EMBEDDER_MODEL_ID` | `vit_base_patch16_siglip_224` | SigLIP model id when the backend is `siglip`. |
+| `TEAM_COUNT` | `2` | Cluster count for team assignment. |
+| `MIN_TEAM_SAMPLES_PER_TRACK` | `3` | Minimum selected samples before a track can be assigned. |
+| `TEAM_SAMPLE_STRIDE` | `5` | Propagated-frame sampling interval for team evidence. Detector frames are always sampled. |
+| `MIN_TEAM_SAMPLE_QUALITY` | `0.0` | Minimum quality score for a sample to count. |
+| `MAX_TEAM_SAMPLES_PER_TRACK` | `12` | Maximum selected samples kept per track. |
+| `TEAM_ASSIGNMENT_MARGIN` | `0.03` | Minimum winning vote margin before a track is assigned. |
+| `TEAM_DEBUG_ENABLED` | `true` | Write team-debug crops, masks, and per-sample metadata. |
+
+The local CLI exposes the common run knobs:
+
+- `--frame-stride`
+- `--max-frames`
+- `--confidence`
+- `--target-fps`
+- `--sam2-model-id`
+- `--team-embedder-backend`
+- `--team-embedder-model-id`
+- `--team-count`
+- `--min-team-samples-per-track`
+- `--team-assignment-margin`
+- `--annotated-video`
+
+The Modal entrypoint exposes the full current team-identification override surface, including `team_sample_stride`, `min_team_sample_quality`, `max_team_samples_per_track`, and `team_debug_enabled`.
+
+## Team identification
+
+Current behavior is simpler than the earlier design notes in `future_tasks/`.
+
+What the code does today:
+
+1. Extract a jersey-focused crop per accepted sample.
+2. Build either a colour histogram, a SigLIP embedding, or both depending on backend.
+3. Reject unusable samples, keep the best `max_team_samples_per_track` samples per track, then cluster all selected samples globally.
+4. Vote one label per track and leave the track unassigned when it is under-sampled, tied, or too close to the runner-up cluster.
+
+Important detail: there is no separate "colour-first then SigLIP refinement" stage in the current code. With the default `siglip` backend, clustering uses the embedding when present and falls back to the colour signature only when an embedding is missing.
+
+Current outputs from one pipeline run:
+
+| File | Meaning |
+| --- | --- |
+| `results.json` | Run summary plus the resolved config used for the run. |
+| `tracks.jsonl` | One row per track per emitted frame, rewritten at the end with final `team_id`s. |
+| `teams.json` | Team assignments, skipped/unassigned tracks, selected-sample counts, and per-track diagnostics. |
+| `team_debug.json` | Per-track sample summaries when team debug is enabled. |
+| `team_debug/` | Crops and masks for manual team-ID inspection when team debug is enabled. |
+| `annotated.mp4` | Optional final render after team assignment. |
+
+Tests that verify the config and team-ID plumbing without a GPU:
 
 ```bash
-python -m pytest tests/
+python -m pytest tests/test_config.py tests/test_team_id.py
 ```
 
-Read `future_tasks/TRACKING_ISSUES.md` before tuning tracking — several obvious
-ideas (lowering `--frame-stride`, using a bigger SAM2 checkpoint) were measured
-and do not do what you would expect.
+Read `future_tasks/TRACKING_ISSUES.md` before tuning tracking. Read `future_tasks/team-identification-architecture.md` before changing the team-ID logic.
 
 ## Local Scripts
 
