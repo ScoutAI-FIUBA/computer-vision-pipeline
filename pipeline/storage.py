@@ -71,9 +71,10 @@ class R2Storage:
 
         content_types = {".json": "application/json", ".jsonl": "application/x-ndjson", ".mp4": "video/mp4"}
         keys = []
-        for path in sorted(directory.iterdir()):
+        for path in sorted(directory.rglob("*")):
             if not path.is_file():
                 continue
-            key = f"{key_prefix.rstrip('/')}/{path.name}"
+            relative = path.relative_to(directory).as_posix()
+            key = f"{key_prefix.rstrip('/')}/{relative}"
             keys.append(self.upload(path, key, content_types.get(path.suffix)))
         return keys

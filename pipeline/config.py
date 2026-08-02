@@ -73,6 +73,7 @@ DEFAULT_TEAM_ASSIGNMENT_MARGIN = 0.03
 DEFAULT_TEAM_SAMPLE_STRIDE = 5
 DEFAULT_MIN_TEAM_SAMPLE_QUALITY = 0.0
 DEFAULT_MAX_TEAM_SAMPLES_PER_TRACK = 12
+DEFAULT_NUMBER_PREDICTOR_BACKEND = "dummy"
 
 DEFAULT_ROBOFLOW_API_URL = "https://serverless.roboflow.com"
 DEFAULT_PLAYER_MODEL_ID = "basketball-player-detection-3-ycjdo/16"
@@ -117,7 +118,7 @@ class PipelineConfig:
     # Cap on processed frames, not source frames — it bounds what you spend.
     max_frames: int | None = None
     confidence: float = 0.0
-    allowed_classes: tuple[str, ...] = ("player",)
+    allowed_classes: tuple[str, ...] = ("player", "number")
 
     # --- SAM2 ---
     sam2_model_id: str = DEFAULT_SAM2_MODEL_ID
@@ -192,9 +193,14 @@ class PipelineConfig:
     # the real output is the track JSON. Off by default; turn on to debug.
     write_annotated_video: bool = False
 
-    # Write per-sample crops, masks, and accept/reject metadata for team ID.
-    # Helpful for debugging, noisy for routine runs.
+    # Write per-sample crops, masks, and accept/reject metadata for team ID plus
+    # detector-frame jersey-number crops/metadata. Helpful for debugging, noisy
+    # for routine runs.
     team_debug_enabled: bool = True
+
+    # Jersey-number single-frame predictor backend. Phase 2 only supports the
+    # seam-first dummy backend.
+    number_predictor_backend: str = DEFAULT_NUMBER_PREDICTOR_BACKEND
 
     # COST: the detector call for segment N+1 is fired in a background thread
     # while SAM2 is still working on segment N, so the ~0.3s HTTP round-trip
@@ -221,6 +227,10 @@ class PipelineConfig:
             raise ValueError("max_team_samples_per_track must be at least 1")
         if self.team_assignment_margin < 0:
             raise ValueError("team_assignment_margin must be at least 0")
+        if self.number_predictor_backend != "dummy":
+            raise ValueError(
+                f"Unknown number_predictor_backend: {self.number_predictor_backend!r} (dummy)"
+            )
         if not self.roboflow_api_key:
             raise ValueError("roboflow_api_key is required")
 
@@ -260,6 +270,9 @@ class PipelineConfig:
                 "TEAM_ASSIGNMENT_MARGIN", DEFAULT_TEAM_ASSIGNMENT_MARGIN
             ),
             "team_debug_enabled": os.getenv("TEAM_DEBUG_ENABLED", "1") not in {"0", "false", "False"},
+            "number_predictor_backend": os.getenv(
+                "NUMBER_PREDICTOR_BACKEND", DEFAULT_NUMBER_PREDICTOR_BACKEND
+            ),
         }
         values.update({key: value for key, value in overrides.items() if value is not None})
         return cls(**values)  # type: ignore[arg-type]

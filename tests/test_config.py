@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ def test_from_env_reads_team_identification_settings(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("MAX_TEAM_SAMPLES_PER_TRACK", "9")
     monkeypatch.setenv("TEAM_ASSIGNMENT_MARGIN", "0.07")
     monkeypatch.setenv("TEAM_DEBUG_ENABLED", "0")
+    monkeypatch.setenv("NUMBER_PREDICTOR_BACKEND", "dummy")
 
     config = PipelineConfig.from_env()
 
@@ -38,6 +40,7 @@ def test_from_env_reads_team_identification_settings(monkeypatch: pytest.MonkeyP
     assert config.max_team_samples_per_track == 9
     assert config.team_assignment_margin == 0.07
     assert config.team_debug_enabled is False
+    assert config.number_predictor_backend == "dummy"
 
 
 def test_pipeline_config_rejects_invalid_team_identification_values():
@@ -58,3 +61,55 @@ def test_pipeline_config_rejects_invalid_team_identification_values():
 
     with pytest.raises(ValueError, match="team_assignment_margin must be at least 0"):
         PipelineConfig(roboflow_api_key="test-key", team_assignment_margin=-0.01)
+
+
+def test_pipeline_config_rejects_unsupported_number_predictor_backend():
+    with pytest.raises(ValueError, match="Unknown number_predictor_backend"):
+        PipelineConfig(roboflow_api_key="test-key", number_predictor_backend="ocr")
+
+
+def test_submit_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch):
+    import modal_app
+
+    monkeypatch.setenv("MODAL_WEBHOOK_TOKEN", "secret")
+    captured: dict[str, object] = {}
+
+    def spawn(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(object_id="call-1")
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(spawn=spawn)),
+    )
+
+    response = modal_app.submit.get_raw_f()(
+        {"r2_key": "videos/game.mp4", "number_predictor_backend": "dummy"},
+        authorization="Bearer secret",
+    )
+
+    assert response == {"call_id": "call-1", "status": "queued"}
+    assert captured["number_predictor_backend"] == "dummy"
+
+
+def test_main_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import modal_app
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"clip")
+    captured: dict[str, object] = {}
+
+    def remote(**kwargs):
+        captured.update(kwargs)
+        return {"summary": {}}
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(remote=remote)),
+    )
+
+    modal_app.main(video_path=str(video_path), number_predictor_backend="dummy")
+
+    assert captured["number_predictor_backend"] == "dummy"

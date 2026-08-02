@@ -20,6 +20,13 @@ from typing import Callable
 from pipeline import appearance
 from pipeline.config import PipelineConfig
 from pipeline.detection import PrefetchingDetector, build_detector, detections_from_result
+from pipeline.number_evidence import (
+    NumberPredictionRecord,
+    associate_number_rows,
+    write_number_debug_artifacts,
+    write_number_prediction_artifacts,
+)
+from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
 from pipeline.reid import Embedder, build_embedder
 from pipeline.results import RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter
 from pipeline.team_evidence import TeamEvidenceSample, select_top_k_evidence, summarize_track_evidence, write_debug_artifacts
@@ -46,6 +53,12 @@ SWAPS_FILENAME = "suspected_swaps.jsonl"
 TEAMS_FILENAME = "teams.json"
 
 
+def _split_detection_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    player_rows = [row for row in rows if str(row.get("class_name", "player")) == "player"]
+    number_rows = [row for row in rows if str(row.get("class_name", "player")) == "number"]
+    return player_rows, number_rows
+
+
 def _with_team_ids(rows: list[dict], team_by_track_id: dict[int, int]) -> list[dict]:
     enriched = []
     for row in rows:
@@ -54,6 +67,11 @@ def _with_team_ids(rows: list[dict], team_by_track_id: dict[int, int]) -> list[d
         copy["team_id"] = None if track_id is None else team_by_track_id.get(int(track_id))
         enriched.append(copy)
     return enriched
+
+
+def _iter_number_evidence_samples(number_evidence_by_track_id: dict[int, list]):
+    for track_id in sorted(number_evidence_by_track_id):
+        yield from sorted(number_evidence_by_track_id[track_id], key=lambda sample: (sample.frame_index, sample.track_id))
 
 
 def _identify_track_teams(
@@ -266,6 +284,8 @@ def run_pipeline(
         model_id=config.team_embedder_model_id,
     )
     team_evidence_by_track_id: dict[int, list[TeamEvidenceSample]] = {}
+    number_evidence_by_track_id: dict[int, list] = {}
+    number_predictor = build_number_predictor(config.number_predictor_backend)
 
     annotated_path = output_dir / ANNOTATED_FILENAME if config.write_annotated_video else None
 
@@ -289,18 +309,18 @@ def run_pipeline(
                     min_confidence=config.confidence,
                     allowed_classes=config.allowed_classes,
                 )
-                new_rows = detection_rows(detections)
+                player_rows, number_rows = _split_detection_rows(detection_rows(detections))
 
                 # Describe each detection before matching. The embedder returns
                 # None for players too occluded to describe, so crossings degrade
                 # to geometry rather than to a confident wrong answer.
                 if config.appearance_weight > 0.0:
-                    signatures = embedder.embed(frames[0], [row["xyxy"] for row in new_rows])
-                    for row, signature in zip(new_rows, signatures):
+                    signatures = embedder.embed(frames[0], [row["xyxy"] for row in player_rows])
+                    for row, signature in zip(player_rows, signatures):
                         row["appearance"] = signature
 
                 seed_rows, next_track_id = assign_track_ids(
-                    new_rows,
+                    player_rows,
                     active_rows,
                     next_track_id,
                     config.sam2_match_iou,
@@ -344,6 +364,14 @@ def run_pipeline(
                     appearance_by_track_id[track_id] = appearance.blend(
                         appearance_by_track_id.get(track_id), signature
                     )
+
+                for sample in associate_number_rows(
+                    frames[0],
+                    seed_rows,
+                    number_rows,
+                    frame_index=indices[0],
+                ):
+                    number_evidence_by_track_id.setdefault(sample.track_id, []).append(sample)
 
                 _collect_team_evidence(
                     frames[0],
@@ -482,6 +510,7 @@ def run_pipeline(
             "max_team_samples_per_track": config.max_team_samples_per_track,
             "team_assignment_margin": config.team_assignment_margin,
             "team_debug_enabled": config.team_debug_enabled,
+            "number_predictor_backend": number_predictor.name,
         },
         summary=summary,
         device=tracker.device,
@@ -489,6 +518,22 @@ def run_pipeline(
         annotated_video_file=ANNOTATED_FILENAME if annotated_path else None,
     )
     results.write(output_dir / RESULTS_FILENAME)
+
+    number_prediction_records: list[NumberPredictionRecord] = []
+    for sample in _iter_number_evidence_samples(number_evidence_by_track_id):
+        prediction = number_predictor.predict(sample)
+        tentative_number, accepted = normalize_number_prediction(prediction)
+        number_prediction_records.append(
+            NumberPredictionRecord(
+                frame_index=sample.frame_index,
+                track_id=sample.track_id,
+                track_state=sample.track_state,
+                raw_text=prediction.raw_text,
+                tentative_number=tentative_number,
+                accepted=accepted,
+            )
+        )
+    write_number_prediction_artifacts(output_dir, number_prediction_records)
 
     (output_dir / TEAMS_FILENAME).write_text(
         json.dumps(
@@ -518,6 +563,7 @@ def run_pipeline(
 
     if config.team_debug_enabled:
         write_debug_artifacts(output_dir, team_evidence_by_track_id)
+        write_number_debug_artifacts(output_dir, number_evidence_by_track_id)
 
     # One line per suspected swap, so a run can be reviewed without watching the
     # video. Written even when empty, so its absence means "not computed" rather

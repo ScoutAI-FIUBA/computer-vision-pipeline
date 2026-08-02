@@ -149,6 +149,7 @@ class Pipeline:
         min_team_sample_quality: float | None = None,
         max_team_samples_per_track: int | None = None,
         team_debug_enabled: bool | None = None,
+        number_predictor_backend: str | None = None,
         write_annotated_video: bool = False,
         return_artifacts: bool = False,
     ) -> dict:
@@ -185,6 +186,7 @@ class Pipeline:
             min_team_sample_quality=min_team_sample_quality,
             max_team_samples_per_track=max_team_samples_per_track,
             team_debug_enabled=team_debug_enabled,
+            number_predictor_backend=number_predictor_backend,
             write_annotated_video=True if write_annotated_video else None,
         )
 
@@ -278,6 +280,7 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
         min_team_sample_quality=payload.get("min_team_sample_quality"),
         max_team_samples_per_track=payload.get("max_team_samples_per_track"),
         team_debug_enabled=payload.get("team_debug_enabled"),
+        number_predictor_backend=payload.get("number_predictor_backend"),
         write_annotated_video=bool(payload.get("write_annotated_video", False)),
     )
     return {"call_id": call.object_id, "status": "queued"}
@@ -305,6 +308,7 @@ def main(
     min_team_sample_quality: float = -1.0,
     max_team_samples_per_track: int = 0,
     team_debug_enabled: bool | None = None,
+    number_predictor_backend: str = "",
     annotated: bool = False,
 ) -> None:
     """Run one job without deploying. Start here.
@@ -348,6 +352,7 @@ def main(
         "min_team_sample_quality": None if min_team_sample_quality < 0 else min_team_sample_quality,
         "max_team_samples_per_track": max_team_samples_per_track or None,
         "team_debug_enabled": team_debug_enabled,
+        "number_predictor_backend": number_predictor_backend or None,
         "write_annotated_video": annotated,
         "return_artifacts": destination is not None,
     }
