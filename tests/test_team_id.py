@@ -239,20 +239,20 @@ def test_siglip_team_embedder_uses_visible_torso_crop(monkeypatch: pytest.Monkey
     vectors = embedder.embed(frame, samples)
 
     assert captured["images"][0].shape == (16, 22, 3)
-    assert vectors[0] == pytest.approx([0.6, 0.8])
+    assert vectors[0].embedding == pytest.approx([0.6, 0.8])
 
 
 def test_extract_team_features_prefers_masked_uniform_region():
     import numpy as np
 
-    frame = np.zeros((40, 30, 3), dtype=np.uint8)
-    frame[14:24, 10:20] = (0, 0, 255)
-    mask = np.zeros((20, 20), dtype=bool)
-    mask[4:14, 6:16] = True
+    frame = np.zeros((50, 40, 3), dtype=np.uint8)
+    frame[15:30, 9:21] = (0, 0, 255)
+    mask = np.zeros((32, 20), dtype=bool)
+    mask[5:20, 4:16] = True
 
     features = extract_team_features(
         frame,
-        TeamEmbeddingSample(detection_id=1, track_id=7, xyxy=(5.0, 10.0, 25.0, 30.0), player_mask=mask),
+        TeamEmbeddingSample(detection_id=1, track_id=7, xyxy=(5.0, 10.0, 25.0, 42.0), player_mask=mask),
         [],
         ReidConfig(),
     )
