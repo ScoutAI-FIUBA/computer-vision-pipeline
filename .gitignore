@@ -1,6 +1,7 @@
 .atl/
 .venv/
 docs/
+openspec/
 
 .env
 
