@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,11 +22,12 @@ def _area(xyxy: list[float]) -> float:
     return max(0.0, float(xyxy[2]) - float(xyxy[0])) * max(0.0, float(xyxy[3]) - float(xyxy[1]))
 
 
-def crop_xyxy(frame, xyxy: list[float]):
-    x1 = max(0, int(round(float(xyxy[0]))))
-    y1 = max(0, int(round(float(xyxy[1]))))
-    x2 = max(x1, int(round(float(xyxy[2]))))
-    y2 = max(y1, int(round(float(xyxy[3]))))
+def crop_xyxy(frame, xyxy: list[float], *, px: int = 0, py: int = 0):
+    height, width = frame.shape[:2]
+    x1 = max(0, int(round(float(xyxy[0]))) - px)
+    y1 = max(0, int(round(float(xyxy[1]))) - py)
+    x2 = min(width, max(x1, int(round(float(xyxy[2]))) + px))
+    y2 = min(height, max(y1, int(round(float(xyxy[3]))) + py))
     return frame[y1:y2, x1:x2].copy()
 
 
@@ -68,6 +70,8 @@ class NumberPredictionRecord:
     raw_text: str | None
     tentative_number: str
     accepted: bool
+    score: float | None = None
+    raw_response: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -77,7 +81,67 @@ class NumberPredictionRecord:
             "raw_text": self.raw_text,
             "tentative_number": self.tentative_number,
             "accepted": bool(self.accepted),
+            "score": None if self.score is None else round(float(self.score), 4),
+            "raw_response": self.raw_response,
         }
+
+
+def _sorted_prediction_records(records: list[NumberPredictionRecord]) -> list[NumberPredictionRecord]:
+    return sorted(records, key=lambda record: (record.frame_index, record.track_id, record.track_state))
+
+
+def _is_decisive_number_record(record: NumberPredictionRecord) -> bool:
+    return bool(record.accepted) and record.tentative_number != "unknown"
+
+
+def aggregate_track_number_predictions(records: list[NumberPredictionRecord]) -> list[dict]:
+    tracks_by_id: dict[int, list[NumberPredictionRecord]] = {}
+    for record in _sorted_prediction_records(records):
+        tracks_by_id.setdefault(record.track_id, []).append(record)
+
+    tracks: list[dict] = []
+    for track_id in sorted(tracks_by_id):
+        track_records = tracks_by_id[track_id]
+        decisive_records = [record for record in track_records if _is_decisive_number_record(record)]
+        decisive_counts = Counter(record.tentative_number for record in decisive_records)
+        winning_number = "unknown"
+        status = "unknown"
+        support: list[dict] = []
+        conflicts: list[dict] = []
+
+        if decisive_counts:
+            highest_count = max(decisive_counts.values())
+            winners = sorted(number for number, count in decisive_counts.items() if count == highest_count)
+            if len(winners) == 1 and (highest_count > 1 or len(decisive_counts) == 1):
+                winning_number = winners[0]
+                status = "confirmed"
+                support = [
+                    record.to_dict()
+                    for record in decisive_records
+                    if record.tentative_number == winning_number
+                ]
+                conflicts = [
+                    record.to_dict()
+                    for record in decisive_records
+                    if record.tentative_number != winning_number
+                ]
+            else:
+                status = "ambiguous"
+                conflicts = [record.to_dict() for record in decisive_records]
+
+        ignored = [record.to_dict() for record in track_records if not _is_decisive_number_record(record)]
+        tracks.append(
+            {
+                "track_id": track_id,
+                "status": status,
+                "number": winning_number,
+                "support": support,
+                "conflicts": conflicts,
+                "ignored": ignored,
+            }
+        )
+
+    return tracks
 
 
 def associate_number_rows(frame, player_rows: list[dict], number_rows: list[dict], *, frame_index: int) -> list[NumberEvidenceSample]:
@@ -133,7 +197,7 @@ def associate_number_rows(frame, player_rows: list[dict], number_rows: list[dict
                         overlap_ratio=overlap_ratio,
                         player_overlap_ratio=player_overlap_ratio,
                         contains_number_center=contains_center,
-                        crop_image=crop_xyxy(frame, number_xyxy),
+                        crop_image=crop_xyxy(frame, number_xyxy, px=10, py=10),
                         confidence_hints={
                             "contains_number_center": contains_center,
                             "overlap_ratio": round(overlap_ratio, 4),
@@ -184,6 +248,13 @@ def write_number_prediction_artifacts(output_dir: Path, records: list[NumberPred
     with (output_dir / "number_prediction_cases.jsonl").open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record.to_dict()) + "\n")
+
+
+def write_number_confirmation_artifacts(output_dir: Path, records: list[NumberPredictionRecord]) -> None:
+    (output_dir / "numbers.json").write_text(
+        json.dumps({"tracks": aggregate_track_number_predictions(records)}, indent=2),
+        encoding="utf-8",
+    )
 
 
 def write_number_debug_artifacts(output_dir: Path, evidence_by_track_id: dict[int, list[NumberEvidenceSample]]) -> None:

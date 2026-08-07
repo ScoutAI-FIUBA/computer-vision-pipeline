@@ -68,6 +68,28 @@ def test_pipeline_config_rejects_unsupported_number_predictor_backend():
         PipelineConfig(roboflow_api_key="test-key", number_predictor_backend="ocr")
 
 
+def test_pipeline_config_accepts_hosted_number_predictor_settings(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("NUMBER_PREDICTOR_BACKEND", "roboflow-hosted")
+    monkeypatch.setenv("NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID", "basketball-jersey-numbers-ocr/6")
+    monkeypatch.setenv("NUMBER_PREDICTOR_SCORE_THRESHOLD", "0.7")
+
+    config = PipelineConfig.from_env()
+
+    assert config.number_predictor_backend == "roboflow-hosted"
+    assert config.number_predictor_roboflow_model_id == "basketball-jersey-numbers-ocr/6"
+    assert config.number_predictor_score_threshold == 0.7
+
+
+def test_pipeline_config_rejects_invalid_hosted_number_predictor_threshold():
+    with pytest.raises(ValueError, match="number_predictor_score_threshold must be between 0 and 1"):
+        PipelineConfig(
+            roboflow_api_key="test-key",
+            number_predictor_backend="roboflow-hosted",
+            number_predictor_score_threshold=1.5,
+        )
+
+
 def test_submit_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch):
     import modal_app
 

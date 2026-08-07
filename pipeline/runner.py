@@ -24,6 +24,7 @@ from pipeline.number_evidence import (
     NumberPredictionRecord,
     associate_number_rows,
     write_number_debug_artifacts,
+    write_number_confirmation_artifacts,
     write_number_prediction_artifacts,
 )
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
@@ -51,6 +52,7 @@ RESULTS_FILENAME = "results.json"
 ANNOTATED_FILENAME = "annotated.mp4"
 SWAPS_FILENAME = "suspected_swaps.jsonl"
 TEAMS_FILENAME = "teams.json"
+NUMBERS_FILENAME = "numbers.json"
 
 
 def _split_detection_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -188,9 +190,26 @@ def _iter_track_rows_by_frame(tracks_path: Path):
         yield current_frame_index, current_rows
 
 
+def _load_confirmed_numbers_by_track_id(numbers_path: Path) -> dict[int, str]:
+    if not numbers_path.exists():
+        return {}
+    payload = json.loads(numbers_path.read_text(encoding="utf-8"))
+    confirmed_numbers = {}
+    for track in payload.get("tracks", []):
+        if track.get("status") != "confirmed":
+            continue
+        number = track.get("number")
+        track_id = track.get("track_id")
+        if number in (None, "", "unknown") or track_id is None:
+            continue
+        confirmed_numbers[int(track_id)] = str(number)
+    return confirmed_numbers
+
+
 def _render_annotated_video(
     video_path: Path,
     tracks_path: Path,
+    numbers_path: Path,
     output_path: Path,
     *,
     info,
@@ -201,6 +220,7 @@ def _render_annotated_video(
 ) -> None:
     from pipeline.annotate import draw_tracks
 
+    confirmed_numbers_by_track_id = _load_confirmed_numbers_by_track_id(numbers_path)
     rows_by_frame = _iter_track_rows_by_frame(tracks_path)
     pending = next(rows_by_frame, None)
 
@@ -216,7 +236,17 @@ def _render_annotated_video(
                 frame_index = segment.frame_indices[offset]
                 rows = []
                 if pending is not None and pending[0] == frame_index:
-                    rows = pending[1]
+                    rows = [
+                        {
+                            **row,
+                            **(
+                                {"confirmed_number": confirmed_numbers_by_track_id[int(row["track_id"])]}
+                                if row.get("track_id") is not None and int(row["track_id"]) in confirmed_numbers_by_track_id
+                                else {}
+                            ),
+                        }
+                        for row in pending[1]
+                    ]
                     pending = next(rows_by_frame, None)
                 elif pending is not None and pending[0] < frame_index:
                     raise RuntimeError(
@@ -285,7 +315,7 @@ def run_pipeline(
     )
     team_evidence_by_track_id: dict[int, list[TeamEvidenceSample]] = {}
     number_evidence_by_track_id: dict[int, list] = {}
-    number_predictor = build_number_predictor(config.number_predictor_backend)
+    number_predictor = build_number_predictor(config)
 
     annotated_path = output_dir / ANNOTATED_FILENAME if config.write_annotated_video else None
 
@@ -466,17 +496,6 @@ def run_pipeline(
     }
     tracks_path = output_dir / TRACKS_FILENAME
     _rewrite_track_team_ids(tracks_path, team_by_track_id)
-    if annotated_path is not None:
-        _render_annotated_video(
-            video_path,
-            tracks_path,
-            annotated_path,
-            info=info,
-            frame_stride=config.frame_stride,
-            max_frames=config.max_frames,
-            frame_step=step,
-            fps=effective_fps,
-        )
 
     results = PipelineResults(
         schema_version=RESULTS_SCHEMA_VERSION,
@@ -515,14 +534,17 @@ def run_pipeline(
         summary=summary,
         device=tracker.device,
         teams_file=TEAMS_FILENAME,
+        numbers_file=NUMBERS_FILENAME,
         annotated_video_file=ANNOTATED_FILENAME if annotated_path else None,
     )
-    results.write(output_dir / RESULTS_FILENAME)
 
     number_prediction_records: list[NumberPredictionRecord] = []
     for sample in _iter_number_evidence_samples(number_evidence_by_track_id):
         prediction = number_predictor.predict(sample)
-        tentative_number, accepted = normalize_number_prediction(prediction)
+        tentative_number, accepted = normalize_number_prediction(
+            prediction,
+            threshold=config.number_predictor_score_threshold,
+        )
         number_prediction_records.append(
             NumberPredictionRecord(
                 frame_index=sample.frame_index,
@@ -531,9 +553,24 @@ def run_pipeline(
                 raw_text=prediction.raw_text,
                 tentative_number=tentative_number,
                 accepted=accepted,
+                score=prediction.score,
+                raw_response=prediction.raw_response,
             )
         )
     write_number_prediction_artifacts(output_dir, number_prediction_records)
+    write_number_confirmation_artifacts(output_dir, number_prediction_records)
+    if annotated_path is not None:
+        _render_annotated_video(
+            video_path,
+            tracks_path,
+            output_dir / NUMBERS_FILENAME,
+            annotated_path,
+            info=info,
+            frame_stride=config.frame_stride,
+            max_frames=config.max_frames,
+            frame_step=step,
+            fps=effective_fps,
+        )
 
     (output_dir / TEAMS_FILENAME).write_text(
         json.dumps(
@@ -571,6 +608,8 @@ def run_pipeline(
     with (output_dir / SWAPS_FILENAME).open("w", encoding="utf-8") as handle:
         for record in suspected_swaps:
             handle.write(json.dumps(record) + "\n")
+
+    results.write(output_dir / RESULTS_FILENAME)
 
     logger.info(
         "done: %s frames, %s segments, %s detector calls, %s track records in %.1fs",

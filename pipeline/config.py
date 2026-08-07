@@ -74,6 +74,8 @@ DEFAULT_TEAM_SAMPLE_STRIDE = 5
 DEFAULT_MIN_TEAM_SAMPLE_QUALITY = 0.0
 DEFAULT_MAX_TEAM_SAMPLES_PER_TRACK = 12
 DEFAULT_NUMBER_PREDICTOR_BACKEND = "dummy"
+DEFAULT_NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID = "basketball-jersey-numbers-ocr/6"
+DEFAULT_NUMBER_PREDICTOR_SCORE_THRESHOLD = 0.7
 
 DEFAULT_ROBOFLOW_API_URL = "https://serverless.roboflow.com"
 DEFAULT_PLAYER_MODEL_ID = "basketball-player-detection-3-ycjdo/16"
@@ -199,8 +201,10 @@ class PipelineConfig:
     team_debug_enabled: bool = True
 
     # Jersey-number single-frame predictor backend. Phase 2 only supports the
-    # seam-first dummy backend.
+    # seam-first dummy backend plus the hosted Roboflow OCR model.
     number_predictor_backend: str = DEFAULT_NUMBER_PREDICTOR_BACKEND
+    number_predictor_roboflow_model_id: str = DEFAULT_NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID
+    number_predictor_score_threshold: float = DEFAULT_NUMBER_PREDICTOR_SCORE_THRESHOLD
 
     # COST: the detector call for segment N+1 is fired in a background thread
     # while SAM2 is still working on segment N, so the ~0.3s HTTP round-trip
@@ -227,10 +231,12 @@ class PipelineConfig:
             raise ValueError("max_team_samples_per_track must be at least 1")
         if self.team_assignment_margin < 0:
             raise ValueError("team_assignment_margin must be at least 0")
-        if self.number_predictor_backend != "dummy":
+        if self.number_predictor_backend not in {"dummy", "roboflow-hosted"}:
             raise ValueError(
-                f"Unknown number_predictor_backend: {self.number_predictor_backend!r} (dummy)"
+                f"Unknown number_predictor_backend: {self.number_predictor_backend!r} (dummy, roboflow-hosted)"
             )
+        if not 0.0 <= self.number_predictor_score_threshold <= 1.0:
+            raise ValueError("number_predictor_score_threshold must be between 0 and 1")
         if not self.roboflow_api_key:
             raise ValueError("roboflow_api_key is required")
 
@@ -272,6 +278,14 @@ class PipelineConfig:
             "team_debug_enabled": os.getenv("TEAM_DEBUG_ENABLED", "1") not in {"0", "false", "False"},
             "number_predictor_backend": os.getenv(
                 "NUMBER_PREDICTOR_BACKEND", DEFAULT_NUMBER_PREDICTOR_BACKEND
+            ),
+            "number_predictor_roboflow_model_id": os.getenv(
+                "NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID",
+                DEFAULT_NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID,
+            ),
+            "number_predictor_score_threshold": _env_float(
+                "NUMBER_PREDICTOR_SCORE_THRESHOLD",
+                DEFAULT_NUMBER_PREDICTOR_SCORE_THRESHOLD,
             ),
         }
         values.update({key: value for key, value in overrides.items() if value is not None})

@@ -18,7 +18,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-RESULTS_SCHEMA_VERSION = 1
+RESULTS_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -48,6 +48,7 @@ class PipelineResults:
     device: str
     tracks_file: str = "tracks.jsonl"
     teams_file: str | None = None
+    numbers_file: str | None = None
     annotated_video_file: str | None = None
 
     def to_dict(self) -> dict:
