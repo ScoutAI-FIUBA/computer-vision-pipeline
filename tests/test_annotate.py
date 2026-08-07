@@ -7,11 +7,22 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pipeline.annotate import draw_tracks, team_color  # noqa: E402
+from pipeline.annotate import draw_tracks, team_color, track_label, track_label_id  # noqa: E402
 
 
 def test_team_color_uses_distinct_palette_entries():
     assert team_color(0) != team_color(1)
+
+
+def test_track_label_id_uses_only_confirmed_number():
+    assert track_label_id({"track_id": 7, "confirmed_number": "23"}) == "23"
+    assert track_label_id({"track_id": 7}) is None
+    assert track_label_id({"track_id": 7, "confirmed_number": "unknown"}) is None
+
+
+def test_track_label_omits_internal_track_id_when_number_is_missing():
+    assert track_label({"track_id": 7, "confirmed_number": "23", "class_name": "player"}) == "#23 player"
+    assert track_label({"track_id": 7, "class_name": "player"}) == "player"
 
 
 def test_draw_tracks_uses_team_colors_when_team_ids_exist():

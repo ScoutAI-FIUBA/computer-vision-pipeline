@@ -17,6 +17,20 @@ def team_color(team_id: int | None) -> tuple[int, int, int]:
     return TEAM_COLORS.get(team_id, (160, 255, 160))
 
 
+def track_label_id(row: dict) -> str | None:
+    confirmed_number = row.get("confirmed_number")
+    if confirmed_number not in (None, "", "unknown"):
+        return str(confirmed_number)
+    return None
+
+
+def track_label(row: dict) -> str:
+    label_id = track_label_id(row)
+    if label_id is None:
+        return str(row["class_name"])
+    return f"#{label_id} {row['class_name']}"
+
+
 def rows_to_detections(rows: list[dict]):
     """Convert pipeline row dicts into a supervision Detections for drawing."""
 
@@ -50,7 +64,7 @@ def draw_tracks(frame, rows: list[dict]):
         for row in rows:
             x1, y1, x2, y2 = [int(round(value)) for value in row["xyxy"]]
             team_id = row.get("team_id")
-            label = f"#{row['track_id']} {row['class_name']}"
+            label = track_label(row)
             if team_id is not None:
                 label += f" T{int(team_id)}"
             if row["confidence"] is not None:
@@ -75,7 +89,7 @@ def draw_tracks(frame, rows: list[dict]):
         return frame
 
     labels = [
-        f"#{row['track_id']} {row['class_name']}"
+        track_label(row)
         + ("" if row["confidence"] is None else f" {float(row['confidence']):.2f}")
         for row in rows
     ]

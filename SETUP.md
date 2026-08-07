@@ -205,6 +205,9 @@ Core environment variables:
 | `MAX_TEAM_SAMPLES_PER_TRACK` | `12` | Per-track cap before global clustering. |
 | `TEAM_ASSIGNMENT_MARGIN` | `0.03` | Required vote margin for a final assignment. |
 | `TEAM_DEBUG_ENABLED` | `true` | Writes `team_debug.json` plus crop/mask artifacts. |
+| `NUMBER_PREDICTOR_BACKEND` | `dummy` | `dummy` or `roboflow-hosted` jersey-number predictor. |
+| `NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID` | `basketball-jersey-numbers-ocr/6` | Hosted Roboflow OCR model id for jersey numbers. |
+| `NUMBER_PREDICTOR_SCORE_THRESHOLD` | `0.7` | Minimum OCR score before a read can count. |
 
 Local CLI overrides available today:
 
@@ -226,18 +229,27 @@ Modal overrides additionally expose:
 - `min_team_sample_quality`
 - `max_team_samples_per_track`
 - `team_debug_enabled`
+- `number_predictor_backend`
 - `max_missed_detections`
 - `appearance_weight`
 
-Current team-ID flow, as implemented:
+Current team-and-number flow, as implemented:
 
 1. Collect team evidence on each detector frame.
 2. Collect extra evidence on propagated frames every `TEAM_SAMPLE_STRIDE` offsets.
 3. Keep only accepted samples above `MIN_TEAM_SAMPLE_QUALITY`, then select the best `MAX_TEAM_SAMPLES_PER_TRACK` samples per track.
 4. Cluster all selected samples globally and vote one label per track.
 5. Leave tracks unassigned when they are under-sampled or ambiguous.
+6. On detector frames, collect overlapping `number` detections, run hosted OCR when enabled, and save every OCR case to `number_predictions.json` plus `number_prediction_cases.jsonl`.
+7. Aggregate accepted OCR reads per track into `numbers.json`, confirming only clean winners and leaving conflicts ambiguous.
 
-This matters because several older notes in `future_tasks/` describe a more elaborate planned design. The code today is one global clustering pass plus per-track voting, not a staged colour-first / SigLIP-refinement pipeline.
+Output contract to expect from a successful run:
+
+- `results.json` now includes `numbers_file` and is written only after all final artifacts are done.
+- `numbers.json` contains the final per-track jersey-number decisions.
+- `annotated.mp4`, when enabled, can show confirmed jersey numbers in labels and does not fall back to internal track IDs when no number is confirmed.
+
+This matters because several older notes in `future_tasks/` describe a more elaborate planned design. The code today is one global clustering pass plus per-track voting for teams, plus a detector-frame OCR-and-aggregation path for jersey numbers — not a larger temporal validation system yet.
 
 ---
 

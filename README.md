@@ -1,6 +1,6 @@
 # computer-vision-pipeline
 
-GPU-first basketball pipeline for Roboflow player detection, SAM2 tracking, and end-of-run team identification.
+GPU-first basketball pipeline for Roboflow player detection, SAM2 tracking, end-of-run team identification, and conservative jersey-number confirmation.
 
 ## Current pipeline
 
@@ -12,7 +12,7 @@ High-level flow:
 2. Match detections back to active tracks and propagate them with SAM2.
 3. Collect team evidence from the detector frame and from selected propagated frames.
 4. Cluster accepted team samples at the end of the run and vote one `team_id` per track.
-5. Rewrite `tracks.jsonl`, write `teams.json`, and optionally render `annotated.mp4`.
+5. Collect detector-frame jersey-number evidence from the `number` class, run hosted OCR on selected number crops, aggregate final per-track numbers, then rewrite `tracks.jsonl`, write `teams.json`, `numbers.json`, and optionally render `annotated.mp4`.
 
 `pipeline/` contains no Modal imports, so the same code runs from local CLI, tests, notebooks, or Modal.
 
@@ -64,6 +64,9 @@ Current environment-backed knobs:
 | `MAX_TEAM_SAMPLES_PER_TRACK` | `12` | Maximum selected samples kept per track. |
 | `TEAM_ASSIGNMENT_MARGIN` | `0.03` | Minimum winning vote margin before a track is assigned. |
 | `TEAM_DEBUG_ENABLED` | `true` | Write team-debug crops, masks, and per-sample metadata. |
+| `NUMBER_PREDICTOR_BACKEND` | `dummy` | `dummy` or `roboflow-hosted` jersey-number predictor. |
+| `NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID` | `basketball-jersey-numbers-ocr/6` | Hosted Roboflow OCR model id for jersey numbers. |
+| `NUMBER_PREDICTOR_SCORE_THRESHOLD` | `0.7` | Minimum hosted OCR score before a read can count. |
 
 The local CLI exposes the common run knobs:
 
@@ -79,7 +82,7 @@ The local CLI exposes the common run knobs:
 - `--team-assignment-margin`
 - `--annotated-video`
 
-The Modal entrypoint exposes the full current team-identification override surface, including `team_sample_stride`, `min_team_sample_quality`, `max_team_samples_per_track`, and `team_debug_enabled`.
+The Modal entrypoint exposes the full current team-and-number override surface, including `team_sample_stride`, `min_team_sample_quality`, `max_team_samples_per_track`, `team_debug_enabled`, and `number_predictor_backend`.
 
 ## Team identification
 
@@ -98,17 +101,54 @@ Current outputs from one pipeline run:
 
 | File | Meaning |
 | --- | --- |
-| `results.json` | Run summary plus the resolved config used for the run. |
+| `results.json` | Run summary plus the resolved config used for the run, including output file pointers such as `teams_file` and `numbers_file`. |
 | `tracks.jsonl` | One row per track per emitted frame, rewritten at the end with final `team_id`s. |
 | `teams.json` | Team assignments, skipped/unassigned tracks, selected-sample counts, and per-track diagnostics. |
+| `numbers.json` | Final per-track jersey-number confirmations and ambiguity details. |
 | `team_debug.json` | Per-track sample summaries when team debug is enabled. |
 | `team_debug/` | Crops and masks for manual team-ID inspection when team debug is enabled. |
-| `annotated.mp4` | Optional final render after team assignment. |
+| `annotated.mp4` | Optional final render after team assignment/number aggregation, with confirmed jersey numbers when available. |
+
+## Jersey numbers
+
+The pipeline now has a working jersey-number path.
+
+What it does today:
+
+1. On each detector frame, keep `player` detections and collect overlapping `number` detections as number evidence.
+2. Crop the matched `number` box and send it to the hosted Roboflow OCR model when `NUMBER_PREDICTOR_BACKEND=roboflow-hosted`.
+3. Store every OCR attempt in `number_predictions.json` and `number_prediction_cases.jsonl`.
+4. Aggregate accepted reads per track at the end of the run and write confirmed/ambiguous results to `numbers.json`.
+5. When an annotated video is requested, show confirmed jersey numbers in labels. If no number is confirmed, the overlay stays generic instead of falling back to internal track IDs.
+
+Confirmation is intentionally conservative:
+
+- A track is `confirmed` only when one accepted number wins cleanly.
+- Conflicting accepted reads keep the track `ambiguous` instead of guessing.
+- One accepted valid read can still confirm a number when there are no competing accepted reads for that track.
+- Non-digit, low-score, or unsupported-length OCR reads are ignored.
+
+Current number artifacts from one pipeline run:
+
+| File | Meaning |
+| --- | --- |
+| `number_predictions.json` | All per-sample OCR outputs in one JSON payload. |
+| `number_prediction_cases.jsonl` | Same OCR cases as JSONL for grep/review workflows. |
+| `numbers.json` | Final per-track number status with `confirmed`, `ambiguous`, or `unknown`, plus support/conflict details. |
+
+`results.json` now includes `numbers_file`, and it is written only at the true end of the run after track, team, number, and optional video outputs finish.
+
+Current limits:
+
+- OCR is detector-frame only; propagated frames are not sampled for number evidence.
+- Partial digits and short noisy reads can still slip through as `unknown` or remain unresolved.
+- There is no stronger temporal validation yet beyond per-track acceptance/conflict aggregation.
+- The pipeline prefers leaving a track unresolved over forcing a wrong jersey number.
 
 Tests that verify the config and team-ID plumbing without a GPU:
 
 ```bash
-python -m pytest tests/test_config.py tests/test_team_id.py
+python -m pytest tests/test_config.py tests/test_team_id.py tests/test_number_evidence.py
 ```
 
 Read `future_tasks/TRACKING_ISSUES.md` before tuning tracking. Read `future_tasks/team-identification-architecture.md` before changing the team-ID logic.
@@ -134,7 +174,7 @@ Use these first.
 
 | Script | Role | When to use it |
 | --- | --- | --- |
-| `scripts/tracking/track_players_sam2.py` | Official local SAM2 tracker | Run the detector-seeded SAM2 tracking pipeline with annotated video, track JSONL, and raw inference JSONL. |
+| `scripts/tracking/track_players_sam2.py` | Official local SAM2 tracker | Run the detector-seeded SAM2 tracking pipeline with annotated video, track JSONL, raw inference JSONL, and the end-of-run team/number artifacts. |
 | `scripts/tracking/video_pipeline.py` | ByteTrack/BoxMOT video pipeline | Run the older box-tracker pipeline when you need the existing ByteTrack, Deep OC-SORT, or BoT-SORT path. |
 | `scripts/tracking/detect_players.py` | Main single-image detector | Run player detection on one local image/frame. |
 
@@ -201,7 +241,7 @@ python3 scripts/tracking/summarize_tracking_run.py outputs/game_tracks.jsonl
 Implemented now:
 
 - Shared annotation helpers now cover player detection, tracking, and court keypoint visualization.
-- `scripts/tracking/track_players_sam2.py` is now the official local tracker path for player tracking with annotated video, track JSONL, and raw inference JSONL.
+- `scripts/tracking/track_players_sam2.py` is now the official local tracker path for player tracking with annotated video, track JSONL, raw inference JSONL, and end-of-run team/number outputs.
 - `scripts/tracking/video_pipeline.py` still exists for the older ByteTrack/BoxMOT path plus optional court keypoints and projected-track JSONL export.
 - Homography fitting now includes geometric pre-validation before `cv2.findHomography`, so obviously degenerate keypoint layouts are rejected early.
 - Projected-track debugging is available through `scripts/court/visualize_projected_tracks.py`.
@@ -237,8 +277,8 @@ These belong in `scripts/tracking/video_pipeline.py` because they are part of th
 | Raw inference JSONL | Integrated | One record per inferred frame. |
 | Court keypoints | Partially integrated | Available through `--court-keypoints` in the local video pipeline, with separate debug scripts still retained. |
 | Court homography / player projection | Partially integrated | Projected-track JSONL export exists in the local pipeline; broader downstream use still depends on trustworthy keypoints and mapping. |
-| Team identification | Future | Add after tracking and court projection are stable. |
-| Jersey OCR | Future | Add after track crops and team separation are reliable. |
+| Team identification | Integrated | End-of-run global clustering plus per-track voting is active in the current pipeline. |
+| Jersey OCR | Integrated | Detector-frame number evidence, hosted OCR prediction, and end-of-run per-track aggregation are active in the current pipeline. |
 | Event logic / make-miss | Future | Depends on stable tracking + court geometry. |
 
 ### 2. Keep as external tools for now
