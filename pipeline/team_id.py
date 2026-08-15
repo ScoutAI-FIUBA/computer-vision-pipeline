@@ -183,10 +183,17 @@ def identify_teams(
         raise ValueError("assignment_margin must be at least 0")
 
     track_ids = sorted({int(observation.track_id) for observation in observations if observation.track_id is not None})
+    eligible_by_track_id: dict[int, list[TeamObservation]] = {track_id: [] for track_id in track_ids}
+    for observation in observations:
+        if observation.track_id is None or _observation_vector(observation) is None:
+            continue
+        eligible_by_track_id[int(observation.track_id)].append(observation)
+
     eligible = [
         observation
-        for observation in observations
-        if observation.track_id is not None and _observation_vector(observation) is not None
+        for track_id in track_ids
+        if len(eligible_by_track_id[track_id]) >= minimum_samples
+        for observation in eligible_by_track_id[track_id]
     ]
     labels_by_track_id: dict[int, list[int]] = {track_id: [] for track_id in track_ids}
 
@@ -204,6 +211,17 @@ def identify_teams(
     track_diagnostics: dict[int, dict] = {}
     skipped: list[int] = []
     for track_id in track_ids:
+        eligible_samples = len(eligible_by_track_id.get(track_id, []))
+        if 0 < eligible_samples < minimum_samples:
+            track_diagnostics[track_id] = {
+                "eligible_samples": eligible_samples,
+                "cluster_votes": {},
+                "majority_share": None,
+                "vote_margin": None,
+                "vote_decision": "under_sampled",
+            }
+            assignments.append(TeamAssignment(detection_id=track_id, track_id=track_id, team_id=None))
+            continue
         vote_labels = labels_by_track_id.get(track_id, [])
         if not vote_labels:
             skipped.append(track_id)

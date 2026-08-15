@@ -401,6 +401,37 @@ def test_identify_teams_skips_tracks_below_minimum_samples():
     assert result.skipped_detection_ids == []
 
 
+def test_identify_teams_excludes_under_sampled_tracks_from_clustering():
+    captured = {}
+
+    class CapturingClusterer:
+        name = "capturing"
+
+        def fit_predict(self, embeddings: list[list[float]], team_count: int) -> list[int]:
+            captured["embeddings"] = embeddings
+            assert team_count == 2
+            return [0, 0, 1, 1]
+
+    result = identify_teams(
+        [
+            TeamObservation(detection_id=100, track_id=7, embedding=[1.0, 0.0]),
+            TeamObservation(detection_id=101, track_id=7, embedding=[0.9, 0.1]),
+            TeamObservation(detection_id=102, track_id=8, embedding=[0.0, 1.0]),
+            TeamObservation(detection_id=103, track_id=8, embedding=[0.1, 0.9]),
+            TeamObservation(detection_id=104, track_id=99, embedding=[5.0, 5.0]),
+        ],
+        clusterer=CapturingClusterer(),
+        team_count=2,
+        minimum_samples=2,
+    )
+
+    assert captured["embeddings"] == [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]
+    assigned = {assignment.track_id: assignment.team_id for assignment in result.assignments}
+    assert assigned[7] == 0
+    assert assigned[8] == 1
+    assert assigned[99] is None
+
+
 def test_identify_teams_uses_colour_when_siglip_embedding_is_missing():
     result = identify_teams(
         [

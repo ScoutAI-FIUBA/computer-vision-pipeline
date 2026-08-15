@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pipeline.config import PipelineConfig  # noqa: E402
+from pipeline.court_projection import DEFAULT_COURT_MODEL_ID  # noqa: E402
 
 
 def test_from_env_reads_team_identification_settings(monkeypatch: pytest.MonkeyPatch):
@@ -43,6 +44,46 @@ def test_from_env_reads_team_identification_settings(monkeypatch: pytest.MonkeyP
     assert config.number_predictor_backend == "dummy"
 
 
+def test_from_env_defaults_main_and_shot_models_separately(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("PLAYER_MODEL_ID", "basketball-player-detection-3-ycjdo/16")
+    monkeypatch.setenv("SHOT_MODEL_ID", "basketball-player-detection-3-ycjdo/1")
+
+    config = PipelineConfig.from_env()
+
+    assert config.player_model_id == "basketball-player-detection-3-ycjdo/16"
+    assert config.shot_model_id == "basketball-player-detection-3-ycjdo/1"
+    assert config.shot_target_fps is None
+    assert config.shot_frame_stride == 1
+
+
+def test_from_env_uses_aligned_default_shot_model(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.delenv("SHOT_MODEL_ID", raising=False)
+
+    config = PipelineConfig.from_env()
+
+    assert config.shot_model_id == "basketball-player-detection-3-ycjdo/1"
+
+
+def test_from_env_reads_shot_target_fps(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("SHOT_TARGET_FPS", "7.5")
+
+    config = PipelineConfig.from_env()
+
+    assert config.shot_target_fps == 7.5
+
+
+def test_from_env_defaults_court_projection_settings(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+
+    config = PipelineConfig.from_env()
+
+    assert config.court_model_id == DEFAULT_COURT_MODEL_ID
+    assert config.court_keypoint_confidence == 0.7
+
+
 def test_pipeline_config_rejects_invalid_team_identification_values():
     with pytest.raises(ValueError, match="team_count must be at least 1"):
         PipelineConfig(roboflow_api_key="test-key", team_count=0)
@@ -52,6 +93,9 @@ def test_pipeline_config_rejects_invalid_team_identification_values():
 
     with pytest.raises(ValueError, match="team_sample_stride must be at least 1"):
         PipelineConfig(roboflow_api_key="test-key", team_sample_stride=0)
+
+    with pytest.raises(ValueError, match="shot_frame_stride must be at least 1"):
+        PipelineConfig(roboflow_api_key="test-key", shot_frame_stride=0)
 
     with pytest.raises(ValueError, match="min_team_sample_quality must be at least 0"):
         PipelineConfig(roboflow_api_key="test-key", min_team_sample_quality=-0.01)
@@ -90,6 +134,11 @@ def test_pipeline_config_rejects_invalid_hosted_number_predictor_threshold():
         )
 
 
+def test_pipeline_config_rejects_invalid_court_keypoint_confidence():
+    with pytest.raises(ValueError, match="court_keypoint_confidence must be between 0 and 1"):
+        PipelineConfig(roboflow_api_key="test-key", court_keypoint_confidence=1.5)
+
+
 def test_submit_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch):
     import modal_app
 
@@ -115,6 +164,30 @@ def test_submit_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch)
     assert captured["number_predictor_backend"] == "dummy"
 
 
+def test_submit_passes_pipeline_selector(monkeypatch: pytest.MonkeyPatch):
+    import modal_app
+
+    monkeypatch.setenv("MODAL_WEBHOOK_TOKEN", "secret")
+    captured: dict[str, object] = {}
+
+    def spawn(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(object_id="call-1")
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(spawn=spawn)),
+    )
+
+    modal_app.submit.get_raw_f()(
+        {"r2_key": "videos/game.mp4", "pipeline": "player-positions"},
+        authorization="Bearer secret",
+    )
+
+    assert captured["pipeline"] == "player-positions"
+
+
 def test_main_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     import modal_app
 
@@ -135,3 +208,168 @@ def test_main_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch, t
     modal_app.main(video_path=str(video_path), number_predictor_backend="dummy")
 
     assert captured["number_predictor_backend"] == "dummy"
+
+
+def test_main_passes_pipeline_selector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import modal_app
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"clip")
+    captured: dict[str, object] = {}
+
+    def remote(**kwargs):
+        captured.update(kwargs)
+        return {"summary": {}}
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(remote=remote)),
+    )
+
+    modal_app.main(video_path=str(video_path), pipeline="player-positions")
+
+    assert captured["pipeline"] == "player-positions"
+
+
+def test_main_passes_player_position_confidence_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import modal_app
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"clip")
+    captured: dict[str, object] = {}
+
+    def remote(**kwargs):
+        captured.update(kwargs)
+        return {"summary": {}}
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(remote=remote)),
+    )
+
+    modal_app.main(video_path=str(video_path), pipeline="player-positions", confidence=0.55)
+
+    assert captured["confidence"] == 0.55
+
+
+def test_main_stats_pipeline_leaves_confidence_unset_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import modal_app
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"clip")
+    captured: dict[str, object] = {}
+
+    def remote(**kwargs):
+        captured.update(kwargs)
+        return {"summary": {}}
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(remote=remote)),
+    )
+
+    modal_app.main(video_path=str(video_path))
+
+    assert captured["confidence"] is None
+
+
+def test_main_stats_pipeline_preserves_explicit_zero_confidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import modal_app
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"clip")
+    captured: dict[str, object] = {}
+
+    def remote(**kwargs):
+        captured.update(kwargs)
+        return {"summary": {}}
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(remote=remote)),
+    )
+
+    modal_app.main(video_path=str(video_path), confidence=0.0)
+
+    assert captured["confidence"] == 0.0
+
+
+def test_process_config_overrides_preserve_explicit_zero_confidence():
+    import modal_app
+
+    overrides = modal_app._build_process_config_overrides(
+        pipeline=modal_app.MAIN_PIPELINE,
+        frame_stride=None,
+        max_frames=None,
+        confidence=0.0,
+        target_fps=None,
+        sam2_model_id=None,
+        max_missed_detections=None,
+        appearance_weight=None,
+        team_embedder_backend=None,
+        team_embedder_model_id=None,
+        team_count=None,
+        min_team_samples_per_track=None,
+        team_sample_stride=None,
+        min_team_sample_quality=None,
+        max_team_samples_per_track=None,
+        team_debug_enabled=None,
+        number_predictor_backend=None,
+        write_annotated_video=False,
+    )
+
+    assert overrides["confidence"] == 0.0
+
+
+def test_process_config_overrides_apply_player_positions_defaults():
+    import modal_app
+
+    overrides = modal_app._build_process_config_overrides(
+        pipeline=modal_app.PLAYER_POSITIONS_PIPELINE,
+        frame_stride=None,
+        max_frames=None,
+        confidence=None,
+        target_fps=None,
+        sam2_model_id=None,
+        max_missed_detections=None,
+        appearance_weight=None,
+        team_embedder_backend=None,
+        team_embedder_model_id=None,
+        team_count=None,
+        min_team_samples_per_track=None,
+        team_sample_stride=None,
+        min_team_sample_quality=None,
+        max_team_samples_per_track=None,
+        team_debug_enabled=None,
+        number_predictor_backend=None,
+        write_annotated_video=False,
+    )
+
+    assert overrides["confidence"] == 0.8
+    assert overrides["target_fps"] == 5.0
+    assert overrides["frame_stride"] == 5
+    assert overrides["allowed_classes"] == ("player",)
+    assert overrides["write_annotated_video"] is False
+
+
+def test_run_selected_pipeline_dispatches_player_positions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import modal_app
+
+    expected = {"positions_file": "player_positions.jsonl"}
+
+    monkeypatch.setitem(sys.modules, "pipeline.player_positions", types.SimpleNamespace(run_player_position_pipeline=lambda *args, **kwargs: expected))
+
+    result = modal_app._run_selected_pipeline(
+        "player-positions",
+        video_path=tmp_path / "clip.mp4",
+        config=object(),
+        output_dir=tmp_path / "out",
+        tracker=object(),
+        embedder=object(),
+    )
+
+    assert result == expected

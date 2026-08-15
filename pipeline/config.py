@@ -13,6 +13,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from pipeline.court_projection import DEFAULT_COURT_MODEL_ID
+
 try:
     from dotenv import load_dotenv
 except ModuleNotFoundError:  # dotenv is a convenience, not a requirement
@@ -79,6 +81,10 @@ DEFAULT_NUMBER_PREDICTOR_SCORE_THRESHOLD = 0.7
 
 DEFAULT_ROBOFLOW_API_URL = "https://serverless.roboflow.com"
 DEFAULT_PLAYER_MODEL_ID = "basketball-player-detection-3-ycjdo/16"
+DEFAULT_SHOT_MODEL_ID = "basketball-player-detection-3-ycjdo/1"
+DEFAULT_SHOT_FRAME_STRIDE = 1
+DEFAULT_COURT_KEYPOINT_CONFIDENCE = 0.7
+
 
 
 def _env_int(name: str, default: int) -> int:
@@ -91,6 +97,11 @@ def _env_float(name: str, default: float) -> float:
     return default if value in (None, "") else float(value)
 
 
+def _env_optional_float(name: str) -> float | None:
+    value = os.getenv(name)
+    return None if value in (None, "") else float(value)
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     """Every tunable the pipeline has. Build with `from_env()` or directly."""
@@ -99,6 +110,9 @@ class PipelineConfig:
     roboflow_api_key: str
     roboflow_api_url: str = DEFAULT_ROBOFLOW_API_URL
     player_model_id: str = DEFAULT_PLAYER_MODEL_ID
+    shot_model_id: str = DEFAULT_SHOT_MODEL_ID
+    court_model_id: str | None = None
+    court_keypoint_confidence: float = DEFAULT_COURT_KEYPOINT_CONFIDENCE
 
     # --- Sampling ---
     # COST: the biggest lever there is. SAM2's image encoder runs on every
@@ -108,6 +122,7 @@ class PipelineConfig:
     # saving. Player positions 66ms apart are more than enough for scouting
     # stats. Set to None to process every frame (4x the cost on 60fps video).
     target_fps: float | None = DEFAULT_TARGET_FPS
+    shot_target_fps: float | None = None
 
     # Run the detector every N *processed* frames. Note this is in processed
     # frames, so its meaning in wall-clock depends on target_fps: at 15fps a
@@ -116,6 +131,7 @@ class PipelineConfig:
     # accuracy knob: lower stride means more re-seeding events, which can help or
     # hurt identity depending on the clip.
     frame_stride: int = DEFAULT_FRAME_STRIDE
+    shot_frame_stride: int = DEFAULT_SHOT_FRAME_STRIDE
 
     # Cap on processed frames, not source frames — it bounds what you spend.
     max_frames: int | None = None
@@ -215,6 +231,8 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         if self.frame_stride < 1:
             raise ValueError("frame_stride must be at least 1")
+        if self.shot_frame_stride < 1:
+            raise ValueError("shot_frame_stride must be at least 1")
         if self.max_frames is not None and self.max_frames < 1:
             raise ValueError("max_frames must be at least 1 when set")
         if not 0.0 <= self.sam2_match_iou <= 1.0:
@@ -237,6 +255,8 @@ class PipelineConfig:
             )
         if not 0.0 <= self.number_predictor_score_threshold <= 1.0:
             raise ValueError("number_predictor_score_threshold must be between 0 and 1")
+        if not 0.0 <= self.court_keypoint_confidence <= 1.0:
+            raise ValueError("court_keypoint_confidence must be between 0 and 1")
         if not self.roboflow_api_key:
             raise ValueError("roboflow_api_key is required")
 
@@ -254,7 +274,14 @@ class PipelineConfig:
             "roboflow_api_key": os.getenv("ROBOFLOW_API_KEY", ""),
             "roboflow_api_url": os.getenv("ROBOFLOW_API_URL", DEFAULT_ROBOFLOW_API_URL),
             "player_model_id": os.getenv("PLAYER_MODEL_ID", DEFAULT_PLAYER_MODEL_ID),
+            "shot_model_id": os.getenv("SHOT_MODEL_ID", DEFAULT_SHOT_MODEL_ID),
+            "court_model_id": os.getenv("COURT_MODEL_ID", DEFAULT_COURT_MODEL_ID),
             "sam2_model_id": os.getenv("SAM2_MODEL_ID", DEFAULT_SAM2_MODEL_ID),
+            "shot_target_fps": _env_optional_float("SHOT_TARGET_FPS"),
+            "shot_frame_stride": _env_int("SHOT_FRAME_STRIDE", DEFAULT_SHOT_FRAME_STRIDE),
+            "court_keypoint_confidence": _env_float(
+                "COURT_KEYPOINT_CONFIDENCE", DEFAULT_COURT_KEYPOINT_CONFIDENCE
+            ),
             "team_embedder_backend": os.getenv(
                 "TEAM_EMBEDDER_BACKEND", DEFAULT_TEAM_EMBEDDER_BACKEND
             ),

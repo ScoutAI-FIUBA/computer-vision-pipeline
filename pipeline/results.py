@@ -18,7 +18,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-RESULTS_SCHEMA_VERSION = 2
+RESULTS_SCHEMA_VERSION = 5
 
 
 @dataclass
@@ -49,11 +49,21 @@ class PipelineResults:
     tracks_file: str = "tracks.jsonl"
     teams_file: str | None = None
     numbers_file: str | None = None
+    shot_events_file: str | None = None
+    projected_tracks_file: str | None = None
+    projected_shots_file: str | None = None
+    projected_shots_image_file: str | None = None
     annotated_video_file: str | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
         payload["summary"] = asdict(self.summary)
+        if payload.get("projected_shots_file") is None:
+            payload.pop("projected_shots_file", None)
+        if payload.get("projected_shots_image_file") is None:
+            payload.pop("projected_shots_image_file", None)
+        if payload.get("projected_tracks_file") is None:
+            payload.pop("projected_tracks_file", None)
         return payload
 
     def write(self, path: Path) -> None:

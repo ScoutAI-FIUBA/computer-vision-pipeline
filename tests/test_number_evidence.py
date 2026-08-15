@@ -27,6 +27,7 @@ from pipeline.number_predictor import (  # noqa: E402
     build_number_predictor,
     normalize_number_prediction,
 )
+from pipeline.results import RESULTS_SCHEMA_VERSION  # noqa: E402
 from pipeline.storage import R2Storage  # noqa: E402
 from pipeline.video import Segment, VideoInfo  # noqa: E402
 
@@ -170,8 +171,9 @@ def _run_number_prediction_case(
     tracks = [json.loads(line) for line in (output_dir / "tracks.jsonl").read_text(encoding="utf-8").splitlines()]
     teams = json.loads((output_dir / "teams.json").read_text(encoding="utf-8"))
     results_payload = json.loads((output_dir / "results.json").read_text(encoding="utf-8"))
-    assert results_payload["schema_version"] == 2
+    assert results_payload["schema_version"] == RESULTS_SCHEMA_VERSION
     assert results_payload["numbers_file"] == "numbers.json"
+    assert results_payload["shot_events_file"] == "shot_events.jsonl"
     results_payload["summary"].pop("wall_seconds", None)
     predictions = json.loads((output_dir / "number_predictions.json").read_text(encoding="utf-8"))["predictions"]
     return tracks, teams, results_payload, predictions, predictor.calls

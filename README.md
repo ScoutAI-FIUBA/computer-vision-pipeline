@@ -16,6 +16,58 @@ High-level flow:
 
 `pipeline/` contains no Modal imports, so the same code runs from local CLI, tests, notebooks, or Modal.
 
+## Dedicated player-position pipeline
+
+There is now a separate homography pipeline for movement data: `python -m pipeline.player_positions` locally, or `modal run modal_app.py --pipeline player-positions ...` on Modal.
+
+Quick path:
+
+```bash
+python -m pipeline.player_positions path/to/clip.mp4 \
+  --output-dir outputs/clip-player-positions
+```
+
+Modal path with the existing entrypoint:
+
+```bash
+modal run modal_app.py \
+  --pipeline player-positions \
+  --video-path path/to/clip.mp4 \
+  --output-dir outputs/clip-player-positions
+```
+
+What it does:
+
+1. Runs a player-only tracking pass separate from the stats/shot pipeline.
+2. Samples the video at 5 FPS and keeps stable `player_id` values across emitted frames.
+3. Uses a stricter default player detector confidence (`0.8`) than the stats pipeline, while still allowing `--confidence` overrides from the dedicated CLI and Modal entrypoint.
+4. Writes a machine-first JSONL plus, when rows are emitted, a top-down debug video for movement review.
+
+Artifacts written to `--output-dir`:
+
+| File | Meaning |
+| --- | --- |
+| `player_positions.jsonl` | One row per player per emitted frame for downstream replay or visualization tooling. |
+| `player_positions_debug.mp4` | Optional top-down court video with per-player movement trails for quick visual debugging; omitted when no player-position rows are emitted. |
+
+`player_positions.jsonl` rows include at least:
+
+- `frame_index`
+- `timestamp_seconds`
+- `player_id`
+- `team_id` when the end-of-run team pass can resolve it
+- `bbox_xyxy`
+- `image_anchor_xy`
+- `court_xy_m`
+- `confidence`
+- homography debug fields such as `homography_frame_status`, `homography_inliers_count`, and `homography_reprojection_mean_m`
+
+Important scope notes:
+
+- This path is players only for now.
+- It intentionally does not run shot-event logic.
+- Team IDs remain best-effort because they still depend on the end-of-run clustering pass.
+
 ## Quick start
 
 ```bash
@@ -23,17 +75,69 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
 
+### Recommended run path
+
+The current production-style path is Modal through `modal_app.py`.
+
 Estimate cost before spending anything:
 
 ```bash
 python -m pipeline.cli path/to/clip.mp4 --dry-run
 ```
 
-Run the current pipeline on Modal:
+Run the current pipeline on Modal and save artifacts locally:
 
 ```bash
-modal run modal_app.py --video-path path/to/clip.mp4 --max-frames 90
+modal run modal_app.py \
+  --video-path path/to/clip.mp4 \
+  --output-dir outputs/check \
+  --annotated
 ```
+
+Run the dedicated player-position pipeline on Modal and save artifacts locally:
+
+```bash
+modal run modal_app.py \
+  --pipeline player-positions \
+  --video-path path/to/clip.mp4 \
+  --output-dir outputs/clip-player-positions
+```
+
+Enable hosted jersey OCR on the same run:
+
+```bash
+modal run modal_app.py \
+  --video-path media/game.mp4 \
+  --output-dir outputs/ocr-check \
+  --annotated \
+  --number-predictor-backend roboflow-hosted
+```
+
+Reproduce an older short comparison run with bounded cost:
+
+```bash
+modal run modal_app.py \
+  --video-path media/game.mp4 \
+  --output-dir outputs/check-repro \
+  --annotated \
+  --max-frames 100 \
+  --frame-stride 10 \
+  --min-team-samples-per-track 2
+```
+
+Expected local artifacts in `--output-dir`:
+
+- `results.json`
+- `tracks.jsonl`
+- `teams.json`
+- `numbers.json`
+- `shot_events.jsonl`
+- `annotated.mp4` when `--annotated` is set
+
+Expected local artifacts for `--pipeline player-positions`:
+
+- `player_positions.jsonl`
+- `player_positions_debug.mp4` when player-position rows were emitted
 
 See `SETUP.md` for secrets, deployment, and the configuration surface.
 
@@ -54,6 +158,7 @@ Current environment-backed knobs:
 | `ROBOFLOW_API_KEY` | required | Roboflow private API key. |
 | `ROBOFLOW_API_URL` | `https://serverless.roboflow.com` | Hosted inference endpoint. |
 | `PLAYER_MODEL_ID` | `basketball-player-detection-3-ycjdo/16` | Player detector model. |
+| `SHOT_TARGET_FPS` | unset | Optional shot-pass FPS target. When unset, the shot pass reuses tracking downsampling. |
 | `SAM2_MODEL_ID` | `facebook/sam2-hiera-small` | SAM2 checkpoint. |
 | `TEAM_EMBEDDER_BACKEND` | `siglip` | `siglip`, `colour`, or `none`. |
 | `TEAM_EMBEDDER_MODEL_ID` | `vit_base_patch16_siglip_224` | SigLIP model id when the backend is `siglip`. |
@@ -82,7 +187,20 @@ The local CLI exposes the common run knobs:
 - `--team-assignment-margin`
 - `--annotated-video`
 
-The Modal entrypoint exposes the full current team-and-number override surface, including `team_sample_stride`, `min_team_sample_quality`, `max_team_samples_per_track`, `team_debug_enabled`, and `number_predictor_backend`.
+The Modal entrypoint exposes the full current override surface, including:
+
+- `--pipeline` (`stats` or `player-positions`)
+- `--output-dir`
+- `--annotated`
+- `--frame-stride`
+- `--max-frames`
+- `--target-fps`
+- `--team-sample-stride`
+- `--min-team-samples-per-track`
+- `--min-team-sample-quality`
+- `--max-team-samples-per-track`
+- `--team-debug-enabled`
+- `--number-predictor-backend`
 
 ## Team identification
 
@@ -101,13 +219,33 @@ Current outputs from one pipeline run:
 
 | File | Meaning |
 | --- | --- |
-| `results.json` | Run summary plus the resolved config used for the run, including output file pointers such as `teams_file` and `numbers_file`. |
+| `results.json` | Run summary plus the resolved config used for the run, including output file pointers such as `teams_file`, `numbers_file`, and `shot_events_file`. |
 | `tracks.jsonl` | One row per track per emitted frame, rewritten at the end with final `team_id`s. |
 | `teams.json` | Team assignments, skipped/unassigned tracks, selected-sample counts, and per-track diagnostics. |
 | `numbers.json` | Final per-track jersey-number confirmations and ambiguity details. |
+| `shot_events.jsonl` | Detector-frame make/miss event records from the active pipeline path. Empty means no shot events were resolved for that clip. |
 | `team_debug.json` | Per-track sample summaries when team debug is enabled. |
 | `team_debug/` | Crops and masks for manual team-ID inspection when team debug is enabled. |
 | `annotated.mp4` | Optional final render after team assignment/number aggregation, with confirmed jersey numbers when available. |
+
+## Shot events
+
+The active `pipeline/` path now writes a minimal make/miss artifact.
+
+What it does today:
+
+1. Read detector-frame action/state classes from the player model. Optionally downsample the shot-only pass independently with `SHOT_TARGET_FPS`.
+2. Start a candidate event when `jump_shot` or `layup_dunk` appears.
+3. Mark the event as `made` when `ball_in_basket` appears during that window.
+4. Mark the event as `missed` when the shot signal times out.
+5. Mark the event as `unknown` at end-of-clip if the run ends before resolution.
+
+Current limits:
+
+- `shot_events.jsonl` now keeps the best available shot-anchor point (`start_image_xy` / `start_shot_xyxy`) from the detector frame when the model returned a shot box.
+- When court homography is available during the main pipeline run, `results.json` also exposes `projected_tracks_file`, `projected_shots_file`, and `projected_shots_image_file`.
+- If no frame yields a usable homography, those projected-artifact keys are omitted and no projected-shot artifacts are written.
+- The output can be empty for clips where the detector never emits the required action classes.
 
 ## Jersey numbers
 
@@ -136,7 +274,7 @@ Current number artifacts from one pipeline run:
 | `number_prediction_cases.jsonl` | Same OCR cases as JSONL for grep/review workflows. |
 | `numbers.json` | Final per-track number status with `confirmed`, `ambiguous`, or `unknown`, plus support/conflict details. |
 
-`results.json` now includes `numbers_file`, and it is written only at the true end of the run after track, team, number, and optional video outputs finish.
+`results.json` now includes `numbers_file` and `shot_events_file`, and it is written only at the true end of the run after track, team, number, shot-event, and optional video outputs finish.
 
 Current limits:
 
@@ -148,7 +286,7 @@ Current limits:
 Tests that verify the config and team-ID plumbing without a GPU:
 
 ```bash
-python -m pytest tests/test_config.py tests/test_team_id.py tests/test_number_evidence.py
+python -m pytest tests/test_config.py tests/test_team_id.py tests/test_number_evidence.py tests/test_shot_events.py
 ```
 
 Read `future_tasks/TRACKING_ISSUES.md` before tuning tracking. Read `future_tasks/team-identification-architecture.md` before changing the team-ID logic.
@@ -479,7 +617,8 @@ Main pipeline defaults:
 - Output video: `outputs/<video-stem>_pipeline.mp4`.
 - Track records: `outputs/<video-stem>_tracks.jsonl`.
 - Raw inference JSONL: `outputs/<video-stem>_inference.jsonl`.
-- With `--court-keypoints`, also writes `outputs/<video-stem>_court_keypoints.jsonl` and `outputs/<video-stem>_projected_tracks.jsonl`.
+- With `--court-keypoints`, also writes `outputs/<video-stem>_court_keypoints.jsonl`.
+- If at least one frame yields a usable homography, also writes `outputs/<video-stem>_projected_tracks.jsonl`, `outputs/<video-stem>_projected_shots.json`, and `outputs/<video-stem>_projected_shots.png`.
 - `--save-json` defaults to `true`.
 - `--sampled-output-only` defaults to `true`.
 - `--persist-tracks` defaults to `true` with `--max-missing-sampled-frames 1`.

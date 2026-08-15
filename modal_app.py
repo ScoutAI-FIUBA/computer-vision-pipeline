@@ -20,6 +20,10 @@ from pathlib import Path
 import modal
 from fastapi import Header, HTTPException
 
+MAIN_PIPELINE = "stats"
+PLAYER_POSITIONS_PIPELINE = "player-positions"
+PIPELINE_CHOICES = {MAIN_PIPELINE, PLAYER_POSITIONS_PIPELINE}
+
 # Pinned to the official Meta repository at a specific commit so image rebuilds
 # are reproducible. Note: the `sam2` package on PyPI is NOT published by Meta —
 # do not switch to it.
@@ -78,6 +82,85 @@ r2_secret = modal.Secret.from_name("scoutai-r2")
 auth_secret = modal.Secret.from_name("scoutai-auth")
 
 
+def _run_selected_pipeline(
+    pipeline: str,
+    *,
+    video_path: Path,
+    config,
+    output_dir: Path,
+    tracker,
+    embedder,
+):
+    if pipeline == MAIN_PIPELINE:
+        from pipeline.runner import run_pipeline
+
+        return run_pipeline(video_path, config, output_dir, tracker=tracker, embedder=embedder)
+
+    if pipeline == PLAYER_POSITIONS_PIPELINE:
+        from pipeline.player_positions import run_player_position_pipeline
+
+        return run_player_position_pipeline(video_path, config, output_dir, tracker=tracker)
+
+    raise ValueError(f"Unknown pipeline: {pipeline!r}")
+
+
+def _build_process_config_overrides(
+    *,
+    pipeline: str,
+    frame_stride: int | None,
+    max_frames: int | None,
+    confidence: float | None,
+    target_fps: float | None,
+    sam2_model_id: str | None,
+    max_missed_detections: int | None,
+    appearance_weight: float | None,
+    team_embedder_backend: str | None,
+    team_embedder_model_id: str | None,
+    team_count: int | None,
+    min_team_samples_per_track: int | None,
+    team_sample_stride: int | None,
+    min_team_sample_quality: float | None,
+    max_team_samples_per_track: int | None,
+    team_debug_enabled: bool | None,
+    number_predictor_backend: str | None,
+    write_annotated_video: bool,
+) -> dict:
+    config_overrides = {
+        "frame_stride": frame_stride or None,
+        "max_frames": max_frames or None,
+        "confidence": confidence,
+        "target_fps": target_fps,
+        "sam2_model_id": sam2_model_id,
+        "max_missed_detections": max_missed_detections,
+        "appearance_weight": appearance_weight,
+        "team_embedder_backend": team_embedder_backend,
+        "team_embedder_model_id": team_embedder_model_id,
+        "team_count": team_count,
+        "min_team_samples_per_track": min_team_samples_per_track,
+        "team_sample_stride": team_sample_stride,
+        "min_team_sample_quality": min_team_sample_quality,
+        "max_team_samples_per_track": max_team_samples_per_track,
+        "team_debug_enabled": team_debug_enabled,
+        "number_predictor_backend": number_predictor_backend,
+        "write_annotated_video": True if write_annotated_video else None,
+    }
+    if pipeline == PLAYER_POSITIONS_PIPELINE:
+        from pipeline.player_positions import (
+            DEFAULT_PLAYER_POSITION_CONFIDENCE,
+            DEFAULT_PLAYER_POSITION_FPS,
+            DEFAULT_PLAYER_POSITION_FRAME_STRIDE,
+        )
+
+        config_overrides.update(
+            confidence=DEFAULT_PLAYER_POSITION_CONFIDENCE if confidence is None else confidence,
+            target_fps=DEFAULT_PLAYER_POSITION_FPS if target_fps is None else target_fps,
+            frame_stride=DEFAULT_PLAYER_POSITION_FRAME_STRIDE if frame_stride is None else frame_stride,
+            allowed_classes=("player",),
+            write_annotated_video=False,
+        )
+    return config_overrides
+
+
 @app.cls(
     image=image,
     # COST: L4 is ~24GB VRAM at roughly a quarter the price of an A100. The
@@ -131,6 +214,7 @@ class Pipeline:
     def process(
         self,
         *,
+        pipeline: str = MAIN_PIPELINE,
         r2_key: str | None = None,
         video_bytes: bytes | None = None,
         output_prefix: str | None = None,
@@ -163,14 +247,17 @@ class Pipeline:
         import logging
 
         from pipeline.config import PipelineConfig
-        from pipeline.runner import run_pipeline
 
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+        if pipeline not in PIPELINE_CHOICES:
+            raise ValueError(f"Unknown pipeline: {pipeline!r}")
 
         if (r2_key is None) == (video_bytes is None):
             raise ValueError("Pass exactly one of r2_key or video_bytes")
 
-        config = PipelineConfig.from_env(
+        config_overrides = _build_process_config_overrides(
+            pipeline=pipeline,
             frame_stride=frame_stride,
             max_frames=max_frames,
             confidence=confidence,
@@ -187,7 +274,11 @@ class Pipeline:
             max_team_samples_per_track=max_team_samples_per_track,
             team_debug_enabled=team_debug_enabled,
             number_predictor_backend=number_predictor_backend,
-            write_annotated_video=True if write_annotated_video else None,
+            write_annotated_video=write_annotated_video,
+        )
+
+        config = PipelineConfig.from_env(
+            **config_overrides,
         )
 
         # A/B testing checkpoints means loading a different model than the one
@@ -213,10 +304,15 @@ class Pipeline:
             else:
                 video_path.write_bytes(video_bytes)
 
-            results = run_pipeline(
-                video_path, config, output_dir, tracker=tracker, embedder=self.embedder
+            results = _run_selected_pipeline(
+                pipeline,
+                video_path=video_path,
+                config=config,
+                output_dir=output_dir,
+                tracker=tracker,
+                embedder=self.embedder,
             )
-            payload = results.to_dict()
+            payload = results.to_dict() if hasattr(results, "to_dict") else dict(results)
 
             if output_prefix:
                 from pipeline.storage import R2Storage
@@ -236,7 +332,9 @@ class Pipeline:
                 }
             elif not output_prefix:
                 # Nothing was persisted anywhere, so at least show some rows.
-                payload["tracks_preview"] = (output_dir / "tracks.jsonl").read_text(
+                preview_name = "tracks.jsonl" if pipeline == MAIN_PIPELINE else "player_positions.jsonl"
+                preview_key = "tracks_preview" if pipeline == MAIN_PIPELINE else "player_positions_preview"
+                payload[preview_key] = (output_dir / preview_name).read_text(
                     encoding="utf-8"
                 ).splitlines()[:20]
 
@@ -267,6 +365,7 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
         raise HTTPException(status_code=400, detail="r2_key is required")
 
     call = Pipeline().process.spawn(
+        pipeline=payload.get("pipeline", MAIN_PIPELINE),
         r2_key=r2_key,
         output_prefix=payload.get("output_prefix"),
         frame_stride=payload.get("frame_stride"),
@@ -288,13 +387,14 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
 
 @app.local_entrypoint()
 def main(
+    pipeline: str = MAIN_PIPELINE,
     video_path: str = "",
     r2_key: str = "",
     output_prefix: str = "",
     output_dir: str = "",
     frame_stride: int = 0,
     max_frames: int = 0,
-    confidence: float = 0.0,
+    confidence: float = -1.0,
     target_fps: float = 0.0,
     native_fps: bool = False,
     sam2_model_id: str = "",
@@ -315,6 +415,8 @@ def main(
 
         modal run modal_app.py --video-path clips/short.mp4 --max-frames 90
 
+        modal run modal_app.py --pipeline player-positions --video-path clips/short.mp4 --output-dir outputs/positions
+
     To see what it is actually tracking, add `--annotated` and `--output-dir`:
 
         modal run modal_app.py --video-path clips/short.mp4 --annotated --output-dir outputs/check
@@ -327,16 +429,20 @@ def main(
 
     import json
 
+    if pipeline not in PIPELINE_CHOICES:
+        raise SystemExit(f"Unknown --pipeline value: {pipeline!r}")
+
     if bool(video_path) == bool(r2_key):
         raise SystemExit("Pass exactly one of --video-path or --r2-key")
 
     destination = Path(output_dir) if output_dir else None
 
     kwargs: dict = {
+        "pipeline": pipeline,
         "output_prefix": output_prefix or None,
         "frame_stride": frame_stride or None,
         "max_frames": max_frames or None,
-        "confidence": confidence or None,
+        "confidence": None if confidence < 0 else confidence,
         # `--native-fps` processes every frame, i.e. no downsampling. It is a
         # separate flag because 0.0 cannot be told apart from "not supplied"
         # once it reaches the config's override filter.
