@@ -13,6 +13,7 @@ load_dotenv()
 
 ROBOFLOW_API_URL = os.getenv("ROBOFLOW_API_URL", "https://serverless.roboflow.com")
 PLAYER_MODEL_ID = os.getenv("PLAYER_MODEL_ID", "basketball-player-detection-3-ycjdo/16")
+SHOT_MODEL_ID = os.getenv("SHOT_MODEL_ID", "basketball-player-detection-3-ycjdo/1")
 COURT_MODEL_ID = os.getenv("COURT_MODEL_ID", "basketball-court-detection-2/22")
 JERSEY_OCR_MODEL_ID = os.getenv("JERSEY_OCR_MODEL_ID", "")
 

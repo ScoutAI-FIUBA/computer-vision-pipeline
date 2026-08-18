@@ -60,6 +60,26 @@ def mask_to_xyxy(mask_logits) -> list[float] | None:
     return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
 
 
+def mask_to_crop(mask_logits):
+    """Small binary crop aligned to `mask_to_xyxy`, or None when empty."""
+
+    import numpy as np
+
+    mask = mask_logits > 0.0
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+    mask_array = np.asarray(mask)
+    if mask_array.ndim > 2:
+        mask_array = mask_array.squeeze()
+    if mask_array.ndim != 2 or not mask_array.any():
+        return None
+
+    ys, xs = np.where(mask_array)
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    return mask_array[y1:y2, x1:x2].astype(bool)
+
+
 def detection_rows(detections) -> list[dict]:
     """Convert supervision Detections into the pipeline's row dicts."""
 
@@ -316,6 +336,7 @@ class Sam2SegmentTracker:
                         xyxy = mask_to_xyxy(mask_logits[mask_index])
                         if xyxy is None:
                             continue
+                        player_mask = mask_to_crop(mask_logits[mask_index])
                         rows.append(
                             {
                                 "xyxy": xyxy,
@@ -323,6 +344,7 @@ class Sam2SegmentTracker:
                                 "class_name": class_name_by_track_id.get(track_id, "player"),
                                 "track_id": track_id,
                                 "track_state": "propagated",
+                                "player_mask": player_mask,
                             }
                         )
                     propagated[offset] = rows

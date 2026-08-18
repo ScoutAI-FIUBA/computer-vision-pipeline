@@ -20,6 +20,10 @@ from pathlib import Path
 import modal
 from fastapi import Header, HTTPException
 
+MAIN_PIPELINE = "stats"
+PLAYER_POSITIONS_PIPELINE = "player-positions"
+PIPELINE_CHOICES = {MAIN_PIPELINE, PLAYER_POSITIONS_PIPELINE}
+
 # Pinned to the official Meta repository at a specific commit so image rebuilds
 # are reproducible. Note: the `sam2` package on PyPI is NOT published by Meta —
 # do not switch to it.
@@ -45,12 +49,14 @@ image = (
         # container. Bump deliberately, never implicitly.
         "torch==2.5.1",
         "torchvision==0.20.1",
+        "timm==1.0.22",
         "opencv-python-headless==4.10.0.84",
         "supervision==0.29.1",
         # Used for optimal (Hungarian) detection-to-track assignment. Pinned
         # explicitly rather than relying on it arriving as someone else's
         # transitive dependency.
         "scipy==1.18.0",
+        "umap-learn==0.5.9.post2",
         "inference-sdk==1.3.3",
         "boto3==1.35.36",
         "huggingface_hub==1.7.1",
@@ -74,6 +80,85 @@ image = (
 roboflow_secret = modal.Secret.from_name("scoutai-roboflow")
 r2_secret = modal.Secret.from_name("scoutai-r2")
 auth_secret = modal.Secret.from_name("scoutai-auth")
+
+
+def _run_selected_pipeline(
+    pipeline: str,
+    *,
+    video_path: Path,
+    config,
+    output_dir: Path,
+    tracker,
+    embedder,
+):
+    if pipeline == MAIN_PIPELINE:
+        from pipeline.runner import run_pipeline
+
+        return run_pipeline(video_path, config, output_dir, tracker=tracker, embedder=embedder)
+
+    if pipeline == PLAYER_POSITIONS_PIPELINE:
+        from pipeline.player_positions import run_player_position_pipeline
+
+        return run_player_position_pipeline(video_path, config, output_dir, tracker=tracker)
+
+    raise ValueError(f"Unknown pipeline: {pipeline!r}")
+
+
+def _build_process_config_overrides(
+    *,
+    pipeline: str,
+    frame_stride: int | None,
+    max_frames: int | None,
+    confidence: float | None,
+    target_fps: float | None,
+    sam2_model_id: str | None,
+    max_missed_detections: int | None,
+    appearance_weight: float | None,
+    team_embedder_backend: str | None,
+    team_embedder_model_id: str | None,
+    team_count: int | None,
+    min_team_samples_per_track: int | None,
+    team_sample_stride: int | None,
+    min_team_sample_quality: float | None,
+    max_team_samples_per_track: int | None,
+    team_debug_enabled: bool | None,
+    number_predictor_backend: str | None,
+    write_annotated_video: bool,
+) -> dict:
+    config_overrides = {
+        "frame_stride": frame_stride or None,
+        "max_frames": max_frames or None,
+        "confidence": confidence,
+        "target_fps": target_fps,
+        "sam2_model_id": sam2_model_id,
+        "max_missed_detections": max_missed_detections,
+        "appearance_weight": appearance_weight,
+        "team_embedder_backend": team_embedder_backend,
+        "team_embedder_model_id": team_embedder_model_id,
+        "team_count": team_count,
+        "min_team_samples_per_track": min_team_samples_per_track,
+        "team_sample_stride": team_sample_stride,
+        "min_team_sample_quality": min_team_sample_quality,
+        "max_team_samples_per_track": max_team_samples_per_track,
+        "team_debug_enabled": team_debug_enabled,
+        "number_predictor_backend": number_predictor_backend,
+        "write_annotated_video": True if write_annotated_video else None,
+    }
+    if pipeline == PLAYER_POSITIONS_PIPELINE:
+        from pipeline.player_positions import (
+            DEFAULT_PLAYER_POSITION_CONFIDENCE,
+            DEFAULT_PLAYER_POSITION_FPS,
+            DEFAULT_PLAYER_POSITION_FRAME_STRIDE,
+        )
+
+        config_overrides.update(
+            confidence=DEFAULT_PLAYER_POSITION_CONFIDENCE if confidence is None else confidence,
+            target_fps=DEFAULT_PLAYER_POSITION_FPS if target_fps is None else target_fps,
+            frame_stride=DEFAULT_PLAYER_POSITION_FRAME_STRIDE if frame_stride is None else frame_stride,
+            allowed_classes=("player",),
+            write_annotated_video=False,
+        )
+    return config_overrides
 
 
 @app.cls(
@@ -129,6 +214,7 @@ class Pipeline:
     def process(
         self,
         *,
+        pipeline: str = MAIN_PIPELINE,
         r2_key: str | None = None,
         video_bytes: bytes | None = None,
         output_prefix: str | None = None,
@@ -139,6 +225,15 @@ class Pipeline:
         sam2_model_id: str | None = None,
         max_missed_detections: int | None = None,
         appearance_weight: float | None = None,
+        team_embedder_backend: str | None = None,
+        team_embedder_model_id: str | None = None,
+        team_count: int | None = None,
+        min_team_samples_per_track: int | None = None,
+        team_sample_stride: int | None = None,
+        min_team_sample_quality: float | None = None,
+        max_team_samples_per_track: int | None = None,
+        team_debug_enabled: bool | None = None,
+        number_predictor_backend: str | None = None,
         write_annotated_video: bool = False,
         return_artifacts: bool = False,
     ) -> dict:
@@ -152,14 +247,17 @@ class Pipeline:
         import logging
 
         from pipeline.config import PipelineConfig
-        from pipeline.runner import run_pipeline
 
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+        if pipeline not in PIPELINE_CHOICES:
+            raise ValueError(f"Unknown pipeline: {pipeline!r}")
 
         if (r2_key is None) == (video_bytes is None):
             raise ValueError("Pass exactly one of r2_key or video_bytes")
 
-        config = PipelineConfig.from_env(
+        config_overrides = _build_process_config_overrides(
+            pipeline=pipeline,
             frame_stride=frame_stride,
             max_frames=max_frames,
             confidence=confidence,
@@ -167,7 +265,20 @@ class Pipeline:
             sam2_model_id=sam2_model_id,
             max_missed_detections=max_missed_detections,
             appearance_weight=appearance_weight,
-            write_annotated_video=True if write_annotated_video else None,
+            team_embedder_backend=team_embedder_backend,
+            team_embedder_model_id=team_embedder_model_id,
+            team_count=team_count,
+            min_team_samples_per_track=min_team_samples_per_track,
+            team_sample_stride=team_sample_stride,
+            min_team_sample_quality=min_team_sample_quality,
+            max_team_samples_per_track=max_team_samples_per_track,
+            team_debug_enabled=team_debug_enabled,
+            number_predictor_backend=number_predictor_backend,
+            write_annotated_video=write_annotated_video,
+        )
+
+        config = PipelineConfig.from_env(
+            **config_overrides,
         )
 
         # A/B testing checkpoints means loading a different model than the one
@@ -193,10 +304,15 @@ class Pipeline:
             else:
                 video_path.write_bytes(video_bytes)
 
-            results = run_pipeline(
-                video_path, config, output_dir, tracker=tracker, embedder=self.embedder
+            results = _run_selected_pipeline(
+                pipeline,
+                video_path=video_path,
+                config=config,
+                output_dir=output_dir,
+                tracker=tracker,
+                embedder=self.embedder,
             )
-            payload = results.to_dict()
+            payload = results.to_dict() if hasattr(results, "to_dict") else dict(results)
 
             if output_prefix:
                 from pipeline.storage import R2Storage
@@ -210,13 +326,15 @@ class Pipeline:
                 # video without wiring up R2. Only sensible for short clips: a
                 # long run's artifacts belong in R2, not a return value.
                 payload["artifacts"] = {
-                    path.name: path.read_bytes()
-                    for path in sorted(output_dir.iterdir())
+                    str(path.relative_to(output_dir)): path.read_bytes()
+                    for path in sorted(output_dir.rglob("*"))
                     if path.is_file()
                 }
             elif not output_prefix:
                 # Nothing was persisted anywhere, so at least show some rows.
-                payload["tracks_preview"] = (output_dir / "tracks.jsonl").read_text(
+                preview_name = "tracks.jsonl" if pipeline == MAIN_PIPELINE else "player_positions.jsonl"
+                preview_key = "tracks_preview" if pipeline == MAIN_PIPELINE else "player_positions_preview"
+                payload[preview_key] = (output_dir / preview_name).read_text(
                     encoding="utf-8"
                 ).splitlines()[:20]
 
@@ -247,11 +365,21 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
         raise HTTPException(status_code=400, detail="r2_key is required")
 
     call = Pipeline().process.spawn(
+        pipeline=payload.get("pipeline", MAIN_PIPELINE),
         r2_key=r2_key,
         output_prefix=payload.get("output_prefix"),
         frame_stride=payload.get("frame_stride"),
         max_frames=payload.get("max_frames"),
         confidence=payload.get("confidence"),
+        team_embedder_backend=payload.get("team_embedder_backend"),
+        team_embedder_model_id=payload.get("team_embedder_model_id"),
+        team_count=payload.get("team_count"),
+        min_team_samples_per_track=payload.get("min_team_samples_per_track"),
+        team_sample_stride=payload.get("team_sample_stride"),
+        min_team_sample_quality=payload.get("min_team_sample_quality"),
+        max_team_samples_per_track=payload.get("max_team_samples_per_track"),
+        team_debug_enabled=payload.get("team_debug_enabled"),
+        number_predictor_backend=payload.get("number_predictor_backend"),
         write_annotated_video=bool(payload.get("write_annotated_video", False)),
     )
     return {"call_id": call.object_id, "status": "queued"}
@@ -259,23 +387,35 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
 
 @app.local_entrypoint()
 def main(
+    pipeline: str = MAIN_PIPELINE,
     video_path: str = "",
     r2_key: str = "",
     output_prefix: str = "",
     output_dir: str = "",
     frame_stride: int = 0,
     max_frames: int = 0,
-    confidence: float = 0.0,
+    confidence: float = -1.0,
     target_fps: float = 0.0,
     native_fps: bool = False,
     sam2_model_id: str = "",
     max_missed_detections: int = -1,
     appearance_weight: float = -1.0,
+    team_embedder_backend: str = "",
+    team_embedder_model_id: str = "",
+    team_count: int = 0,
+    min_team_samples_per_track: int = 0,
+    team_sample_stride: int = 0,
+    min_team_sample_quality: float = -1.0,
+    max_team_samples_per_track: int = 0,
+    team_debug_enabled: bool | None = None,
+    number_predictor_backend: str = "",
     annotated: bool = False,
 ) -> None:
     """Run one job without deploying. Start here.
 
         modal run modal_app.py --video-path clips/short.mp4 --max-frames 90
+
+        modal run modal_app.py --pipeline player-positions --video-path clips/short.mp4 --output-dir outputs/positions
 
     To see what it is actually tracking, add `--annotated` and `--output-dir`:
 
@@ -289,16 +429,20 @@ def main(
 
     import json
 
+    if pipeline not in PIPELINE_CHOICES:
+        raise SystemExit(f"Unknown --pipeline value: {pipeline!r}")
+
     if bool(video_path) == bool(r2_key):
         raise SystemExit("Pass exactly one of --video-path or --r2-key")
 
     destination = Path(output_dir) if output_dir else None
 
     kwargs: dict = {
+        "pipeline": pipeline,
         "output_prefix": output_prefix or None,
         "frame_stride": frame_stride or None,
         "max_frames": max_frames or None,
-        "confidence": confidence or None,
+        "confidence": None if confidence < 0 else confidence,
         # `--native-fps` processes every frame, i.e. no downsampling. It is a
         # separate flag because 0.0 cannot be told apart from "not supplied"
         # once it reaches the config's override filter.
@@ -306,6 +450,15 @@ def main(
         "sam2_model_id": sam2_model_id or None,
         "max_missed_detections": None if max_missed_detections < 0 else max_missed_detections,
         "appearance_weight": None if appearance_weight < 0 else appearance_weight,
+        "team_embedder_backend": team_embedder_backend or None,
+        "team_embedder_model_id": team_embedder_model_id or None,
+        "team_count": team_count or None,
+        "min_team_samples_per_track": min_team_samples_per_track or None,
+        "team_sample_stride": team_sample_stride or None,
+        "min_team_sample_quality": None if min_team_sample_quality < 0 else min_team_sample_quality,
+        "max_team_samples_per_track": max_team_samples_per_track or None,
+        "team_debug_enabled": team_debug_enabled,
+        "number_predictor_backend": number_predictor_backend or None,
         "write_annotated_video": annotated,
         "return_artifacts": destination is not None,
     }
@@ -329,5 +482,6 @@ def main(
         destination.mkdir(parents=True, exist_ok=True)
         print(f"\nSaved to {destination}:")
         for name, data in artifacts.items():
+            (destination / name).parent.mkdir(parents=True, exist_ok=True)
             (destination / name).write_bytes(data)
             print(f"  {name}  ({len(data) / 1024:.0f} KB)")

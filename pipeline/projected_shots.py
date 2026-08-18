@@ -1,0 +1,376 @@
+"""Join shot events with projected player positions into machine and image artifacts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+
+from pipeline.court_projection import project_points
+
+
+COURT_LENGTH_M = 28.0
+COURT_WIDTH_M = 15.0
+
+
+def draw_fiba_court(*, pixels_per_meter: int = 40):
+    import cv2
+    import numpy as np
+
+    width_px = int(round(COURT_LENGTH_M * pixels_per_meter))
+    height_px = int(round(COURT_WIDTH_M * pixels_per_meter))
+    image = np.full((height_px, width_px, 3), 255, dtype=np.uint8)
+    color_court = (40, 40, 40)
+    color_paint = (60, 60, 60)
+    line_thickness = 2
+
+    def to_px(x_m: float, y_m: float) -> tuple[int, int]:
+        return int(round(x_m * pixels_per_meter)), int(round(y_m * pixels_per_meter))
+
+    def arc_radius_m(center: tuple[float, float], edge: tuple[float, float]) -> float:
+        return math.hypot(edge[0] - center[0], edge[1] - center[1])
+
+    cv2.rectangle(image, to_px(0.0, 0.0), to_px(COURT_LENGTH_M, COURT_WIDTH_M), color_court, line_thickness)
+    cv2.line(image, to_px(COURT_LENGTH_M / 2.0, 0.0), to_px(COURT_LENGTH_M / 2.0, COURT_WIDTH_M), color_court, line_thickness)
+    cv2.circle(image, to_px(COURT_LENGTH_M / 2.0, COURT_WIDTH_M / 2.0), int(round(1.8 * pixels_per_meter)), color_court, line_thickness)
+
+    left_hoop = (1.575, COURT_WIDTH_M / 2.0)
+    right_hoop = (COURT_LENGTH_M - 1.575, COURT_WIDTH_M / 2.0)
+    lane_half_width = 2.45
+    lane_depth = 5.8
+
+    for hoop in (left_hoop, right_hoop):
+        cv2.circle(image, to_px(*hoop), int(round(0.225 * pixels_per_meter)), color_court, line_thickness)
+
+    cv2.rectangle(image, to_px(0.0, (COURT_WIDTH_M / 2.0) - lane_half_width), to_px(lane_depth, (COURT_WIDTH_M / 2.0) + lane_half_width), color_paint, line_thickness)
+    cv2.rectangle(image, to_px(COURT_LENGTH_M - lane_depth, (COURT_WIDTH_M / 2.0) - lane_half_width), to_px(COURT_LENGTH_M, (COURT_WIDTH_M / 2.0) + lane_half_width), color_paint, line_thickness)
+
+    left_free_throw = (5.8, COURT_WIDTH_M / 2.0)
+    right_free_throw = (COURT_LENGTH_M - 5.8, COURT_WIDTH_M / 2.0)
+    free_throw_radius_px = int(round(1.8 * pixels_per_meter))
+    cv2.circle(image, to_px(*left_free_throw), free_throw_radius_px, color_court, line_thickness)
+    cv2.circle(image, to_px(*right_free_throw), free_throw_radius_px, color_court, line_thickness)
+
+    three_radius_px = int(round(6.75 * pixels_per_meter))
+    for hoop, start, end in ((left_hoop, -68, 68), (right_hoop, 112, 248)):
+        cv2.ellipse(image, to_px(*hoop), (three_radius_px, three_radius_px), 0, start, end, color_court, line_thickness)
+
+    corner_offset = 0.9
+    corner_distance = 6.6
+    cv2.line(image, to_px(corner_offset, 0.0), to_px(corner_offset, corner_distance), color_court, line_thickness)
+    cv2.line(image, to_px(corner_offset, COURT_WIDTH_M), to_px(corner_offset, COURT_WIDTH_M - corner_distance), color_court, line_thickness)
+    cv2.line(image, to_px(COURT_LENGTH_M - corner_offset, 0.0), to_px(COURT_LENGTH_M - corner_offset, corner_distance), color_court, line_thickness)
+    cv2.line(image, to_px(COURT_LENGTH_M - corner_offset, COURT_WIDTH_M), to_px(COURT_LENGTH_M - corner_offset, COURT_WIDTH_M - corner_distance), color_court, line_thickness)
+
+    return image
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _load_confirmed_numbers_by_track_id(path: Path | None) -> dict[int, str]:
+    if path is None or not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    confirmed: dict[int, str] = {}
+    for track in payload.get("tracks", []):
+        if track.get("status") != "confirmed":
+            continue
+        if track.get("track_id") is None or track.get("number") in (None, "", "unknown"):
+            continue
+        confirmed[int(track["track_id"])] = str(track["number"])
+    return confirmed
+
+
+def _load_team_ids_by_track_id(path: Path | None) -> dict[int, int]:
+    if path is None or not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assignments = payload.get("assignments_by_track_id", {})
+    return {int(track_id): int(team_id) for track_id, team_id in assignments.items()}
+
+
+def _group_projected_tracks_by_frame(projected_tracks: list[dict]) -> dict[int, list[dict]]:
+    grouped: dict[int, list[dict]] = {}
+    for row in projected_tracks:
+        if row.get("class_name", "player") != "player":
+            continue
+        frame_index = row.get("frame_index")
+        if frame_index is None:
+            continue
+        grouped.setdefault(int(frame_index), []).append(row)
+    return grouped
+
+
+def _point_in_xyxy(point_xy: tuple[float, float], xyxy: list[float] | tuple[float, float, float, float] | None) -> bool:
+    if xyxy is None or len(xyxy) != 4:
+        return False
+    x, y = point_xy
+    x1, y1, x2, y2 = [float(value) for value in xyxy]
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _distance(point_a: tuple[float, float], point_b: tuple[float, float] | list[float] | None) -> float:
+    if point_b is None or len(point_b) < 2:
+        return float("inf")
+    dx = float(point_a[0]) - float(point_b[0])
+    dy = float(point_a[1]) - float(point_b[1])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _bbox_center_xy(xyxy: list[float] | tuple[float, float, float, float] | None) -> tuple[float, float] | None:
+    if xyxy is None or len(xyxy) != 4:
+        return None
+    x1, y1, x2, y2 = [float(value) for value in xyxy]
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def _shot_anchor_image_xy(event: dict) -> tuple[float, float] | None:
+    start_image_xy = event.get("start_image_xy")
+    if isinstance(start_image_xy, list) and len(start_image_xy) >= 2:
+        return float(start_image_xy[0]), float(start_image_xy[1])
+    return _bbox_center_xy(event.get("start_shot_xyxy"))
+
+
+def _project_shot_anchor_court_xy(projected_rows: list[dict], shot_image_xy: tuple[float, float] | None) -> tuple[list[float] | None, str | None]:
+    if shot_image_xy is None:
+        return None, "missing_shot_anchor"
+
+    image_points: list[tuple[float, float]] = []
+    court_points: list[tuple[float, float]] = []
+    for row in projected_rows:
+        image_foot_xy = row.get("image_foot_xy")
+        court_xy_m = row.get("court_xy_m")
+        if image_foot_xy is None or len(image_foot_xy) < 2 or court_xy_m is None or len(court_xy_m) < 2:
+            continue
+        image_points.append((float(image_foot_xy[0]), float(image_foot_xy[1])))
+        court_points.append((float(court_xy_m[0]), float(court_xy_m[1])))
+
+    if len({point for point in image_points}) < 4 or len({point for point in court_points}) < 4:
+        return None, "projected_shot_anchor_requires_4_projected_players"
+
+    import cv2
+    import numpy as np
+
+    homography, _ = cv2.findHomography(
+        np.asarray(image_points, dtype=np.float32),
+        np.asarray(court_points, dtype=np.float32),
+        0,
+    )
+    if homography is None:
+        return None, "projected_shot_anchor_homography_failed"
+
+    projected_point = project_points(homography, [shot_image_xy])[0]
+    return [float(projected_point[0]), float(projected_point[1])], "shot_anchor_homography_from_projected_players"
+
+
+def _nearest_projected_frame(frame_indexes: list[int], target_frame_index: int, max_frame_gap: int) -> int | None:
+    best_frame_index = None
+    best_gap = None
+    for frame_index in frame_indexes:
+        gap = abs(int(frame_index) - int(target_frame_index))
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best_frame_index = int(frame_index)
+    return best_frame_index
+
+
+def _snapshot_row(row: dict, *, team_ids_by_track_id: dict[int, int], confirmed_numbers_by_track_id: dict[int, str]) -> dict:
+    track_id = None if row.get("track_id") is None else int(row["track_id"])
+    return {
+        "track_id": track_id,
+        "team_id": None if track_id is None else team_ids_by_track_id.get(track_id),
+        "confirmed_number": None if track_id is None else confirmed_numbers_by_track_id.get(track_id),
+        "track_state": row.get("track_state"),
+        "image_foot_xy": [float(value) for value in row.get("image_foot_xy", [])[:2]],
+        "court_xy_m": [float(value) for value in row.get("court_xy_m", [])[:2]],
+        "xyxy": [float(value) for value in row.get("xyxy", [])[:4]],
+    }
+
+
+def _select_shooter_row(projected_rows: list[dict], shot_image_xy: tuple[float, float] | None) -> tuple[dict | None, str]:
+    if shot_image_xy is None:
+        return None, "missing_shot_anchor"
+
+    best_row = None
+    best_score = None
+    for row in projected_rows:
+        bbox_center = _bbox_center_xy(row.get("xyxy"))
+        score = (
+            0 if _point_in_xyxy(shot_image_xy, row.get("xyxy")) else 1,
+            _distance(shot_image_xy, bbox_center),
+            _distance(shot_image_xy, row.get("image_foot_xy")),
+            int(row.get("track_id", 10**9)) if row.get("track_id") is not None else 10**9,
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_row = row
+    if best_row is None:
+        return None, "no_projected_players"
+    return best_row, "nearest_player_bbox_to_shot_anchor"
+
+
+def build_projected_shots(
+    shot_events: list[dict],
+    projected_tracks: list[dict],
+    *,
+    max_frame_gap: int = 6,
+    team_ids_by_track_id: dict[int, int] | None = None,
+    confirmed_numbers_by_track_id: dict[int, str] | None = None,
+) -> dict:
+    team_ids_by_track_id = team_ids_by_track_id or {}
+    confirmed_numbers_by_track_id = confirmed_numbers_by_track_id or {}
+    projected_by_frame = _group_projected_tracks_by_frame(projected_tracks)
+    available_frame_indexes = sorted(projected_by_frame)
+
+    shots: list[dict] = []
+    for event in shot_events:
+        target_frame_index = int(event["start_frame_index"])
+        matched_frame_index = _nearest_projected_frame(available_frame_indexes, target_frame_index, max_frame_gap)
+        snapshot_rows = []
+        shooter_row = None
+        attribution_method = "no_projected_frame_within_gap"
+        if matched_frame_index is not None:
+            frame_rows = projected_by_frame.get(matched_frame_index, [])
+            snapshot_rows = [
+                _snapshot_row(
+                    row,
+                    team_ids_by_track_id=team_ids_by_track_id,
+                    confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+                )
+                for row in sorted(frame_rows, key=lambda row: (row.get("track_id") is None, row.get("track_id")))
+            ]
+            shot_anchor_image_xy = _shot_anchor_image_xy(event)
+            shooter_row, attribution_method = _select_shooter_row(
+                frame_rows,
+                shot_anchor_image_xy,
+            )
+            shot_origin_court_xy_m = None
+            shot_origin_projection_method = None
+        else:
+            shot_origin_court_xy_m = None
+            shot_origin_projection_method = None
+
+        shooter_track_id = None if shooter_row is None or shooter_row.get("track_id") is None else int(shooter_row["track_id"])
+        if shooter_row is not None:
+            shot_origin_court_xy_m = [float(value) for value in shooter_row.get("court_xy_m", [])[:2]]
+            shot_origin_projection_method = "shooter_foot"
+        shots.append(
+            {
+                **event,
+                "matched_projected_frame_index": matched_frame_index,
+                "matched_projected_frame_gap": None
+                if matched_frame_index is None
+                else abs(int(matched_frame_index) - target_frame_index),
+                "shot_origin_court_xy_m": shot_origin_court_xy_m,
+                "shot_origin_projection_method": shot_origin_projection_method,
+                "shooter_track_id": shooter_track_id,
+                "shooter_team_id": None if shooter_track_id is None else team_ids_by_track_id.get(shooter_track_id),
+                "shooter_confirmed_number": None
+                if shooter_track_id is None
+                else confirmed_numbers_by_track_id.get(shooter_track_id),
+                "shooter_attribution_method": attribution_method,
+                "projected_player_snapshot": snapshot_rows,
+            }
+        )
+
+    return {
+        "schema_version": 1,
+        "heuristics": {
+            "event_anchor": "start_frame_index/start_image_xy from shot_events.jsonl",
+            "frame_matching": "nearest projected frame by minimum temporal distance",
+            "shot_origin_projection": "use the attributed shooter's projected foot/court point",
+            "shooter_selection": "prefer projected player bbox containing the shot anchor, then nearest bbox center, then nearest foot point",
+        },
+        "shots": shots,
+    }
+
+
+def _court_point_to_px(court_xy_m: list[float] | tuple[float, float] | None, pixels_per_meter: int) -> tuple[int, int] | None:
+    if court_xy_m is None or len(court_xy_m) < 2:
+        return None
+    x_m = float(court_xy_m[0])
+    y_m = float(court_xy_m[1])
+    if not (0.0 <= x_m <= COURT_LENGTH_M and 0.0 <= y_m <= COURT_WIDTH_M):
+        return None
+    return int(round(x_m * pixels_per_meter)), int(round(y_m * pixels_per_meter))
+
+
+def write_projected_shots_image(
+    artifact: dict,
+    output_path: Path,
+    *,
+    pixels_per_meter: int = 40,
+    point_radius: int = 7,
+) -> int:
+    import cv2
+
+    court = draw_fiba_court(pixels_per_meter=pixels_per_meter)
+    plotted = 0
+    for shot in artifact.get("shots", []):
+        point = _court_point_to_px(shot.get("shot_origin_court_xy_m"), pixels_per_meter)
+        if point is None:
+            continue
+        outcome = str(shot.get("outcome") or "unknown").lower()
+        color = (0, 180, 0) if outcome == "made" else (0, 0, 255) if outcome == "missed" else (128, 128, 128)
+        cv2.circle(court, point, point_radius, color, -1)
+        cv2.circle(court, point, point_radius + 2, (255, 255, 255), 1)
+        label = f"{shot.get('event_id', '?')}:{outcome[:1].upper()}"
+        cv2.putText(court, label, (point[0] + point_radius + 3, point[1] - point_radius - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+        plotted += 1
+
+    cv2.putText(court, "Projected shot chart", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 20), 2, cv2.LINE_AA)
+    cv2.putText(court, "Made = green  Missed = red  Unknown = gray", (12, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
+    cv2.putText(court, f"Plotted shots: {plotted}/{len(artifact.get('shots', []))}", (12, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), court):
+        raise RuntimeError(f"Could not write projected shots image: {output_path}")
+    return plotted
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__ or "Export projected shot events.")
+    parser.add_argument("shot_events_jsonl", type=Path, help="Path to shot_events.jsonl")
+    parser.add_argument("projected_tracks_jsonl", type=Path, help="Path to projected_tracks.jsonl")
+    parser.add_argument("--output", type=Path, help="Path for projected_shots.json")
+    parser.add_argument("--output-image", type=Path, help="Optional path for a projected_shots PNG")
+    parser.add_argument("--teams", type=Path, help="Optional teams.json for team enrichment")
+    parser.add_argument("--numbers", type=Path, help="Optional numbers.json for jersey-number enrichment")
+    parser.add_argument(
+        "--max-frame-gap",
+        type=int,
+        default=6,
+        help="Compatibility flag only; shots now always use the nearest projected frame. Default: 6",
+    )
+    args = parser.parse_args(argv)
+
+    if args.max_frame_gap < 0:
+        raise SystemExit("--max-frame-gap must be at least 0")
+
+    output_path = args.output or args.shot_events_jsonl.with_name("projected_shots.json")
+    artifact = build_projected_shots(
+        _load_jsonl(args.shot_events_jsonl),
+        _load_jsonl(args.projected_tracks_jsonl),
+        max_frame_gap=args.max_frame_gap,
+        team_ids_by_track_id=_load_team_ids_by_track_id(args.teams),
+        confirmed_numbers_by_track_id=_load_confirmed_numbers_by_track_id(args.numbers),
+    )
+    output_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    if args.output_image is not None:
+        write_projected_shots_image(artifact, args.output_image)
+    print(output_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

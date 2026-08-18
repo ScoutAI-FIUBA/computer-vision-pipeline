@@ -122,11 +122,11 @@ def detections_from_result(
     return detections
 
 
-def build_detector(config) -> HostedRoboflowDetector:
+def build_detector(config, *, model_id: str | None = None) -> HostedRoboflowDetector:
     """Construct the detector described by `config`."""
 
     return HostedRoboflowDetector(
         api_key=config.roboflow_api_key,
         api_url=config.roboflow_api_url,
-        model_id=config.player_model_id,
+        model_id=model_id or config.player_model_id,
     )

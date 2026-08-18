@@ -7,6 +7,29 @@ main path never imports it, and so `pipeline/` has no dependency on the older
 
 from __future__ import annotations
 
+TEAM_COLORS = {
+    0: (0, 90, 255),
+    1: (255, 140, 0),
+}
+
+
+def team_color(team_id: int | None) -> tuple[int, int, int]:
+    return TEAM_COLORS.get(team_id, (160, 255, 160))
+
+
+def track_label_id(row: dict) -> str | None:
+    confirmed_number = row.get("confirmed_number")
+    if confirmed_number not in (None, "", "unknown"):
+        return str(confirmed_number)
+    return None
+
+
+def track_label(row: dict) -> str:
+    label_id = track_label_id(row)
+    if label_id is None:
+        return str(row["class_name"])
+    return f"#{label_id} {row['class_name']}"
+
 
 def rows_to_detections(rows: list[dict]):
     """Convert pipeline row dicts into a supervision Detections for drawing."""
@@ -34,6 +57,31 @@ def rows_to_detections(rows: list[dict]):
 def draw_tracks(frame, rows: list[dict]):
     """Draw boxes and `#id name conf` labels onto a copy-safe frame."""
 
+    if any(row.get("team_id") is not None for row in rows):
+        import cv2
+
+        annotated = frame.copy()
+        for row in rows:
+            x1, y1, x2, y2 = [int(round(value)) for value in row["xyxy"]]
+            team_id = row.get("team_id")
+            label = track_label(row)
+            if team_id is not None:
+                label += f" T{int(team_id)}"
+            if row["confidence"] is not None:
+                label += f" {float(row['confidence']):.2f}"
+            color = team_color(None if team_id is None else int(team_id))
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                annotated,
+                label,
+                (x1, max(18, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+        return annotated
+
     import supervision as sv
 
     detections = rows_to_detections(rows)
@@ -41,7 +89,7 @@ def draw_tracks(frame, rows: list[dict]):
         return frame
 
     labels = [
-        f"#{row['track_id']} {row['class_name']}"
+        track_label(row)
         + ("" if row["confidence"] is None else f" {float(row['confidence']):.2f}")
         for row in rows
     ]
