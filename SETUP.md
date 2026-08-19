@@ -84,7 +84,17 @@ openssl rand -hex 32
 modal secret create scoutai-auth MODAL_WEBHOOK_TOKEN=paste_the_generated_value_here
 ```
 
-Confirm all three exist:
+**Job status callback** — where to report progress back to the backend. Only
+needed once the backend is deployed; `modal run` works without it, and jobs
+simply log their status instead of reporting it.
+
+The token must match `PROCESSING_CALLBACK_TOKEN` in the backend's environment.
+
+```bash
+modal secret create scoutai-callback PROCESSING_CALLBACK_URL=https://your-backend.onrender.com/internal/jobs/status PROCESSING_CALLBACK_TOKEN=paste_the_backend_token_here
+```
+
+Confirm they exist:
 
 ```bash
 modal secret list

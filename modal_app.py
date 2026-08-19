@@ -13,6 +13,7 @@ Quick start (see SETUP.md for the full sequence):
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -80,6 +81,9 @@ image = (
 roboflow_secret = modal.Secret.from_name("scoutai-roboflow")
 r2_secret = modal.Secret.from_name("scoutai-r2")
 auth_secret = modal.Secret.from_name("scoutai-auth")
+# Where to report job status. Optional: created only once the backend is
+# deployed, and `modal run` works fine without it.
+callback_secret = modal.Secret.from_name("scoutai-callback", required_keys=[])
 
 
 def _run_selected_pipeline(
@@ -90,15 +94,24 @@ def _run_selected_pipeline(
     output_dir: Path,
     tracker,
     embedder,
+    on_progress=None,
 ):
     if pipeline == MAIN_PIPELINE:
         from pipeline.runner import run_pipeline
 
-        return run_pipeline(video_path, config, output_dir, tracker=tracker, embedder=embedder)
+        return run_pipeline(
+            video_path,
+            config,
+            output_dir,
+            tracker=tracker,
+            embedder=embedder,
+            on_progress=on_progress,
+        )
 
     if pipeline == PLAYER_POSITIONS_PIPELINE:
         from pipeline.player_positions import run_player_position_pipeline
 
+        # No progress hook on this one yet, so it reports RUNNING and then DONE.
         return run_player_position_pipeline(video_path, config, output_dir, tracker=tracker)
 
     raise ValueError(f"Unknown pipeline: {pipeline!r}")
@@ -161,6 +174,87 @@ def _build_process_config_overrides(
     return config_overrides
 
 
+def _progress_reporter(job_id: str | None, *, every_percent: int = 20):
+    """Build an `on_progress` callback that reports at coarse intervals.
+
+    Throttled deliberately: the pipeline calls this once per segment, and one
+    HTTP request per segment would add more latency than the GPU work it reports
+    on. Returns None when there is nothing to report to.
+    """
+
+    if not job_id:
+        return None
+
+    last_reported = {"bucket": -1}
+
+    def report(frames_done: int, frames_total: int) -> None:
+        if frames_total <= 0:
+            return
+        percent = min(99, int(100 * frames_done / frames_total))
+        bucket = percent // every_percent
+        if bucket > last_reported["bucket"]:
+            last_reported["bucket"] = bucket
+            _report_status(job_id, "RUNNING", progress_percent=percent)
+
+    return report
+
+
+def _report_status(
+    job_id: str | None,
+    status: str,
+    *,
+    artifacts: list[str] | None = None,
+    summary: dict | None = None,
+    error_message: str | None = None,
+    progress_percent: int | None = None,
+) -> None:
+    """Tell the backend how a job is going.
+
+    No-ops when there is no `job_id` (a `modal run` test) or no configured
+    callback, so local runs work without a backend to report to.
+
+    Never raises. A failed status report must not fail an otherwise good job —
+    the GPU work is the expensive part and is already done by the time most of
+    these fire.
+    """
+
+    import os
+
+    if not job_id:
+        return
+
+    url = (os.getenv("PROCESSING_CALLBACK_URL") or "").strip()
+    token = (os.getenv("PROCESSING_CALLBACK_TOKEN") or "").strip()
+    if not url or not token:
+        print(f"[job {job_id}] status={status} (no callback configured, not reported)")
+        return
+
+    body: dict = {"job_id": job_id, "status": status}
+    if artifacts is not None:
+        body["artifacts"] = artifacts
+    if summary is not None:
+        body["summary"] = summary
+    if error_message is not None:
+        body["error_message"] = error_message[:1000]
+    if progress_percent is not None:
+        body["progress_percent"] = progress_percent
+
+    try:
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            print(f"[job {job_id}] reported {status} ({response.status})")
+    except Exception as error:  # noqa: BLE001 - reporting must never break a job
+        print(f"[job {job_id}] could not report {status}: {error!r}")
+
+
 @app.cls(
     image=image,
     # COST: L4 is ~24GB VRAM at roughly a quarter the price of an A100. The
@@ -168,7 +262,7 @@ def _build_process_config_overrides(
     # hundred MB and a bigger GPU would buy nothing but a larger bill.
     gpu="L4",
     volumes={CACHE_DIR: model_cache},
-    secrets=[roboflow_secret, r2_secret],
+    secrets=[roboflow_secret, r2_secret, callback_secret],
     # COST: how long an idle container stays alive after finishing. Long enough
     # that back-to-back jobs reuse a warm container and skip the ~60s model load,
     # short enough that a forgotten container costs cents rather than dollars.
@@ -215,6 +309,9 @@ class Pipeline:
         self,
         *,
         pipeline: str = MAIN_PIPELINE,
+        # Identifies the backend job this run belongs to. Echoed back on every
+        # status callback; without it the backend cannot tell which job finished.
+        job_id: str | None = None,
         r2_key: str | None = None,
         video_bytes: bytes | None = None,
         output_prefix: str | None = None,
@@ -291,6 +388,35 @@ class Pipeline:
             print(f"Loading requested SAM2 checkpoint for this job: {sam2_model_id}")
             tracker = Sam2SegmentTracker(sam2_model_id)
 
+        try:
+            return self._run_job(
+                pipeline=pipeline,
+                job_id=job_id,
+                r2_key=r2_key,
+                video_bytes=video_bytes,
+                output_prefix=output_prefix,
+                config=config,
+                tracker=tracker,
+                return_artifacts=return_artifacts,
+            )
+        except Exception as error:
+            # Report before re-raising. A job left QUEUED blocks its video
+            # forever, because the backend allows only one active job per video.
+            _report_status(job_id, "FAILED", error_message=f"{type(error).__name__}: {error}")
+            raise
+
+    def _run_job(
+        self,
+        *,
+        pipeline: str,
+        job_id: str | None,
+        r2_key: str | None,
+        video_bytes: bytes | None,
+        output_prefix: str | None,
+        config,
+        tracker,
+        return_artifacts: bool,
+    ) -> dict:
         with tempfile.TemporaryDirectory(prefix="job_") as work_dir:
             work = Path(work_dir)
             video_path = work / "input.mp4"
@@ -304,6 +430,10 @@ class Pipeline:
             else:
                 video_path.write_bytes(video_bytes)
 
+            # Reported once the video is local and the models are warm, so
+            # RUNNING means "actually processing", not "queued behind a download".
+            _report_status(job_id, "RUNNING", progress_percent=0)
+
             results = _run_selected_pipeline(
                 pipeline,
                 video_path=video_path,
@@ -311,14 +441,31 @@ class Pipeline:
                 output_dir=output_dir,
                 tracker=tracker,
                 embedder=self.embedder,
+                on_progress=_progress_reporter(job_id),
             )
             payload = results.to_dict() if hasattr(results, "to_dict") else dict(results)
 
+            uploaded_filenames: list[str] = []
             if output_prefix:
                 from pipeline.storage import R2Storage
 
                 storage = R2Storage()
-                payload["output_keys"] = storage.upload_directory(output_dir, output_prefix)
+                keys = storage.upload_directory(output_dir, output_prefix)
+                payload["output_keys"] = keys
+                # The backend stores these so it can presign download URLs
+                # without ever listing or reading the bucket.
+                prefix = output_prefix.rstrip("/") + "/"
+                uploaded_filenames = [
+                    key[len(prefix):] if key.startswith(prefix) else key for key in keys
+                ]
+
+            _report_status(
+                job_id,
+                "DONE",
+                artifacts=uploaded_filenames,
+                summary=payload.get("summary"),
+                progress_percent=100,
+            )
 
             if return_artifacts:
                 # Ship the output files back to the caller so `modal run` can save
@@ -366,6 +513,8 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
 
     call = Pipeline().process.spawn(
         pipeline=payload.get("pipeline", MAIN_PIPELINE),
+        # Carried through so status callbacks can name the job they refer to.
+        job_id=payload.get("job_id"),
         r2_key=r2_key,
         output_prefix=payload.get("output_prefix"),
         frame_stride=payload.get("frame_stride"),
