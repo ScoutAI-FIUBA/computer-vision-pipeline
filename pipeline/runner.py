@@ -448,6 +448,11 @@ def run_pipeline(
     info = probe(video_path)
     step = frame_step_for(info.fps, config.target_fps)
     effective_fps = info.fps / step if info.fps else 0.0
+    # Progress is measured against frames we will actually PROCESS (after
+    # downsampling), not source frames — otherwise it caps at target_fps/fps
+    # (e.g. ~25% for 15fps on 60fps footage) and never approaches 100%.
+    available_frames = (info.frame_count + step - 1) // step if (info.frame_count and step) else 0
+    expected_frames = min(available_frames, config.max_frames) if config.max_frames else available_frames
     shot_step = step if config.shot_target_fps is None else frame_step_for(info.fps, config.shot_target_fps)
     shot_effective_fps = info.fps / shot_step if info.fps else 0.0
     logger.info(
@@ -659,7 +664,7 @@ def run_pipeline(
                     summary.segments_processed += 1
                     summary.frames_processed += last_offset + 1
                     if on_progress is not None:
-                        on_progress(summary.frames_processed, info.frame_count)
+                        on_progress(summary.frames_processed, expected_frames)
 
             summary.track_records = tracks.record_count
             summary.distinct_track_ids = len(tracks.track_ids)

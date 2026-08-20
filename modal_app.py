@@ -174,12 +174,17 @@ def _build_process_config_overrides(
     return config_overrides
 
 
-def _progress_reporter(job_id: str | None, *, every_percent: int = 20):
-    """Build an `on_progress` callback that reports at coarse intervals.
+def _progress_reporter(job_id: str | None, *, ceiling: int = 90, every_percent: int = 10):
+    """Build an `on_progress` callback that reports tracking progress.
 
-    Throttled deliberately: the pipeline calls this once per segment, and one
-    HTTP request per segment would add more latency than the GPU work it reports
-    on. Returns None when there is nothing to report to.
+    Throttled to every `every_percent` so a long run makes ~10 status calls, not
+    one per segment.
+
+    Reports only up to `ceiling` (default 90), not 100: tracking is the bulk of a
+    run, but the stats pipeline still has work left afterwards (team ID, jersey
+    OCR, shot detection, court projection) that reports no progress. Holding at
+    90 until the DONE callback fills the last stretch reads as "finalizing"
+    rather than "done but still churning".
     """
 
     if not job_id:
@@ -190,7 +195,7 @@ def _progress_reporter(job_id: str | None, *, every_percent: int = 20):
     def report(frames_done: int, frames_total: int) -> None:
         if frames_total <= 0:
             return
-        percent = min(99, int(100 * frames_done / frames_total))
+        percent = min(ceiling, int(ceiling * frames_done / frames_total))
         bucket = percent // every_percent
         if bucket > last_reported["bucket"]:
             last_reported["bucket"] = bucket
