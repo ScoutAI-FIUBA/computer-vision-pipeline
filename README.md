@@ -299,7 +299,10 @@ Implementations now live under:
 
 - `scripts/tracking/` for player detection, tracking, frame extraction, and tracking evaluation.
 - `scripts/court/` for court-keypoint, homography, and projected-track tooling.
+- `scripts/ball/` for experimental ball-detection work and ball-specific docs.
 - `scripts/shared/` for shared config and annotation helpers.
+
+Keep ball work separate from the player/team/OCR planning docs unless you are documenting an integration boundary.
 
 ## Script Roles
 

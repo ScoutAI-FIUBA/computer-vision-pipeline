@@ -6,6 +6,8 @@ Short status doc for the unresolved tracking failures in the current local pipel
 
 Applies to `scripts/tracking/video_pipeline.py` and `scripts/tracking/track_players_video.py`.
 
+Not in scope here: ball-model training, TrackNet experiments, or ball-only review workflows. Those now live under `scripts/ball/`.
+
 Implemented now:
 
 - Shared annotation helpers are consolidated.
@@ -117,3 +119,4 @@ Suggested next investigation, in order:
 - Do not claim tracking is solved because projected-track export and top-down visualization now exist.
 - Do not treat `--frame-stride 1` as the default product answer.
 - Do not treat the current torso-color baseline as production-grade re-identification.
+- Do not mix ball-detection experimentation into this tracking issue list; link to `scripts/ball/` docs instead.

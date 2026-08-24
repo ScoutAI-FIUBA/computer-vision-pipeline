@@ -17,6 +17,7 @@ Improve player identity consistency in `scripts/tracking/video_pipeline.py` / `s
 ## Out of Scope
 
 - Team identification, jersey OCR, or event logic.
+- Ball detection experiments, TrackNet training, or ball-only dataset work. That work lives under `scripts/ball/`.
 - Full API integration or deployment decisions.
 - SAM 2 or other heavy segmentation-first tracking unless lighter tracker/re-ID changes are proven insufficient.
 - Perfect long-range re-identification across scene cuts or broadcast replay edits.
@@ -84,3 +85,4 @@ Exit condition: downstream tasks can consume track outputs without depending on 
 - `future_tasks/basketball_pipeline_tasks.md`
 - `TRACKING_ISSUES.md`
 - `README.md`
+- `scripts/ball/FINETUNING.md` (ball-only experimental reference, not part of the tracking rework)

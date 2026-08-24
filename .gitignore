@@ -1,9 +1,11 @@
 .atl/
 .venv/
+.script-exp/
 docs/
 openspec/
 
 .env
+scripts/ball/TrackNet_best.pt
 
 scripts/__pycache__/
 __pycache__/

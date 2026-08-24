@@ -1,6 +1,18 @@
 # Future Tasks: Basketball Video Analysis Pipeline
 
-This backlog documents the implementation work needed to evolve the current Roboflow player-detection prototype into a full basketball video-analysis pipeline. The shortest useful path is: stabilize video detection, normalize model outputs with Supervision, use the current SAM2 tracking path, then add court geometry, team identification, jersey OCR, and later heavier event logic or VLM components.
+This backlog documents the implementation work needed to evolve the player/court pipeline into a fuller basketball video-analysis pipeline.
+
+Ball detection is now a separate experimental workstream under `scripts/ball/`. Keep ball-model training, TrackNet experiments, and ball-only evaluation there instead of mixing them into player tracking, team ID, jersey OCR, or shot-event planning.
+
+## Workstream Boundaries
+
+| Workstream | Owns | Does not own |
+|---|---|---|
+| Player tracking | player detection, tracking identity, track exports | ball model training or ball-only inference experiments |
+| Court geometry | court keypoints, homography, projected player positions | shot resolution logic by itself |
+| Team ID / jersey OCR | per-track team and jersey evidence | ball detection |
+| Ball detection (experimental) | ball-only scripts, checkpoints, fine-tuning docs in `scripts/ball/` | player tracking rework or team/OCR logic |
+| Shot / make-miss events | event windows, player/team association, shot charts | ball model training details |
 
 ## Current State
 
@@ -27,9 +39,23 @@ This backlog documents the implementation work needed to evolve the current Robo
 | 5 | Improve team identification quality and validation | The baseline is already wired; the remaining work is evidence quality, validation, and output confidence. |
 | 6 | Add jersey OCR | Useful but noisy; depends on good crops/tracks. |
 | 7 | Improve SAM2 robustness and operating cost | SAM2 is now the chosen tracker path; optimize it instead of deferring it. |
-| 8 | Add make/miss and event logic | Depends on stable tracking, court geometry, and ball/rim signals. |
-| 9 | Add evaluation and regression set | Needed before production. |
-| 10 | Decide deployment path | Local/serverless/dedicated depends on measured cost and latency. |
+| 8 | Keep ball detection as a separate experimental track | Ball-model work now lives under `scripts/ball/`; do not fold it into player-tracking tasks prematurely. |
+| 9 | Add make/miss and event logic | Depends on stable tracking, court geometry, and ball/rim signals. |
+| 10 | Add evaluation and regression set | Needed before production. |
+| 11 | Decide deployment path | Local/serverless/dedicated depends on measured cost and latency. |
+
+## Dedicated Ball Detection Track
+
+Use this backlog only to note integration boundaries.
+
+- Experimental ball work lives under `scripts/ball/`.
+- Keep ball-model details out of the player-tracking phases unless they change the integration contract.
+- Prefer linking to the ball docs instead of duplicating training or dataset notes here.
+
+References:
+
+- `scripts/ball/FINETUNING.md`
+- `scripts/ball/FINETUNING_TRACKNETV3_REPO.md`
 
 ## Phase 1 — Detection Foundation
 
@@ -395,11 +421,14 @@ Acceptance criteria:
 
 ## Phase 8 — Make/Miss and Event Logic
 
+Ball detection itself is not tracked in this phase. This phase starts only after the ball workstream can provide a usable ball signal/output contract from `scripts/ball/`.
+
 ### Task 8.1: Review Roboflow make/miss notebook behavior
 
 - [ ] Document required model classes and signals.
 - [ ] Identify how `BALL_IN_BASKET_CLASS_ID` is used.
 - [ ] Identify dependencies on court homography and shot event tracking.
+- [ ] Reference the current ball-signal source without duplicating TrackNet training notes here.
 
 Acceptance criteria:
 
