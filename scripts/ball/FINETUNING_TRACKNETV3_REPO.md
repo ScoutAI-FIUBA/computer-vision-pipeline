@@ -1235,3 +1235,71 @@ TrackNet_basketball_best.pt
 capaz de generar heatmaps confiables para pelotas de básquet en videos que no fueron utilizados durante el entrenamiento.
 
 Ese checkpoint será posteriormente la entrada del pipeline de tracking temporal con Kalman, gating e interpolación.
+
+---
+
+# Shared Processed Dataset Workflow
+
+Preprocess locally once, publish an immutable dataset ID, then run Modal from
+the processed root. Modal does not extract frames or rebuild the dataset.
+
+## Publish a new dataset
+
+Run this from the repository root with Modal CLI credentials and an unused dataset ID:
+
+```bash
+python scripts/ball/publish_tracknet_processed.py \
+  --raw-dataset-root /path/to/raw-dataset \
+  --dataset-id basketball-v1
+```
+
+The command creates `processed/basketball-v1`, atomically claims that local ID,
+validates its `manifest.json` and materialized split contents,
+and uploads one deterministic batch per game directory under `train`, `val`,
+and `test` to each split's parent directory (`/processed/<dataset-id>/<split>/`)
+on the `tracknet-data` Volume; Modal adds the local game-directory basename.
+`manifest.json` is uploaded separately, after all game batches, and
+the remote manifest plus `train`, `val`, and `test` directories are verified.
+
+If a connection fails, inspect the remote ID before retrying. A remote ID is
+complete only when its manifest and every expected split/game batch are present;
+an incomplete remote root is rejected and must be cleaned up or replaced with a
+new immutable dataset ID. A different remote manifest is rejected. Do not run
+two publishers for the same ID at once: Modal Volume CLI has no atomic
+multi-file publish, so the single-publisher contract remains required.
+
+## Check the Modal plan, then run it
+
+Use the mounted processed root. Keep the run plan and all outputs under the
+run root, never under the shared dataset:
+
+```bash
+modal run modal_tracknet_finetune.py::run_dry \
+  --run-id basketball-v1-trial-01 \
+  --processed-root /mnt/tracknet/processed/basketball-v1 \
+  --volume-root /mnt/tracknet \
+  --pretrained-tracknet /mnt/tracknet/pretrained/TrackNet_best.pt \
+  --plan-output /mnt/tracknet/tracknet-finetune/runs/basketball-v1-trial-01/plans/modal-plan.json
+```
+
+After reviewing the plan, replace `run_dry` with `run`. The shared root is
+read-only; checkpoints, reports, logs, visualizations, and caches stay under
+`runs/<run-id>/`.
+
+The Modal entrypoints default to `--volume-root /mnt/tracknet` and
+`/mnt/tracknet/pretrained/TrackNet_best.pt`. The checkpoint must exist in the
+mounted Volume; `/path/...` is a host-local path and is rejected by the remote
+wrapper.
+
+## Immutable IDs
+
+No overwrite path exists. A local staging directory or a remote ID with a
+different manifest fails and requires a new dataset ID. A remote ID with the
+same manifest is treated as the same retryable publication. To add clips or
+change preprocessing, publish a new ID such as `basketball-v2`; do not modify
+`basketball-v1`.
+
+## Supported publication contract
+
+The local publisher's temporary atomic lock serializes **same-machine concurrent calls** for one dataset ID and removes the lock after success or failure.
+Modal Volume CLI cannot atomically claim a dataset ID across machines. Therefore, the supported contract is that **cross-machine publishers must serialize manually**: only one operator/machine may publish a given dataset ID at a time. Do not start two publishers for the same ID from different machines; choose a new immutable ID for a separate publication.
