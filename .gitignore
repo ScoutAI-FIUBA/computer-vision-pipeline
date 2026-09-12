@@ -13,3 +13,11 @@ __pycache__/
 
 media/
 outputs/
+
+# TrackNet fine-tuning datasets, processed data, checkpoints, and local reports
+dataset-tracknet/
+processed/
+models/
+TrackNet_best.pt
+TrackNetV3/corrected_test_label/
+.coverage
