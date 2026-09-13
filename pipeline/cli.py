@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--team-embedder-model-id",
-        help="SigLIP model id for team embeddings, e.g. vit_base_patch16_siglip_224",
+        help="SigLIP model id for team embeddings, e.g. Marqo/marqo-fashionSigLIP",
     )
     parser.add_argument("--team-count", type=int, help="Number of teams to cluster")
     parser.add_argument(

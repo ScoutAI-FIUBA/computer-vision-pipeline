@@ -16,6 +16,11 @@ High-level flow:
 
 `pipeline/` contains no Modal imports, so the same code runs from local CLI, tests, notebooks, or Modal.
 
+## Phase status
+
+- **Completed for this phase:** production ball detection and production team identification.
+- **Next phase:** statistics detection. Statistics are not implemented yet; the existing `shot_events.jsonl` is only the current minimal detector-driven artifact, not a complete statistics system.
+
 ## Dedicated player-position pipeline
 
 There is now a separate homography pipeline for movement data: `python -m pipeline.player_positions` locally, or `modal run modal_app.py --pipeline player-positions ...` on Modal.
@@ -94,9 +99,12 @@ modal run modal_app.py \
   --annotated
 ```
 
-TrackNet is enabled by default. To use the hosted ball-detection compatibility
-path without loading the TrackNet checkpoint, pass `--no-tracknet-enabled` to
-`modal run`, or send `"tracknet_enabled": false` to the HTTP submit endpoint.
+For local CLI runs, TrackNet is disabled by default (`TRACKNET_ENABLED=0` in
+`PipelineConfig`); enable it explicitly with the checkpoint environment
+variables. Modal production runs enable TrackNet by default. To use the hosted
+ball-detection compatibility path without loading the TrackNet checkpoint,
+pass `--no-tracknet-enabled` to `modal run`, or send
+`"tracknet_enabled": false` to the HTTP submit endpoint.
 
 Run the dedicated player-position pipeline on Modal and save artifacts locally:
 
@@ -165,8 +173,8 @@ Current environment-backed knobs:
 | `PLAYER_MODEL_ID` | `basketball-player-detection-3-ycjdo/16` | Player detector model. |
 | `SHOT_TARGET_FPS` | unset | Optional shot-pass FPS target. When unset, the shot pass reuses tracking downsampling. |
 | `SAM2_MODEL_ID` | `facebook/sam2-hiera-small` | SAM2 checkpoint. |
-| `TEAM_EMBEDDER_BACKEND` | `siglip` | `siglip`, `colour`, or `none`. |
-| `TEAM_EMBEDDER_MODEL_ID` | `vit_base_patch16_siglip_224` | SigLIP model id when the backend is `siglip`. |
+| `TEAM_EMBEDDER_BACKEND` | `siglip` | FashionSigLIP by default; `colour` or `none` remain supported overrides. |
+| `TEAM_EMBEDDER_MODEL_ID` | `Marqo/marqo-fashionSigLIP` | FashionSigLIP model id when the backend is `siglip`. |
 | `TEAM_COUNT` | `2` | Cluster count for team assignment. |
 | `MIN_TEAM_SAMPLES_PER_TRACK` | `3` | Minimum selected samples before a track can be assigned. |
 | `TEAM_SAMPLE_STRIDE` | `5` | Propagated-frame sampling interval for team evidence. Detector frames are always sampled. |
@@ -214,11 +222,13 @@ Current behavior is simpler than the earlier design notes in `future_tasks/`.
 What the code does today:
 
 1. Extract a jersey-focused crop per accepted sample.
-2. Build either a colour histogram, a SigLIP embedding, or both depending on backend.
+2. Build either a colour histogram, a FashionSigLIP embedding, or both depending on backend.
 3. Reject unusable samples, keep the best `max_team_samples_per_track` samples per track, then cluster all selected samples globally.
 4. Vote one label per track and leave the track unassigned when it is under-sampled, tied, or too close to the runner-up cluster.
 
-Important detail: there is no separate "colour-first then SigLIP refinement" stage in the current code. With the default `siglip` backend, clustering uses the embedding when present and falls back to the colour signature only when an embedding is missing.
+FashionSigLIP is the production default backbone. The downstream global clustering, per-track voting, under-sampled/ambiguous handling, and unknown logic are unchanged. An explicit legacy timm model ID remains supported as an override; model IDs containing `/` use the OpenCLIP/Hugging Face FashionSigLIP path, while legacy timm IDs use the timm path.
+
+There is no separate "colour-first then SigLIP refinement" stage in the current code. With the default backend, clustering uses the FashionSigLIP embedding when present and falls back to the colour signature only when an embedding is missing.
 
 Current outputs from one pipeline run:
 
@@ -229,10 +239,62 @@ Current outputs from one pipeline run:
 | `teams.json` | Team assignments, skipped/unassigned tracks, selected-sample counts, and per-track diagnostics. |
 | `numbers.json` | Final per-track jersey-number confirmations and ambiguity details. |
 | `shot_events.jsonl` | Detector-frame make/miss event records from the active pipeline path. Empty means no shot events were resolved for that clip. |
-| `ball_tracks.jsonl` | Per-frame ball rows, using TrackNet detections first and bounded SAM2 fallback rows for TrackNet misses. |
+| `ball_tracks.jsonl` | One ball record per decoded source frame in the dense TrackNet stream, in source-frame order. Rows include `timestamp_seconds`; TrackNet detections are preferred, bounded SAM2 fallback rows use `track_state: "fallback"`, and an exhausted miss emits `track_state: "lost"` with null geometry. |
 | `team_debug.json` | Per-track sample summaries when team debug is enabled. |
 | `team_debug/` | Crops and masks for manual team-ID inspection when team debug is enabled. |
 | `annotated.mp4` | Optional final render after team assignment/number aggregation, with confirmed jersey numbers when available. |
+
+### Offline team-backbone A/B evaluation
+
+The production run's `team_debug.json` and `team_debug/` directory are a
+read-only evaluation input. They contain the already-selected torso crops, so
+the offline pass does not call Roboflow, SAM2, or Modal and does not change
+production configuration.
+
+Validate an artifact without loading models:
+
+```bash
+python scripts/team/evaluate_backbones.py outputs/check outputs/team-ab.json --dry-run
+```
+
+Install the normal production requirements and the optional A/B baseline
+dependency before a non-dry-run evaluation:
+
+```bash
+python -m pip install -r requirements.txt -r requirements-team-ab.txt
+```
+
+Dry-run validation does not require `timm`, `transformers`, or model
+downloads. The normal requirements provide the production FashionSigLIP
+runtime; `requirements-team-ab.txt` adds the legacy timm baseline and keeps
+the same pinned torch/torchvision, Transformers, and Hugging Face versions for
+a coherent evaluation environment. This is a heavy CUDA-capable environment.
+
+Run the current SigLIP baseline against FashionSigLIP (model downloads and
+inference happen only when this command is explicitly run):
+
+```bash
+python scripts/team/evaluate_backbones.py outputs/check outputs/team-ab.json
+```
+
+`labels.json` is optional. Add `--labels labels.json` only when a JSON object
+such as `{"12": "home", "19": "away"}` is available. Override either model explicitly with `--baseline-model-id` or
+`--candidate-model-id`; the default candidate is `Marqo/marqo-fashionSigLIP`.
+The report contains both assignments, coverage/unknown/ambiguous rates,
+cluster sizes, disagreements, and label metrics when labels are supplied.
+
+## Next session: statistics detection
+
+Implement this work in dependency order, without adding a broad analytics framework:
+
+1. Define the statistics contract and versioned event/schema fields.
+2. Validate provenance for player tracks, team IDs, ball rows, and court coordinates, including unknown/lost states.
+3. Implement shot/event detection with explicit `made` and `missed` outcomes and reviewable unknowns.
+4. Add possession only after ball/player evidence is reliable enough to support it.
+5. Add passes only after possession and transfer evidence are validated; do not infer passes from proximity alone.
+6. Build a small evaluation clip set and metrics for detection quality, event outcomes, and provenance coverage.
+7. Write stable output artifacts and document their ownership in `results.json`.
+8. Add focused acceptance tests for schema validity, missing evidence, make/miss, possession, and rejected/unknown events.
 
 ## Shot events
 
@@ -305,7 +367,7 @@ Implementations now live under:
 
 - `scripts/tracking/` for player detection, tracking, frame extraction, and tracking evaluation.
 - `scripts/court/` for court-keypoint, homography, and projected-track tooling.
-- `scripts/ball/` for experimental ball-detection work and ball-specific docs.
+- `scripts/ball/` for ball-model experiments, training history, and ball-specific docs; the production TrackNet+SAM2 integration is documented above.
 - `scripts/shared/` for shared config and annotation helpers.
 
 Keep ball work separate from the player/team/OCR planning docs unless you are documenting an integration boundary.
@@ -815,7 +877,8 @@ Video form fields:
 Processing requires `ROBOFLOW_API_KEY` and returns `model_id`, `frames_read`, `roboflow_calls`, `output_fps`, `content_type`, `filename`, and `annotated_video_base64`.
 ### Ball cadence
 
-The player/SAM2 pipeline defaults to `15` FPS. TrackNet is primary for the ball
+The player/SAM2 pipeline defaults to `15` FPS. In Modal production, TrackNet is
+primary for the ball
 and defaults to `BALL_ALL_FRAMES=1`, so every decoded source frame is processed
 for ball windows while player cost stays at 15 FPS. This is independent of the
 declared video FPS. On TrackNet misses, a bounded ball-only SAM2 pass bridges

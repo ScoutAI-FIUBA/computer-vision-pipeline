@@ -58,7 +58,11 @@ image = (
         # container. Bump deliberately, never implicitly.
         "torch==2.5.1",
         "torchvision==0.20.1",
+        "ftfy==6.3.1",
+        "open_clip_torch==2.32.0",
         "timm==1.0.22",
+        "transformers==5.0.0",
+        "huggingface_hub==1.7.1",
         "opencv-python-headless==4.10.0.84",
         "supervision==0.29.1",
         # Used for optimal (Hungarian) detection-to-track assignment. Pinned
@@ -68,7 +72,6 @@ image = (
         "umap-learn==0.5.9.post2",
         "inference-sdk==1.3.3",
         "boto3==1.35.36",
-        "huggingface_hub==1.7.1",
         "fastapi==0.115.6",
         # Supplies the osnet person re-ID model used to keep player identities
         # apart. Verified compatible with the torch pin above.

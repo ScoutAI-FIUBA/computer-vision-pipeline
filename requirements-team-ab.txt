@@ -1,0 +1,13 @@
+# Optional dependency for the non-dry-run A/B baseline.
+# The production FashionSigLIP dependency is already in requirements.txt.
+# Keep this standalone environment on the same heavy runtime matrix as Modal
+# and SAM2 so baseline comparisons do not resolve a different torch stack.
+# Dry-run validation does not import or load either model library.
+-r requirements-dev.txt
+ftfy==6.3.1
+open_clip_torch==2.32.0
+torch==2.5.1
+torchvision==0.20.1
+timm==1.0.22
+transformers==5.0.0
+huggingface_hub==1.7.1

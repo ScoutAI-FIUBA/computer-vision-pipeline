@@ -17,9 +17,9 @@ It writes `ball_tracks.jsonl` and `ball_only.mp4`. Use `--max-frames`,
 
 ## Local TrackNet ball detection
 
-The local pipeline keeps hosted ball detection as the default. To enable the
-temporal TrackNet primary detector, point it at a local checkpoint (the file is
-not stored in this repository):
+The local pipeline defaults TrackNet to disabled. Enable it explicitly with
+`TRACKNET_ENABLED=1` and point it at a local checkpoint (the file is not stored
+in this repository):
 
 ```bash
 export TRACKNET_ENABLED=1
@@ -28,19 +28,21 @@ export TRACKNET_FALLBACK_BUDGET=12
 python -m pipeline.cli clips/short.mp4 --max-frames 90 --output-dir outputs/tracknet
 ```
 
-TrackNet uses 8-frame windows at 512x288 with `bg_mode=concat`. When it misses,
-SAM2 may carry the last valid ball for at most
-`TRACKNET_FALLBACK_BUDGET` **emitted processed frames** (default 12). The
-counter resets only on a real TrackNet detection, not on fallback rows. After
-the hard cap, `ball_tracks.jsonl` emits one `track_state: "lost"` row with the
-stable public `track_id` and `xyxy`/`center_xy` set to `null`; no box is sent to
-SAM2 until TrackNet seeds the ball again. `TRACKNET_SEED_RADIUS` and
-`TRACKNET_HEATMAP_THRESHOLD` tune seed size and acceptance.
+TrackNet uses 8-frame windows at 512x288 with `bg_mode=concat`. Modal production
+enables TrackNet by default: all decoded source frames feed the dense TrackNet
+stream, independent of the player output cadence. When TrackNet misses, ball-only SAM2 may carry
+the last valid ball for at most `TRACKNET_FALLBACK_BUDGET` **emitted ball
+frames** (default 12). The counter resets only on a real TrackNet detection,
+not on fallback rows. After the hard cap, `ball_tracks.jsonl` emits one
+`track_state: "lost"` row with stable public `track_id`, `xyxy: null`, and
+`center_xy: null`; no box is sent to SAM2 until TrackNet seeds the ball again.
+Every row has `timestamp_seconds` and is written in source-frame order.
+`TRACKNET_SEED_RADIUS` and `TRACKNET_HEATMAP_THRESHOLD` tune seed size and
+acceptance.
 
-The dense ball pass keeps only its 8-frame TrackNet window and previous
-fallback frame in memory, writes `ball_tracks.jsonl` in source-frame order, and
-adds `timestamp_seconds` from the source FPS. Dense misses use a separate
-two-frame, ball-only SAM2 fallback; the player SAM2 stream remains at 15 FPS.
+The dense ball pass keeps only its 8-frame TrackNet window and previous fallback
+frame in memory. Dense misses use a separate two-frame, ball-only SAM2
+fallback; the player SAM2/output stream remains at its separate 15 FPS default.
 
 How to get the pipeline running on Modal GPUs. Follow it in order — each step
 gets cheaper to debug if the previous one worked.
@@ -73,10 +75,11 @@ Everything below assumes the venv is active — your prompt should start with
 `(.venv)`. If you would rather not activate it, prefix commands with
 `.venv/bin/` instead: `.venv/bin/modal run ...`.
 
-> `requirements-dev.txt` is intentionally small: Modal, pytest, and OpenCV. It
-> does **not** install torch or SAM2, because those run in the container. If you
-> want the legacy BoxMOT scripts too, `pip install -r requirements.txt`
-> separately — that one does pull torch and the CUDA toolkit, several GB.
+> `requirements-dev.txt` is local tooling: Modal, pytest, OpenCV, python-dotenv,
+> umap-learn, and inference-sdk. It does **not** install torch, SAM2, or the
+> production FashionSigLIP/legacy BoxMOT stack. Install the heavier optional
+> sets separately when needed: `requirements.txt` for the production team and
+> legacy BoxMOT stack, and `requirements-sam2.txt` for SAM2.
 
 ```bash
 modal setup
@@ -153,8 +156,9 @@ loads SAM2, and processes **90 frames only**.
 modal run modal_app.py --video-path clips/short.mp4 --max-frames 90
 ```
 
-TrackNet is enabled by default. To skip loading its checkpoint and retain the
-hosted ball-detection compatibility path, use:
+Modal production enables TrackNet by default. To skip loading its checkpoint
+and retain the hosted ball-detection compatibility path, use the explicit
+override:
 
 ```bash
 modal run modal_app.py --video-path clips/short.mp4 --no-tracknet-enabled
@@ -168,11 +172,18 @@ What you should see: the image build, `SAM2 loaded: facebook/sam2-hiera-small on
 cuda`, progress logs, then a JSON summary with `frames_processed: 90` and a
 `tracks_preview` array.
 
+FashionSigLIP is the default team-ID backbone. Its Modal image and production
+requirements include `ftfy==6.3.1` and `open_clip_torch==2.32.0` in addition to
+the aligned Transformers/Hugging Face pins. `open_clip_torch` provides the
+`open_clip` import used by Marqo's dynamic modeling code. The Modal image
+targets Python 3.12; a local Python 3.13 environment is not proof that the
+Modal runtime will resolve the same stack.
+
 If it fails, the likely causes in order:
 
 | Symptom | Cause |
 |---|---|
-| Image build fails on `sam2` install | Version conflict between `torch`, `huggingface_hub`, and SAM2's own pins. Adjust in `modal_app.py` and `requirements-sam2.txt` **together**. |
+| Image build or FashionSigLIP import fails | Keep `transformers==5.0.0`, `huggingface_hub==1.7.1`, `ftfy==6.3.1`, and `open_clip_torch==2.32.0` aligned in the production/team requirements and `modal_app.py`; verify the runtime is Python 3.12. |
 | `Secret not found` | Name typo in step 2. Names must match `scoutai-roboflow`, `scoutai-r2`, `scoutai-auth` exactly. |
 | `ModuleNotFoundError: pipeline` | `.add_local_python_source("pipeline")` missing from the image definition. |
 | Roboflow 401/403 | Bad key, or the model id in `.env.example` doesn't match your workspace. |
@@ -259,8 +270,8 @@ Core environment variables:
 | `ROBOFLOW_API_URL` | `https://serverless.roboflow.com` | Hosted inference endpoint. |
 | `PLAYER_MODEL_ID` | `basketball-player-detection-3-ycjdo/16` | Player detector model id. |
 | `SAM2_MODEL_ID` | `facebook/sam2-hiera-small` | Default SAM2 checkpoint. |
-| `TEAM_EMBEDDER_BACKEND` | `siglip` | `siglip`, `colour`, or `none`. |
-| `TEAM_EMBEDDER_MODEL_ID` | `vit_base_patch16_siglip_224` | Used only for `siglip`. |
+| `TEAM_EMBEDDER_BACKEND` | `siglip` | FashionSigLIP by default; `colour` or `none` remain supported overrides. |
+| `TEAM_EMBEDDER_MODEL_ID` | `Marqo/marqo-fashionSigLIP` | FashionSigLIP model id for `siglip`. |
 | `TEAM_COUNT` | `2` | Current clustering target. |
 | `MIN_TEAM_SAMPLES_PER_TRACK` | `3` | Minimum selected samples before assigning a track. |
 | `TEAM_SAMPLE_STRIDE` | `5` | Propagated-frame team-evidence sampling rate. |
@@ -312,7 +323,21 @@ Output contract to expect from a successful run:
 - `numbers.json` contains the final per-track jersey-number decisions.
 - `annotated.mp4`, when enabled, can show confirmed jersey numbers in labels and does not fall back to internal track IDs when no number is confirmed.
 
-This matters because several older notes in `future_tasks/` describe a more elaborate planned design. The code today is one global clustering pass plus per-track voting for teams, plus a detector-frame OCR-and-aggregation path for jersey numbers — not a larger temporal validation system yet.
+FashionSigLIP is the default `siglip` backbone. The downstream clustering,
+voting, and unknown/unassigned logic is unchanged; an explicit legacy timm
+model ID remains available as an override. Several older notes in
+`future_tasks/` describe a more elaborate planned design. The code today is one
+global clustering pass plus per-track voting for teams, plus a detector-frame
+OCR-and-aggregation path for jersey numbers — not a larger temporal validation
+system yet.
+
+## Phase status and next session
+
+- **Completed for this phase:** production ball detection and team identification.
+- **Next session:** implement statistics detection. Start with the schema and
+  provenance checks, then shot make/miss, possession, evidence-backed passes,
+  evaluation clips/metrics, output artifacts, and acceptance tests. Statistics
+  are not implemented yet.
 
 ---
 
@@ -420,9 +445,11 @@ Tests for the segment windowing, which also need no GPU:
 ```bash
 python -m pytest tests/test_video_segments.py
 ```
-Ball detection defaults to `BALL_ALL_FRAMES=1`: TrackNet consumes every decoded
-source frame independently of the player `target_fps=15`. TrackNet uses true
-8-frame windows on that dense stream; SAM2 only fills bounded TrackNet misses.
+Modal production ball detection uses `BALL_ALL_FRAMES=1`: TrackNet consumes
+every decoded source frame independently of the player `target_fps=15`. TrackNet
+uses true 8-frame windows on that dense stream; SAM2 only fills bounded TrackNet
+misses. Local `PipelineConfig` runs keep `tracknet_enabled=False` unless
+`TRACKNET_ENABLED=1` is set explicitly.
 For compatibility with the old FPS-derived mode, disable all-frame mode and
 set the ball cadence. This compatibility mode uses strided source-frame
 windows, not consecutive decoded frames:

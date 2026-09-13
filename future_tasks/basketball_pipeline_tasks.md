@@ -1,8 +1,13 @@
 # Future Tasks: Basketball Video Analysis Pipeline
 
-This backlog documents the implementation work needed to evolve the player/court pipeline into a fuller basketball video-analysis pipeline.
+This backlog documents the remaining implementation work needed to evolve the
+player/court pipeline into a fuller basketball video-analysis pipeline.
 
-Ball detection is now a separate experimental workstream under `scripts/ball/`. Keep ball-model training, TrackNet experiments, and ball-only evaluation there instead of mixing them into player tracking, team ID, jersey OCR, or shot-event planning.
+Ball-model training, TrackNet experiments, and ball-only evaluation remain a
+separate experimental workstream under `scripts/ball/`. The production
+TrackNet+SAM2 integration is complete for this phase and is documented in the
+main pipeline/setup docs; keep only the model experimentation there instead of
+mixing it into player tracking, team ID, jersey OCR, or statistics planning.
 
 ## Workstream Boundaries
 
@@ -11,7 +16,7 @@ Ball detection is now a separate experimental workstream under `scripts/ball/`. 
 | Player tracking | player detection, tracking identity, track exports | ball model training or ball-only inference experiments |
 | Court geometry | court keypoints, homography, projected player positions | shot resolution logic by itself |
 | Team ID / jersey OCR | per-track team and jersey evidence | ball detection |
-| Ball detection (experimental) | ball-only scripts, checkpoints, fine-tuning docs in `scripts/ball/` | player tracking rework or team/OCR logic |
+| Ball model experiments | ball-only scripts, checkpoints, fine-tuning docs in `scripts/ball/` | production player/team/statistics integration |
 | Shot / make-miss events | event windows, player/team association, shot charts | ball model training details |
 
 ## Current State
@@ -23,8 +28,9 @@ Ball detection is now a separate experimental workstream under `scripts/ball/`. 
 | Cost control | Basic controls exist: `--dry-run`, `--frame-stride`, `--max-frames`, `--sampled-output-only`. |
 | Supervision integration | Implemented for image/video annotation with shared detection/keypoint annotation helpers. |
 | Tracking | Implemented locally with official SAM2 entrypoint `scripts/tracking/track_players_sam2.py`. The older `scripts/tracking/video_pipeline.py` / `scripts/tracking/track_players_video.py` box-tracker path still exists for comparison and support tooling. |
-| Team identification | Implemented experimentally in `pipeline/` and Modal. End-of-run assignment writes `teams.json` and rewrites `tracks.jsonl`. It is still not considered production-stable. |
-| Jersey OCR | Not implemented yet. |
+| Ball detection | Completed for this phase: TrackNet is the production primary, with dense source-frame output and bounded ball-only SAM2 fallback. |
+| Team identification | Completed for this phase in `pipeline/` and Modal. FashionSigLIP is the default backbone; end-of-run assignment writes `teams.json` and rewrites `tracks.jsonl`. |
+| Jersey OCR | Implemented as a conservative detector-frame OCR-and-aggregation path. |
 | Court keypoints / homography | Implemented locally for single-frame, sampled-video, homography debug, and projected-track export. Homography now rejects obviously bad point layouts before fitting. |
 | SAM 2 tracking | Implemented and now the tracker path to use going forward. |
 
@@ -39,7 +45,7 @@ Ball detection is now a separate experimental workstream under `scripts/ball/`. 
 | 5 | Improve team identification quality and validation | The baseline is already wired; the remaining work is evidence quality, validation, and output confidence. |
 | 6 | Add jersey OCR | Useful but noisy; depends on good crops/tracks. |
 | 7 | Improve SAM2 robustness and operating cost | SAM2 is now the chosen tracker path; optimize it instead of deferring it. |
-| 8 | Keep ball detection as a separate experimental track | Ball-model work now lives under `scripts/ball/`; do not fold it into player-tracking tasks prematurely. |
+| 8 | Keep ball-model experimentation separate | Production TrackNet+SAM2 integration is complete; model training and ball-only evaluation remain under `scripts/ball/`. |
 | 9 | Add make/miss and event logic | Depends on stable tracking, court geometry, and ball/rim signals. |
 | 10 | Add evaluation and regression set | Needed before production. |
 | 11 | Decide deployment path | Local/serverless/dedicated depends on measured cost and latency. |
@@ -156,11 +162,40 @@ Notes:
 - Tracking quality is improved but not solved: IDs still switch in crossings/occlusions, some tracks still die entirely, and `--frame-stride 1` is too slow/costly to treat as the default fix.
 - The current tracker construction is still `sv.ByteTrack()`, and the deprecation warning means the tracker API choice should be revisited before treating this path as stable.
 
-## Recommended next task
+## Completed phases and historical notes
 
-**Recommended next implementation task: Task 3.3 — Evaluate tracker robustness on crossings/occlusions, then decide whether to replace or wrap the current tracker API.**
+The earlier tracking, court, ball, and team sections below preserve historical
+implementation notes. Ball detection and team identification are closed for
+this phase; do not reopen those sections as the next implementation target
+unless new evidence breaks their current output contracts.
 
-Why this is next now:
+## Next immediate task: statistics detection
+
+Implement the following in order during the next session:
+
+1. Define a versioned statistics contract/schema and event status vocabulary.
+2. Validate player-track, team-ID, ball-track, and court-coordinate provenance,
+   including unknown, lost, and unassigned states.
+3. Implement shot/event detection with explicit make/miss outcomes and
+   reviewable unknown events.
+4. Add possession only after player/team/ball evidence passes validation.
+5. Add passes only after possession and transfer evidence support them; do not
+   infer passes from proximity alone.
+6. Select a small evaluation clip set and define practical metrics for event
+   precision/recall, outcome accuracy, and provenance coverage.
+7. Define and write the output artifacts, with references from `results.json`.
+8. Add acceptance tests for schema validation, missing evidence, make/miss,
+   possession, and rejected/unknown events.
+
+The current `shot_events.jsonl` is a minimal existing artifact, not proof that
+the statistics phase is implemented.
+
+Historical next-task note (superseded):
+
+**Previously recommended:** Task 3.3 — evaluate tracker robustness on
+crossings/occlusions, then decide whether to replace or wrap the current tracker API.
+
+Why this was previously next:
 
 - The repo already has config centralization, raw inference JSONL output, and a
   unified video pipeline entrypoint for player detection + tracking.
@@ -271,7 +306,7 @@ Notes:
 - Reuses `draw_fiba_court` from `scripts/court/build_court_homography.py` and consumes the existing projected-track JSONL emitted by `scripts/tracking/track_players_video.py` / `scripts/tracking/video_pipeline.py`.
 - Produces an offline top-down PNG summary by default and can optionally render a simple court-only MP4 for per-frame review, with no additional Roboflow calls.
 
-## Phase 5 — Team identification
+## Phase 5 — Team identification (completed for this phase; historical detail)
 
 ### Task 5.1: Keep the current config and docs aligned with the deployed path
 
@@ -331,7 +366,7 @@ Acceptance criteria:
 - Tracking changes are evaluated against the same clip set before and after tracker/re-ID changes.
 - The backlog has one explicit reference doc for the tracking rework instead of scattered notes only.
 
-## Phase 5 — Team Identification
+## Phase 5 — Team Identification (completed for this phase; historical detail)
 
 ### Task 5.1: Start with color clustering baseline
 
@@ -352,7 +387,7 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- SigLIP path is optional and disabled by default.
+- FashionSigLIP is the production default; explicit legacy timm override remains supported.
 - Team assignment is measured against a small manually labeled clip set.
 
 ### Task 5.3: Track-level team voting
@@ -397,58 +432,68 @@ Acceptance criteria:
 
 - Heavy OCR/VLM is justified by measured improvement, not assumption.
 
-## Phase 7 — SAM 2 Tracking Optional Layer
+## Phase 7 — SAM 2 tracking (completed)
 
-### Task 7.1: Create SAM 2 experiment branch/script
+SAM2 is implemented as the official player tracker and as the bounded,
+ball-only fallback for TrackNet misses. The production integration is complete
+for this phase; this section is not an undecided implementation task.
 
-- [ ] Install SAM 2 in a separate optional requirements file.
-- [ ] Initialize masks from player detector boxes.
-- [ ] Propagate masks through a short clip.
+### Completed integration
 
-Acceptance criteria:
+- [x] Initialize player masks from detector boxes and propagate them through the
+  production player stream.
+- [x] Use a separate bounded ball-only SAM2 pass for TrackNet misses.
+- [x] Keep the legacy box-tracker path only as comparison/support tooling.
 
-- SAM 2 runs on a short local clip with documented GPU requirements.
-- ByteTrack vs SAM 2 result is visually comparable.
+### Follow-up / deferred SAM2 optimization
 
-### Task 7.2: Decide SAM 2 deployment path
+These are optimization and evaluation tasks, not prerequisites for the next
+phase:
 
-- [ ] Measure GPU memory, latency, and setup complexity.
-- [ ] Decide local GPU, Roboflow Dedicated, or skip.
+- [ ] Measure SAM2 robustness, GPU memory, latency, and cost on representative
+  clips.
+- [ ] Tune player cadence, checkpoint choice, and fallback budgets only when
+  measured evidence justifies a change.
+- [ ] Revisit the legacy comparison path only if target-footage evaluation shows
+  a clear production benefit.
 
-Acceptance criteria:
+## Phase 8 — Statistics detection (next session)
 
-- SAM 2 is either accepted with measurable benefit or explicitly deferred.
+Ball detection is complete for this phase. Statistics work starts from the
+usable ball signal/output contract provided by `scripts/ball/` and the
+production pipeline.
 
-## Phase 8 — Make/Miss and Event Logic
+### Task 8.1: Define the statistics contract and validate provenance
 
-Ball detection itself is not tracked in this phase. This phase starts only after the ball workstream can provide a usable ball signal/output contract from `scripts/ball/`.
-
-### Task 8.1: Review Roboflow make/miss notebook behavior
-
-- [ ] Document required model classes and signals.
-- [ ] Identify how `BALL_IN_BASKET_CLASS_ID` is used.
-- [ ] Identify dependencies on court homography and shot event tracking.
+- [ ] Define versioned event/schema fields and status vocabulary.
+- [ ] Validate player, team, ball, and court provenance, including unknown/lost states.
 - [ ] Reference the current ball-signal source without duplicating TrackNet training notes here.
 
 Acceptance criteria:
 
 - The project has a clear local design before copying notebook code.
 
-### Task 8.2: Implement shot event tracker
+### Task 8.2: Implement shot event tracker with make/miss
 
 - [ ] Track candidate jump-shot events.
 - [ ] Associate ball/rim/player signals over time.
-- [ ] Output event records: frame range, player track, team, make/miss if known.
+- [ ] Output event records with frame range, player track, team, and explicit make/miss/unknown status.
 
 Acceptance criteria:
 
 - Events are exported as JSON/CSV.
 - False positives can be reviewed frame-by-frame.
 
-### Task 8.3: Add shot chart export
+### Task 8.3: Add possession and evidence-backed passes
 
-- [ ] Use homography to locate shot origin.
-- [ ] Render shot chart on top-down court.
+- [ ] Add possession only after ball/player evidence is validated.
+- [ ] Add passes only after transfer evidence is available; do not use proximity alone.
+
+### Task 8.4: Evaluate and publish statistics artifacts
+
+- [ ] Select small, representative evaluation clips and define practical metrics.
+- [ ] Write stable statistics artifacts and reference them from `results.json`.
+- [ ] Add acceptance tests for schema, provenance, make/miss, possession, and unknown/rejected events.
 
 Acceptance criteria:
 
@@ -522,7 +567,7 @@ Acceptance criteria:
 
 ## Deferred Until Proven Necessary
 
-- [ ] Full SAM 2 tracking in production.
+- [ ] Further SAM2 robustness and cost optimization after statistics needs are clearer.
 - [ ] SmolVLM2 in the hot path.
 - [ ] Custom RF-DETR fine-tuning.
 - [ ] ResNet-32 jersey classifier.
@@ -533,17 +578,6 @@ These are valid directions, but they should wait until the simpler pipeline fail
 
 ## Next Immediate Task
 
-Wire the homography into the tracking pipeline so player positions can be
-projected to FIBA court coordinates.
-
-```text
-court keypoints -> COURT_POINT_MAP -> cv2.findHomography
-tracked player foot points -> cv2.perspectiveTransform -> court coordinates
-```
-
-Why this next: the local homography script is in place
-(`scripts/court/build_court_homography.py`); the missing piece is using it on every
-tracked frame so downstream code can reason in meters instead of pixels. The
-mapping is still a best-guess, so any real measurement on the target court
-should land in `COURT_POINT_MAP` before relying on shot charts or spatial
-stats.
+Statistics detection, beginning with the contract/schema and provenance checks
+listed in **Phase 8** above. Court projection is an existing dependency to
+validate, not the next standalone implementation task.

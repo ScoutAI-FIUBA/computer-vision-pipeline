@@ -8,6 +8,7 @@ from typing import Protocol
 from pipeline.appearance import ReidConfig, visible_torso
 
 DEFAULT_SIGLIP_MODEL_ID = "vit_base_patch16_siglip_224"
+DEFAULT_FASHION_SIGLIP_MODEL_ID = "Marqo/marqo-fashionSigLIP"
 
 
 @dataclass(frozen=True)
@@ -88,7 +89,7 @@ def _load_siglip_components():
 class SiglipTeamEmbedder:
     """Jersey colour prior plus optional SigLIP refinement features."""
 
-    def __init__(self, model_id: str = DEFAULT_SIGLIP_MODEL_ID, config: ReidConfig | None = None) -> None:
+    def __init__(self, model_id: str = DEFAULT_FASHION_SIGLIP_MODEL_ID, config: ReidConfig | None = None) -> None:
         import cv2
         import numpy as np
 
@@ -99,9 +100,19 @@ class SiglipTeamEmbedder:
         self._image = image_module
         self._config = config or ReidConfig()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._model = timm.create_model(model_id, pretrained=True, num_classes=0).to(self.device)
-        data_config = timm.data.resolve_model_data_config(self._model)
-        self._transform = timm.data.create_transform(**data_config, is_training=False)
+        self._processor = None
+        self._uses_open_clip = "/" in model_id
+        if self._uses_open_clip:
+            import open_clip
+
+            self._model, _, self._transform = open_clip.create_model_and_transforms(
+                f"hf-hub:{model_id}"
+            )
+            self._model = self._model.to(self.device)
+        else:
+            self._model = timm.create_model(model_id, pretrained=True, num_classes=0).to(self.device)
+            data_config = timm.data.resolve_model_data_config(self._model)
+            self._transform = timm.data.create_transform(**data_config, is_training=False)
         self._model.eval()
         self.name = f"siglip:{model_id}"
 
@@ -124,28 +135,17 @@ class SiglipTeamEmbedder:
             results[index] = features
             if features.debug_crop is None:
                 continue
-            crops.append(
-                self._image.fromarray(self._cv2.cvtColor(features.debug_crop, self._cv2.COLOR_BGR2RGB))
-            )
+            crops.append(features.debug_crop)
             keep.append(index)
 
         if not keep:
             return results
 
-        inputs = self._torch.stack([self._transform(crop) for crop in crops]).to(self.device)
-        with self._torch.inference_mode():
-            features = self._model(inputs)
-        array = self._np.asarray(
-            features.detach().cpu() if hasattr(features, "detach") else features,
-            dtype=self._np.float32,
-        )
-        norms = self._np.clip(self._np.linalg.norm(array, axis=1, keepdims=True), 1e-12, None)
-        normalized = array / norms
-
+        vectors = self.embed_crops(crops)
         for position, index in enumerate(keep):
             results[index] = TeamFeatures(
                 color_signature=results[index].color_signature,
-                embedding=normalized[position].tolist(),
+                embedding=vectors[position],
                 quality_score=results[index].quality_score,
                 quality_details=results[index].quality_details,
                 rejection_reasons=results[index].rejection_reasons,
@@ -157,6 +157,22 @@ class SiglipTeamEmbedder:
                 debug_mask=results[index].debug_mask,
             )
         return results
+
+    def embed_crops(self, crops) -> list[list[float]]:
+        """Embed already-selected BGR torso crops without changing crop policy."""
+
+        images = [self._image.fromarray(self._cv2.cvtColor(crop, self._cv2.COLOR_BGR2RGB)) for crop in crops]
+        inputs = self._torch.stack([self._transform(image) for image in images]).to(self.device)
+        with self._torch.inference_mode():
+            features = self._model.encode_image(inputs) if self._uses_open_clip else self._model(inputs)
+        array = self._np.asarray(
+            features.detach().cpu() if hasattr(features, "detach") else features,
+            dtype=self._np.float32,
+        )
+        norms = self._np.clip(self._np.linalg.norm(array, axis=1, keepdims=True), 1e-12, None)
+        normalized = array / norms
+
+        return normalized.tolist()
 
 
 def extract_team_features(frame, sample: TeamEmbeddingSample, other_boxes, config: ReidConfig) -> TeamFeatures:
@@ -321,7 +337,7 @@ def _jersey_region(region: tuple[int, int, int, int], config: ReidConfig) -> tup
 
 
 def build_team_embedder(
-    backend: str = "siglip", model_id: str = DEFAULT_SIGLIP_MODEL_ID
+    backend: str = "siglip", model_id: str = DEFAULT_FASHION_SIGLIP_MODEL_ID
 ) -> TeamEmbedder:
     """Construct the requested team embedding backend."""
 

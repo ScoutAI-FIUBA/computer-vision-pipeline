@@ -12,7 +12,7 @@
 
 torch==2.5.1
 torchvision==0.20.1
-transformers==4.57.3
+transformers==5.0.0
 huggingface_hub==1.7.1
 # Plain URL form is required. The repo declares its project name as "sam-2", so
 # the `sam2 @ git+...` form fails pip's name check and then falls back to the

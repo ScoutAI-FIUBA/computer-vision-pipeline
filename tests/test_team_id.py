@@ -9,6 +9,7 @@ SigLIP or K-means integration.
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -58,7 +59,44 @@ def test_build_team_embedder_selects_none_backend():
     assert isinstance(build_team_embedder("none"), NullTeamEmbedder)
 
 
-def test_build_team_embedder_selects_siglip_backend_by_default(monkeypatch: pytest.MonkeyPatch):
+def test_build_team_embedder_selects_fashion_siglip_backend_by_default(monkeypatch: pytest.MonkeyPatch):
+    captured = {}
+
+    class FakeModel:
+        def to(self, device: str):
+            assert device != "meta"
+            captured["device"] = device
+            return self
+
+        def eval(self):
+            captured["eval"] = True
+            return self
+
+    class FakeOpenClip:
+        @staticmethod
+        def create_model_and_transforms(model_id):
+            captured["model"] = model_id
+            return FakeModel(), None, lambda image: image
+
+    class FakeTorch:
+        class cuda:
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+    monkeypatch.setattr(
+        "pipeline.team_embedder._load_siglip_components",
+        lambda: (FakeTorch, object(), object()),
+    )
+    monkeypatch.setitem(sys.modules, "open_clip", FakeOpenClip)
+
+    assert isinstance(build_team_embedder(), SiglipTeamEmbedder)
+    assert captured["model"] == "hf-hub:Marqo/marqo-fashionSigLIP"
+    assert captured["device"] == "cpu"
+    assert captured["eval"] is True
+
+
+def test_build_team_embedder_selects_legacy_timm_backend_when_explicit(monkeypatch: pytest.MonkeyPatch):
     class FakeModel:
         def to(self, device: str):
             return self
@@ -113,7 +151,7 @@ def test_build_team_embedder_selects_siglip_backend_by_default(monkeypatch: pyte
         lambda: (FakeTorch, FakeTimm, FakeImage),
     )
 
-    assert isinstance(build_team_embedder(), SiglipTeamEmbedder)
+    assert isinstance(build_team_embedder("siglip", model_id="vit_base_patch16_siglip_224"), SiglipTeamEmbedder)
 
 
 def test_build_team_embedder_passes_custom_siglip_model_id(monkeypatch: pytest.MonkeyPatch):
@@ -233,13 +271,183 @@ def test_siglip_team_embedder_uses_visible_torso_crop(monkeypatch: pytest.Monkey
     )
 
     frame = np.zeros((100, 80, 3), dtype=np.uint8)
-    embedder = SiglipTeamEmbedder()
+    embedder = SiglipTeamEmbedder(model_id="vit_base_patch16_siglip_224")
     samples = [TeamEmbeddingSample(detection_id=10, track_id=1, xyxy=(10.0, 20.0, 50.0, 80.0))]
 
     vectors = embedder.embed(frame, samples)
 
     assert captured["images"][0].shape == (16, 22, 3)
     assert vectors[0].embedding == pytest.approx([0.6, 0.8])
+
+
+def test_fashion_siglip_uses_huggingface_image_features_without_downloads(monkeypatch: pytest.MonkeyPatch):
+    import numpy as np
+
+    captured = {}
+
+    class FakeTensor:
+        def to(self, device):
+            captured["input_device"] = device
+            return self
+
+    class FakeModel:
+        def to(self, device):
+            assert device != "meta"
+            captured["model_device"] = device
+            return self
+
+        def eval(self):
+            captured["eval"] = True
+            return self
+
+        def encode_image(self, inputs):
+            captured["model_inputs"] = inputs
+            return np.asarray([[3.0, 4.0], [0.0, 5.0]], dtype=np.float32)
+
+    class FakeOpenClip:
+        @staticmethod
+        def create_model_and_transforms(model_id):
+            captured["model_load"] = model_id
+            return FakeModel(), None, lambda image: FakeTensor()
+
+    class FakeTorch:
+        class cuda:
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        @staticmethod
+        def inference_mode():
+            class _Context:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            return _Context()
+
+        class _Batch(list):
+            def to(self, device):
+                captured["input_device"] = device
+                return self
+
+        @staticmethod
+        def stack(items):
+            return FakeTorch._Batch(items)
+
+    monkeypatch.setattr(
+        "pipeline.team_embedder._load_siglip_components",
+        lambda: (FakeTorch, object(), types.SimpleNamespace(fromarray=lambda array: array)),
+    )
+    monkeypatch.setitem(sys.modules, "open_clip", FakeOpenClip)
+
+    embedder = SiglipTeamEmbedder(model_id="Marqo/marqo-fashionSigLIP")
+    vectors = embedder.embed_crops([np.zeros((4, 4, 3), dtype=np.uint8)] * 2)
+
+    assert captured["model_load"] == "hf-hub:Marqo/marqo-fashionSigLIP"
+    assert captured["model_device"] == "cpu"
+    assert captured["input_device"] == "cpu"
+    assert captured["eval"] is True
+    assert captured["model_inputs"] is not None
+    assert np.asarray(vectors).shape == (2, 2)
+    assert np.asarray(vectors) == pytest.approx(np.asarray([[0.6, 0.8], [0.0, 1.0]]))
+
+
+def test_default_fashion_siglip_embed_extracts_crops_and_propagates_features(monkeypatch: pytest.MonkeyPatch):
+    import numpy as np
+
+    captured = {}
+
+    class FakeTensor:
+        def to(self, device):
+            captured["input_device"] = device
+            return self
+
+    class FakeModel:
+        def to(self, device):
+            assert device != "meta"
+            captured["model_device"] = device
+            return self
+
+        def eval(self):
+            captured["eval"] = True
+            return self
+
+        def encode_image(self, inputs):
+            captured["model_inputs"] = inputs
+            return np.asarray([[3.0, 4.0], [5.0, 12.0]], dtype=np.float32)
+
+    class FakeOpenClip:
+        @staticmethod
+        def create_model_and_transforms(model_id):
+            captured["model_load"] = model_id
+            def transform(image):
+                captured.setdefault("images", []).append(image)
+                return FakeTensor()
+
+            return FakeModel(), None, transform
+
+    class FakeTorch:
+        class cuda:
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        @staticmethod
+        def inference_mode():
+            class _Context:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            return _Context()
+
+        class _Batch(list):
+            def to(self, device):
+                captured["input_device"] = device
+                return self
+
+        @staticmethod
+        def stack(items):
+            return FakeTorch._Batch(items)
+
+    import pipeline.team_embedder as team_embedder_module
+
+    monkeypatch.setattr(
+        team_embedder_module,
+        "_load_siglip_components",
+        lambda: (FakeTorch, object(), types.SimpleNamespace(fromarray=lambda array: array)),
+    )
+    monkeypatch.setitem(sys.modules, "open_clip", FakeOpenClip)
+
+    frame = np.zeros((100, 80, 3), dtype=np.uint8)
+    frame[20:80, 10:50] = (0, 0, 255)
+    samples = [
+        TeamEmbeddingSample(detection_id=10, track_id=1, xyxy=(10.0, 20.0, 50.0, 80.0)),
+        TeamEmbeddingSample(detection_id=11, track_id=2, xyxy=(50.0, 20.0, 80.0, 80.0)),
+    ]
+
+    embedder = build_team_embedder()
+    assert isinstance(embedder, SiglipTeamEmbedder)
+    features = embedder.embed(frame, samples)
+
+    assert captured["model_load"] == "hf-hub:Marqo/marqo-fashionSigLIP"
+    assert captured["images"]
+    assert captured["images"][0].shape == (16, 22, 3)
+    assert captured["model_inputs"] is not None
+    assert captured["model_device"] == captured["input_device"] == "cpu"
+    assert captured["eval"] is True
+    assert len(features) == 2
+    assert all(isinstance(feature, TeamFeatures) for feature in features)
+    assert np.asarray([feature.embedding for feature in features]) == pytest.approx(
+        np.asarray([[0.6, 0.8], [5.0 / 13.0, 12.0 / 13.0]])
+    )
+    assert all(feature.color_signature is not None for feature in features)
+    assert all(feature.quality_score > 0 for feature in features)
+    assert all(feature.debug_crop is not None for feature in features)
 
 
 def test_extract_team_features_prefers_masked_uniform_region():
