@@ -32,6 +32,11 @@ SAM2_COMMIT = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
 
 # Where the Volume holding downloaded model weights is mounted.
 CACHE_DIR = "/cache"
+TRACKNET_VOLUME_DIR = "/tracknet-data"
+TRACKNET_CHECKPOINT = (
+    f"{TRACKNET_VOLUME_DIR}/tracknet-finetune/runs/"
+    "basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt"
+)
 
 app = modal.App("scoutai-pipeline")
 
@@ -39,6 +44,9 @@ app = modal.App("scoutai-pipeline")
 # per job. SAM2 checkpoints are a few hundred MB; re-downloading them on every
 # cold start would add time to each job and, at per-second billing, real money.
 model_cache = modal.Volume.from_name("scoutai-model-cache", create_if_missing=True)
+tracknet_data = modal.Volume.from_name(
+    "tracknet-data", environment_name="main", create_if_missing=False
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -70,10 +78,19 @@ image = (
     # "sam-2" with a hyphen, so the PEP 508 named form fails the name check and
     # pip then falls back to the unrelated third-party `sam2` package on PyPI.
     .pip_install(f"git+https://github.com/facebookresearch/sam2.git@{SAM2_COMMIT}")
-    .env({"HF_HOME": f"{CACHE_DIR}/huggingface"})
-    # Ship our own package into the container. Without this the image has no
-    # `pipeline` module.
+    .env(
+        {
+            "HF_HOME": f"{CACHE_DIR}/huggingface",
+            "TRACKNET_ENABLED": "1",
+            "TRACKNET_CHECKPOINT": TRACKNET_CHECKPOINT,
+             "BALL_ALL_FRAMES": "1",
+        }
+    )
+    # Modal requires add_local_* calls to be the final image build steps.
+    # Ship our own package and TrackNet adapter into the container.
     .add_local_python_source("pipeline")
+    .add_local_file("scripts/ball/tracknet.py", remote_path="/root/scripts/ball/tracknet.py")
+    .add_local_file("scripts/ball/candidates.py", remote_path="/root/scripts/ball/candidates.py")
 )
 
 # Secrets are created once with `modal secret create` (see SETUP.md) and never
@@ -94,6 +111,7 @@ def _run_selected_pipeline(
     output_dir: Path,
     tracker,
     embedder,
+    tracknet_detector=None,
     on_progress=None,
 ):
     if pipeline == MAIN_PIPELINE:
@@ -105,6 +123,7 @@ def _run_selected_pipeline(
             output_dir,
             tracker=tracker,
             embedder=embedder,
+            tracknet_detector=tracknet_detector,
             on_progress=on_progress,
         )
 
@@ -124,6 +143,8 @@ def _build_process_config_overrides(
     max_frames: int | None,
     confidence: float | None,
     target_fps: float | None,
+    ball_target_fps: float | None = None,
+    ball_all_frames: bool | None = None,
     sam2_model_id: str | None,
     max_missed_detections: int | None,
     appearance_weight: float | None,
@@ -136,6 +157,7 @@ def _build_process_config_overrides(
     max_team_samples_per_track: int | None,
     team_debug_enabled: bool | None,
     number_predictor_backend: str | None,
+    tracknet_enabled: bool | None = None,
     write_annotated_video: bool,
 ) -> dict:
     config_overrides = {
@@ -143,6 +165,8 @@ def _build_process_config_overrides(
         "max_frames": max_frames or None,
         "confidence": confidence,
         "target_fps": target_fps,
+        "ball_target_fps": ball_target_fps,
+        "ball_all_frames": ball_all_frames,
         "sam2_model_id": sam2_model_id,
         "max_missed_detections": max_missed_detections,
         "appearance_weight": appearance_weight,
@@ -155,6 +179,7 @@ def _build_process_config_overrides(
         "max_team_samples_per_track": max_team_samples_per_track,
         "team_debug_enabled": team_debug_enabled,
         "number_predictor_backend": number_predictor_backend,
+        "tracknet_enabled": tracknet_enabled,
         "write_annotated_video": True if write_annotated_video else None,
     }
     if pipeline == PLAYER_POSITIONS_PIPELINE:
@@ -260,13 +285,33 @@ def _report_status(
         print(f"[job {job_id}] could not report {status}: {error!r}")
 
 
+def _load_tracknet_detector(*, enabled: bool | None = None):
+    if enabled is None:
+        enabled = os.getenv("TRACKNET_ENABLED", "1").lower() in {"1", "true", "yes"}
+    if not enabled:
+        print("TrackNet disabled; using hosted ball detection compatibility path")
+        return None
+
+    from pipeline.ball import build_tracknet_detector
+
+    checkpoint = Path(os.getenv("TRACKNET_CHECKPOINT", TRACKNET_CHECKPOINT))
+    if not checkpoint.exists():
+        raise RuntimeError(f"TrackNet is enabled but checkpoint is missing: {checkpoint}")
+    try:
+        detector = build_tracknet_detector(checkpoint)
+    except Exception as error:
+        raise RuntimeError(f"Could not load TrackNet checkpoint {checkpoint}: {error}") from error
+    print(f"TrackNet loaded: {checkpoint}")
+    return detector
+
+
 @app.cls(
     image=image,
     # COST: L4 is ~24GB VRAM at roughly a quarter the price of an A100. The
     # pipeline processes one ~16-frame segment at a time, so peak VRAM is a few
     # hundred MB and a bigger GPU would buy nothing but a larger bill.
     gpu="L4",
-    volumes={CACHE_DIR: model_cache},
+    volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data},
     secrets=[roboflow_secret, r2_secret, callback_secret],
     # COST: how long an idle container stays alive after finishing. Long enough
     # that back-to-back jobs reuse a warm container and skip the ~60s model load,
@@ -307,7 +352,16 @@ class Pipeline:
         self.embedder = build_embedder(backend, weights=f"{CACHE_DIR}/reid/osnet_x1_0_msmt17.pt")
         print(f"ReID loaded: {self.embedder.name} on {self.embedder.device}")
 
+        # TrackNet is loaded lazily: player-position jobs do not need its
+        # checkpoint or volume, and should retain their existing cold start.
+        self.tracknet_detector = None
+
         model_cache.commit()
+
+    def _ensure_tracknet_detector(self):
+        if self.tracknet_detector is None:
+            self.tracknet_detector = _load_tracknet_detector(enabled=True)
+        return self.tracknet_detector
 
     @modal.method()
     def process(
@@ -324,6 +378,8 @@ class Pipeline:
         max_frames: int | None = None,
         confidence: float | None = None,
         target_fps: float | None = None,
+        ball_target_fps: float | None = None,
+        ball_all_frames: bool | None = None,
         sam2_model_id: str | None = None,
         max_missed_detections: int | None = None,
         appearance_weight: float | None = None,
@@ -336,6 +392,7 @@ class Pipeline:
         max_team_samples_per_track: int | None = None,
         team_debug_enabled: bool | None = None,
         number_predictor_backend: str | None = None,
+        tracknet_enabled: bool | None = None,
         write_annotated_video: bool = False,
         return_artifacts: bool = False,
     ) -> dict:
@@ -364,6 +421,8 @@ class Pipeline:
             max_frames=max_frames,
             confidence=confidence,
             target_fps=target_fps,
+            ball_target_fps=ball_target_fps,
+            ball_all_frames=ball_all_frames,
             sam2_model_id=sam2_model_id,
             max_missed_detections=max_missed_detections,
             appearance_weight=appearance_weight,
@@ -376,6 +435,7 @@ class Pipeline:
             max_team_samples_per_track=max_team_samples_per_track,
             team_debug_enabled=team_debug_enabled,
             number_predictor_backend=number_predictor_backend,
+            tracknet_enabled=tracknet_enabled,
             write_annotated_video=write_annotated_video,
         )
 
@@ -393,6 +453,12 @@ class Pipeline:
             print(f"Loading requested SAM2 checkpoint for this job: {sam2_model_id}")
             tracker = Sam2SegmentTracker(sam2_model_id)
 
+        tracknet_detector = (
+            self._ensure_tracknet_detector()
+            if pipeline == MAIN_PIPELINE and config.tracknet_enabled
+            else None
+        )
+
         try:
             return self._run_job(
                 pipeline=pipeline,
@@ -402,6 +468,7 @@ class Pipeline:
                 output_prefix=output_prefix,
                 config=config,
                 tracker=tracker,
+                tracknet_detector=tracknet_detector,
                 return_artifacts=return_artifacts,
             )
         except Exception as error:
@@ -420,6 +487,7 @@ class Pipeline:
         output_prefix: str | None,
         config,
         tracker,
+        tracknet_detector,
         return_artifacts: bool,
     ) -> dict:
         with tempfile.TemporaryDirectory(prefix="job_") as work_dir:
@@ -446,6 +514,7 @@ class Pipeline:
                 output_dir=output_dir,
                 tracker=tracker,
                 embedder=self.embedder,
+                tracknet_detector=tracknet_detector,
                 on_progress=_progress_reporter(job_id),
             )
             payload = results.to_dict() if hasattr(results, "to_dict") else dict(results)
@@ -525,6 +594,9 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
         frame_stride=payload.get("frame_stride"),
         max_frames=payload.get("max_frames"),
         confidence=payload.get("confidence"),
+        target_fps=payload.get("target_fps"),
+        ball_target_fps=payload.get("ball_target_fps"),
+        ball_all_frames=payload.get("ball_all_frames"),
         team_embedder_backend=payload.get("team_embedder_backend"),
         team_embedder_model_id=payload.get("team_embedder_model_id"),
         team_count=payload.get("team_count"),
@@ -534,6 +606,7 @@ def submit(payload: dict, authorization: str = Header(default="")) -> dict:
         max_team_samples_per_track=payload.get("max_team_samples_per_track"),
         team_debug_enabled=payload.get("team_debug_enabled"),
         number_predictor_backend=payload.get("number_predictor_backend"),
+        tracknet_enabled=payload.get("tracknet_enabled", True),
         write_annotated_video=bool(payload.get("write_annotated_video", False)),
     )
     return {"call_id": call.object_id, "status": "queued"}
@@ -550,6 +623,8 @@ def main(
     max_frames: int = 0,
     confidence: float = -1.0,
     target_fps: float = 0.0,
+    ball_target_fps: float = 0.0,
+    ball_all_frames: bool | None = None,
     native_fps: bool = False,
     sam2_model_id: str = "",
     max_missed_detections: int = -1,
@@ -563,6 +638,7 @@ def main(
     max_team_samples_per_track: int = 0,
     team_debug_enabled: bool | None = None,
     number_predictor_backend: str = "",
+    tracknet_enabled: bool = True,
     annotated: bool = False,
 ) -> None:
     """Run one job without deploying. Start here.
@@ -601,6 +677,8 @@ def main(
         # separate flag because 0.0 cannot be told apart from "not supplied"
         # once it reaches the config's override filter.
         "target_fps": 0.0 if native_fps else (target_fps or None),
+        "ball_target_fps": ball_target_fps or None,
+        "ball_all_frames": ball_all_frames,
         "sam2_model_id": sam2_model_id or None,
         "max_missed_detections": None if max_missed_detections < 0 else max_missed_detections,
         "appearance_weight": None if appearance_weight < 0 else appearance_weight,
@@ -613,6 +691,7 @@ def main(
         "max_team_samples_per_track": max_team_samples_per_track or None,
         "team_debug_enabled": team_debug_enabled,
         "number_predictor_backend": number_predictor_backend or None,
+        "tracknet_enabled": tracknet_enabled,
         "write_annotated_video": annotated,
         "return_artifacts": destination is not None,
     }

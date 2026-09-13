@@ -51,6 +51,10 @@ DEFAULT_FRAME_STRIDE = 10
 # costs ~3 GPU-hours per 10 minutes if every frame is processed. At 15fps that
 # drops to ~45 minutes. Set to None to disable downsampling.
 DEFAULT_TARGET_FPS = 15.0
+# TrackNet's primary mode is source-frame based, not FPS based. The optional FPS
+# value remains only as a compatibility override when ball_all_frames is false.
+DEFAULT_BALL_TARGET_FPS = None
+DEFAULT_BALL_ALL_FRAMES = True
 
 # Minimum IoU to keep an existing track ID when re-seeding from detector boxes.
 # Matches the original local script's default; changing it changes tracking output.
@@ -84,6 +88,11 @@ DEFAULT_MAX_TEAM_SAMPLES_PER_TRACK = 12
 DEFAULT_NUMBER_PREDICTOR_BACKEND = "dummy"
 DEFAULT_NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID = "basketball-jersey-numbers-ocr/6"
 DEFAULT_NUMBER_PREDICTOR_SCORE_THRESHOLD = 0.7
+DEFAULT_TRACKNET_CONTEXT_SIZE = 8
+DEFAULT_TRACKNET_INPUT_SIZE = (512, 288)
+DEFAULT_TRACKNET_SEED_RADIUS = 12.0
+DEFAULT_TRACKNET_HEATMAP_THRESHOLD = 0.5
+DEFAULT_TRACKNET_FALLBACK_BUDGET = 12
 
 DEFAULT_ROBOFLOW_API_URL = "https://serverless.roboflow.com"
 DEFAULT_PLAYER_MODEL_ID = "basketball-player-detection-3-ycjdo/16"
@@ -128,6 +137,10 @@ class PipelineConfig:
     # saving. Player positions 66ms apart are more than enough for scouting
     # stats. Set to None to process every frame (4x the cost on 60fps video).
     target_fps: float | None = DEFAULT_TARGET_FPS
+    ball_target_fps: float | None = DEFAULT_BALL_TARGET_FPS
+    # TrackNet normally consumes every decoded source frame. Set false only for
+    # the legacy ball_target_fps compatibility mode.
+    ball_all_frames: bool = DEFAULT_BALL_ALL_FRAMES
     shot_target_fps: float | None = None
 
     # Run the detector every N *processed* frames. Note this is in processed
@@ -147,6 +160,14 @@ class PipelineConfig:
     # --- SAM2 ---
     sam2_model_id: str = DEFAULT_SAM2_MODEL_ID
     sam2_match_iou: float = DEFAULT_MATCH_IOU
+
+    # Optional local temporal ball detector. Disabled by default so hosted
+    # ball detection and Modal remain unchanged.
+    tracknet_enabled: bool = False
+    tracknet_checkpoint: str | None = None
+    tracknet_seed_radius: float = DEFAULT_TRACKNET_SEED_RADIUS
+    tracknet_heatmap_threshold: float = DEFAULT_TRACKNET_HEATMAP_THRESHOLD
+    tracknet_fallback_budget: int = DEFAULT_TRACKNET_FALLBACK_BUDGET
 
     # How many consecutive detector calls a track may go unmatched before it is
     # retired. Detectors routinely miss a player for one frame (occlusion, an
@@ -241,8 +262,16 @@ class PipelineConfig:
             raise ValueError("shot_frame_stride must be at least 1")
         if self.max_frames is not None and self.max_frames < 1:
             raise ValueError("max_frames must be at least 1 when set")
+        if self.ball_target_fps is not None and self.ball_target_fps <= 0:
+            raise ValueError("ball_target_fps must be positive when set")
         if not 0.0 <= self.sam2_match_iou <= 1.0:
             raise ValueError("sam2_match_iou must be between 0 and 1")
+        if self.tracknet_seed_radius <= 0:
+            raise ValueError("tracknet_seed_radius must be greater than 0")
+        if not 0.0 <= self.tracknet_heatmap_threshold <= 1.0:
+            raise ValueError("tracknet_heatmap_threshold must be between 0 and 1")
+        if self.tracknet_fallback_budget < 0:
+            raise ValueError("tracknet_fallback_budget must be at least 0")
         if self.team_count < 1:
             raise ValueError("team_count must be at least 1")
         if self.min_team_samples_per_track < 1:
@@ -283,7 +312,18 @@ class PipelineConfig:
             "shot_model_id": os.getenv("SHOT_MODEL_ID", DEFAULT_SHOT_MODEL_ID),
             "court_model_id": os.getenv("COURT_MODEL_ID", DEFAULT_COURT_MODEL_ID),
             "sam2_model_id": os.getenv("SAM2_MODEL_ID", DEFAULT_SAM2_MODEL_ID),
+            "tracknet_enabled": os.getenv("TRACKNET_ENABLED", "0").lower() in {"1", "true", "yes"},
+            "tracknet_checkpoint": os.getenv("TRACKNET_CHECKPOINT") or None,
+            "tracknet_seed_radius": _env_float("TRACKNET_SEED_RADIUS", DEFAULT_TRACKNET_SEED_RADIUS),
+            "tracknet_heatmap_threshold": _env_float(
+                "TRACKNET_HEATMAP_THRESHOLD", DEFAULT_TRACKNET_HEATMAP_THRESHOLD
+            ),
+            "tracknet_fallback_budget": _env_int(
+                "TRACKNET_FALLBACK_BUDGET", DEFAULT_TRACKNET_FALLBACK_BUDGET
+            ),
             "shot_target_fps": _env_optional_float("SHOT_TARGET_FPS"),
+            "ball_target_fps": _env_optional_float("BALL_TARGET_FPS"),
+            "ball_all_frames": os.getenv("BALL_ALL_FRAMES", "1").lower() in {"1", "true", "yes"},
             "shot_frame_stride": _env_int("SHOT_FRAME_STRIDE", DEFAULT_SHOT_FRAME_STRIDE),
             "court_keypoint_confidence": _env_float(
                 "COURT_KEYPOINT_CONFIDENCE", DEFAULT_COURT_KEYPOINT_CONFIDENCE

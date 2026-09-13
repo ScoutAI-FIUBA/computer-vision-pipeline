@@ -19,6 +19,17 @@ from pathlib import Path
 from typing import Callable
 
 from pipeline import appearance
+from pipeline.ball import (
+    ball_track_record,
+    ball_rows_from_result,
+    build_tracknet_detector,
+    candidate_to_ball_row,
+    filter_ball_rows,
+    reconcile_ball_track_id,
+    select_seed_ball_rows,
+    TRACKNET_CONTEXT_SIZE,
+    write_ball_track_rows,
+)
 from pipeline.config import PipelineConfig
 from pipeline.court_projection import compute_frame_homography, parse_court_keypoints, project_points
 from pipeline.detection import PrefetchingDetector, build_detector, detections_from_result
@@ -57,6 +68,7 @@ from pipeline.tracking import (
     detection_rows,
 )
 from pipeline.video import AnnotatedVideoWriter, frame_step_for, iter_segments, probe
+from scripts.ball.tracknet import padded_window
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +81,7 @@ NUMBERS_FILENAME = "numbers.json"
 SHOT_EVENTS_FILENAME = "shot_events.jsonl"
 SHOT_SIGNALS_FILENAME = "shot_signals.jsonl"
 SHOT_RAW_PREDICTIONS_FILENAME = "shot_raw_predictions.jsonl"
+BALL_TRACKS_FILENAME = "ball_tracks.jsonl"
 PROJECTED_TRACKS_FILENAME = "projected_tracks.jsonl"
 PROJECTED_SHOTS_FILENAME = "projected_shots.json"
 PROJECTED_SHOTS_IMAGE_FILENAME = "projected_shots.png"
@@ -147,7 +160,7 @@ def _collect_team_evidence(
     team_embedder,
     evidence_by_track_id: dict[int, list[TeamEvidenceSample]],
     min_quality: float,
-) -> None:
+) -> int:
     samples = [
         TeamEmbeddingSample(
             detection_id=index,
@@ -220,6 +233,162 @@ def _iter_track_rows_by_frame(tracks_path: Path):
             current_rows.append(record)
     if current_frame_index is not None:
         yield current_frame_index, current_rows
+
+
+def _annotated_frame_rows(
+    track_rows: list[dict],
+    *,
+    confirmed_numbers_by_track_id: dict[int, str],
+    ball_rows: list[dict] | None = None,
+) -> list[dict]:
+    rows = [
+        {
+            **row,
+            **(
+                {"confirmed_number": confirmed_numbers_by_track_id[int(row["track_id"])]}
+                if row.get("track_id") is not None
+                and int(row["track_id"]) in confirmed_numbers_by_track_id
+                else {}
+            ),
+        }
+        for row in track_rows
+    ]
+    if ball_rows:
+        rows.extend(dict(row) for row in ball_rows)
+    return rows
+
+
+def _cap_ball_fallback_rows(rows: list[dict], remaining: int) -> tuple[list[dict], int]:
+    capped: list[dict] = []
+    emitted = 0
+    for row in rows:
+        if row.get("track_state") != "fallback" or emitted < remaining:
+            capped.append(row)
+            if row.get("track_state") == "fallback":
+                emitted += 1
+            continue
+        capped.append({**row, "track_state": "lost", "confidence": None, "xyxy": None})
+    return capped, emitted
+
+
+def _collect_tracknet_rows(
+    video_path: Path,
+    *,
+    info,
+    config: PipelineConfig,
+    detector,
+    tracker,
+    player_step: int,
+    output_path: Path,
+) -> None:
+    """Run TrackNet plus bounded ball-only SAM2 fallback on a dense stream."""
+    from scripts.ball.candidates import extract_candidates
+
+    ball_step = 1 if config.ball_all_frames else frame_step_for(info.fps, config.ball_target_fps)
+    ball_max_frames = None
+    if config.max_frames is not None:
+        ball_max_frames = (config.max_frames * player_step + ball_step - 1) // ball_step
+
+    # Keep only the temporal window and the immediately previous frame. The
+    # JSONL is the merge boundary; it avoids retaining a whole match in RAM.
+    frames_by_index: dict[int, object] = {}
+    indices: list[int] = []
+    previous_frame = None
+    active_rows: list[dict] = []
+    next_track_id = 1
+    fallback_remaining = 0
+    records = 0
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as output:
+        for segment in iter_segments(
+            video_path, frame_stride=1, max_frames=ball_max_frames, frame_step=ball_step
+        ):
+            for frame, frame_index in zip(segment.frames, segment.frame_indices):
+                if frame_index in frames_by_index:
+                    continue
+                frames_by_index[frame_index] = frame
+                indices.append(frame_index)
+                window_indices = padded_window(indices, len(indices) - 1, TRACKNET_CONTEXT_SIZE)
+                prediction = detector.predict(
+                    [frames_by_index[index] for index in window_indices], window_indices
+                )
+                candidates = extract_candidates(
+                    prediction.heatmap,
+                    original_frame_size=prediction.source_frame_size,
+                    min_score=config.tracknet_heatmap_threshold,
+                    min_distance=config.tracknet_seed_radius,
+                    max_candidates=1,
+                )
+                rows = (
+                    [
+                        candidate_to_ball_row(
+                            candidates[0],
+                            frame_size=prediction.source_frame_size,
+                            radius=config.tracknet_seed_radius,
+                        )
+                    ]
+                    if candidates else []
+                )
+                if rows:
+                    rows, next_track_id = reconcile_ball_track_id(rows, active_rows, next_track_id)
+                    active_rows = rows
+                    fallback_remaining = config.tracknet_fallback_budget
+                elif active_rows and previous_frame is not None and fallback_remaining > 0:
+                    fallback_seed = {**active_rows[0], "track_state": "fallback"}
+                    propagated = tracker.propagate_segment([previous_frame, frame], [fallback_seed])
+                    rows = filter_ball_rows(propagated.get(1, []))
+                    if rows:
+                        rows[0]["track_state"] = "fallback"
+                        active_rows = rows
+                        fallback_remaining -= 1
+                if not rows:
+                    rows = [{
+                        "track_id": active_rows[0].get("track_id") if active_rows else None,
+                        "track_state": "lost",
+                        "class_name": "ball",
+                        "confidence": None,
+                        "xyxy": None,
+                    }]
+                record = ball_track_record(
+                    frame_index,
+                    rows[0],
+                    timestamp_seconds=_frame_timestamp_seconds(frame_index, info.fps),
+                )
+                output.write(json.dumps(record) + "\n")
+                records += 1
+
+                # The temporal window is causal; discard frames older than it.
+                previous_frame = frame
+                while len(indices) > TRACKNET_CONTEXT_SIZE:
+                    old_index = indices.pop(0)
+                    frames_by_index.pop(old_index, None)
+    return records
+
+
+class _BallRecordReader:
+    """Forward-only lookup for dense TrackNet records during player playback."""
+
+    def __init__(self, path: Path) -> None:
+        self._source = path.open("r", encoding="utf-8")
+        self._pending = self._next()
+
+    def _next(self) -> dict | None:
+        line = self._source.readline()
+        return json.loads(line) if line else None
+
+    def take(self, frame_index: int) -> tuple[bool, list[dict]]:
+        while self._pending is not None and self._pending["frame_index"] < frame_index:
+            self._pending = self._next()
+        if self._pending is None or self._pending["frame_index"] != frame_index:
+            return False, []
+        row = self._pending
+        self._pending = self._next()
+        # Presence is separate from drawable rows: an authoritative lost row
+        # must suppress SAM2 propagation at this exact source frame.
+        return True, ([] if row.get("xyxy") is None else [row])
+
+    def close(self) -> None:
+        self._source.close()
 
 
 def _load_confirmed_numbers_by_track_id(numbers_path: Path) -> dict[int, str]:
@@ -322,12 +491,19 @@ def _render_annotated_video(
     max_frames: int | None,
     frame_step: int,
     fps: float,
+    ball_tracks_path: Path | None = None,
 ) -> None:
     from pipeline.annotate import draw_tracks
 
     confirmed_numbers_by_track_id = _load_confirmed_numbers_by_track_id(numbers_path)
     rows_by_frame = _iter_track_rows_by_frame(tracks_path)
+    ball_rows = (
+        _iter_track_rows_by_frame(ball_tracks_path)
+        if ball_tracks_path is not None and ball_tracks_path.exists()
+        else iter(())
+    )
     pending = next(rows_by_frame, None)
+    pending_ball = next(ball_rows, None)
 
     with AnnotatedVideoWriter(output_path, info, fps=fps) as writer:
         for segment in iter_segments(
@@ -339,32 +515,31 @@ def _render_annotated_video(
             last_offset = len(segment.frames) - 1 if segment.is_last else len(segment.frames) - 2
             for offset in range(last_offset + 1):
                 frame_index = segment.frame_indices[offset]
-                rows = []
+                track_rows = []
                 if pending is not None and pending[0] == frame_index:
-                    rows = [
-                        {
-                            **row,
-                            **(
-                                {"confirmed_number": confirmed_numbers_by_track_id[int(row["track_id"])]}
-                                if row.get("track_id") is not None and int(row["track_id"]) in confirmed_numbers_by_track_id
-                                else {}
-                            ),
-                        }
-                        for row in pending[1]
-                    ]
+                    track_rows = pending[1]
                     pending = next(rows_by_frame, None)
                 elif pending is not None and pending[0] < frame_index:
                     raise RuntimeError(
                         f"tracks.jsonl is out of sync with processed frames at frame {frame_index}"
                     )
+                while pending_ball is not None and pending_ball[0] < frame_index:
+                    pending_ball = next(ball_rows, None)
+                current_ball_rows = []
+                if pending_ball is not None and pending_ball[0] == frame_index:
+                    current_ball_rows = pending_ball[1]
+                    pending_ball = next(ball_rows, None)
+                rows = _annotated_frame_rows(
+                    track_rows,
+                    confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+                    ball_rows=current_ball_rows,
+                )
                 writer.write(draw_tracks(segment.frames[offset], rows))
 
     if pending is not None:
         raise RuntimeError(
             f"tracks.jsonl has extra frame rows starting at frame {pending[0]}"
         )
-
-
 def _write_shot_events(video_path: Path, output_path: Path, *, info, step: int, config: PipelineConfig) -> None:
     detector = _build_detector_for_model(config, model_id=config.shot_model_id)
     active_shot_event = None
@@ -432,6 +607,7 @@ def run_pipeline(
     *,
     tracker: Sam2SegmentTracker | None = None,
     embedder: Embedder | None = None,
+    tracknet_detector=None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> PipelineResults:
     """Run detection + SAM2 tracking over `video_path`, writing into `output_dir`.
@@ -465,6 +641,13 @@ def run_pipeline(
         effective_fps,
     )
 
+    if config.tracknet_enabled:
+        if tracknet_detector is None and not config.tracknet_checkpoint:
+            raise RuntimeError("TrackNet is enabled but TRACKNET_CHECKPOINT is not configured")
+        if tracknet_detector is None:
+            tracknet_detector = build_tracknet_detector(config.tracknet_checkpoint)
+    else:
+        tracknet_detector = None
     tracker = tracker or Sam2SegmentTracker(config.sam2_model_id)
     detector = _build_detector_for_model(config)
     court_detector = (
@@ -491,6 +674,26 @@ def run_pipeline(
     team_evidence_by_track_id: dict[int, list[TeamEvidenceSample]] = {}
     number_evidence_by_track_id: dict[int, list] = {}
     number_predictor = build_number_predictor(config)
+    active_ball_rows: list[dict] = []
+    next_ball_track_id = 1
+    ball_missed_counts: dict[int, int] = {}
+    ball_fallback_frames_remaining = 0
+    ball_track_records = 0
+    tracknet_output_path = output_dir / BALL_TRACKS_FILENAME
+    tracknet_reader = None
+    ball_rows_by_frame: dict[int, list[dict]] = {}
+
+    if tracknet_detector is not None:
+        ball_track_records = _collect_tracknet_rows(
+            video_path,
+            info=info,
+            config=config,
+            detector=tracknet_detector,
+            tracker=tracker,
+            player_step=step,
+            output_path=tracknet_output_path,
+        )
+        tracknet_reader = _BallRecordReader(tracknet_output_path)
 
     annotated_path = output_dir / ANNOTATED_FILENAME if config.write_annotated_video else None
     projected_tracks_path = output_dir / PROJECTED_TRACKS_FILENAME
@@ -503,7 +706,9 @@ def run_pipeline(
             projected_context = (
                 projected_tracks_path.open("w", encoding="utf-8") if court_detector is not None else nullcontext()
             )
-            with projected_context as projected_tracks_file:
+            with projected_context as projected_tracks_file, (output_dir / BALL_TRACKS_FILENAME).open(
+                "a" if tracknet_detector is not None else "w", encoding="utf-8"
+            ) as ball_tracks_file:
                 for segment in iter_segments(
                     video_path,
                     frame_stride=config.frame_stride,
@@ -513,6 +718,10 @@ def run_pipeline(
                     frames = segment.frames
                     indices = segment.frame_indices
 
+                    tracknet_present, tracknet_rows = (
+                        tracknet_reader.take(indices[0]) if tracknet_reader else (False, [])
+                    )
+
                     # --- detect on the segment's first frame -------------------
                     result = prefetch.take(frames[0]) if prefetch else detector.detect(frames[0])
                     detections = detections_from_result(
@@ -521,6 +730,56 @@ def run_pipeline(
                         allowed_classes=config.allowed_classes,
                     )
                     player_rows, number_rows = _split_detection_rows(detection_rows(detections))
+                    detected_ball_rows = (
+                        tracknet_rows
+                        if tracknet_detector is not None
+                        else ball_rows_from_result(
+                            result,
+                            min_confidence=config.confidence,
+                            detections_from_result=detections_from_result,
+                            detection_rows=detection_rows,
+                        )
+                    )
+                    seed_ball_rows = select_seed_ball_rows(
+                        detected_ball_rows,
+                        active_rows=active_ball_rows,
+                        min_match_iou=config.sam2_match_iou,
+                    )
+                    tracknet_detected = bool(tracknet_rows) if tracknet_detector is not None else False
+                    lost_ball_rows: list[dict] = []
+                    if seed_ball_rows:
+                        if tracknet_detector is not None:
+                            seed_ball_rows, next_ball_track_id = reconcile_ball_track_id(
+                                seed_ball_rows, active_ball_rows, next_ball_track_id
+                            )
+                        else:
+                            seed_ball_rows, next_ball_track_id = assign_track_ids(
+                                seed_ball_rows, active_ball_rows, next_ball_track_id, config.sam2_match_iou
+                            )
+                        ball_missed_counts.clear()
+                        if tracknet_detector is not None:
+                            ball_fallback_frames_remaining = config.tracknet_fallback_budget
+                    elif tracknet_detector is None:
+                        seed_ball_rows = carry_unmatched_tracks(
+                            [], active_ball_rows, ball_missed_counts, config.max_missed_detections
+                        )
+                    elif tracknet_present:
+                        # An authoritative lost row suppresses SAM2 at this
+                        # exact source frame; fallback resumes only when the
+                        # dense reader has no row for a frame.
+                        seed_ball_rows = []
+                    elif active_ball_rows and ball_fallback_frames_remaining > 0:
+                        seed_ball_rows = [{**active_ball_rows[0], "track_state": "fallback"}]
+                    elif tracknet_detector is not None and active_ball_rows:
+                        lost_ball_rows = [
+                            {
+                                "track_id": active_ball_rows[0].get("track_id"),
+                                "track_state": "lost",
+                                "class_name": "ball",
+                                "confidence": None,
+                                "xyxy": None,
+                            }
+                        ]
 
                 # Describe each detection before matching. The embedder returns
                 # None for players too occluded to describe, so crossings degrade
@@ -599,6 +858,7 @@ def run_pipeline(
                         seed_rows, active_rows, missed_counts, config.max_missed_detections
                     )
                     seed_rows_with_teams = _with_team_ids(seed_rows, {})
+                    combined_seed_rows = seed_rows + seed_ball_rows
 
                     if court_detector is not None and projected_tracks_file is not None and seed_rows:
                         try:
@@ -630,11 +890,15 @@ def run_pipeline(
                         prefetch.submit(frames[-1])
 
                 # --- propagate through the segment -------------------------
-                    propagated = tracker.propagate_segment(frames, seed_rows)
+                    propagated = tracker.propagate_segment(frames, combined_seed_rows)
                     for offset in range(1, len(frames)):
                         if offset % config.team_sample_stride != 0:
                             continue
-                        propagated_rows = propagated.get(offset, [])
+                        propagated_rows = [
+                            row
+                            for row in propagated.get(offset, [])
+                            if str(row.get("class_name", "player")) == "player"
+                        ]
                         if not propagated_rows:
                             continue
                         _collect_team_evidence(
@@ -655,16 +919,86 @@ def run_pipeline(
                 # downsampling never changes what a record refers to.
                 # When the detector finds nothing, the frame keeps whatever SAM2
                 # was already carrying, matching the original script's behaviour.
+                    seed_ball_rows, emitted_fallback_frames = _cap_ball_fallback_rows(
+                        seed_ball_rows, ball_fallback_frames_remaining
+                    )
+                    ball_fallback_frames_remaining -= emitted_fallback_frames
+                    if tracknet_detector is None:
+                        ball_rows_by_frame[indices[0]] = seed_ball_rows + lost_ball_rows
                     tracks.write_frame(indices[0], seed_rows_with_teams or _with_team_ids(active_rows, {}))
                     for offset in range(1, last_offset + 1):
-                        tracks.write_frame(indices[offset], _with_team_ids(propagated.get(offset, []), {}))
+                        frame_index = indices[offset]
+                        authoritative_present, authoritative_rows = (
+                            tracknet_reader.take(frame_index) if tracknet_reader else (False, [])
+                        )
+                        propagated_ball_rows = filter_ball_rows(propagated.get(offset, []))
+                        if authoritative_present:
+                            ball_rows = [dict(authoritative_rows[0])] if authoritative_rows else []
+                            if not ball_rows:
+                                # TrackNet explicitly reported lost; do not let
+                                # the propagated ball replace that source row.
+                                propagated_ball_rows = []
+                            else:
+                                prior_ball_rows = seed_ball_rows or active_ball_rows
+                                if prior_ball_rows and prior_ball_rows[0].get("track_id") is not None:
+                                    ball_rows[0]["track_id"] = prior_ball_rows[0]["track_id"]
+                                else:
+                                    ball_rows, next_ball_track_id = reconcile_ball_track_id(
+                                        ball_rows, [], next_ball_track_id
+                                    )
+                                ball_fallback_frames_remaining = config.tracknet_fallback_budget
+                        else:
+                            ball_rows = [
+                                {**row, "track_state": "fallback"}
+                                for row in propagated_ball_rows
+                            ] if tracknet_detector is not None else propagated_ball_rows
+                            if tracknet_detector is not None and not ball_rows and active_ball_rows:
+                                ball_rows = [
+                                    {
+                                        "track_id": active_ball_rows[0].get("track_id"),
+                                        "track_state": "lost",
+                                        "class_name": "ball",
+                                        "confidence": None,
+                                        "xyxy": None,
+                                    }
+                                ]
+                        ball_rows, emitted_fallback = _cap_ball_fallback_rows(
+                            ball_rows, ball_fallback_frames_remaining
+                        )
+                        ball_fallback_frames_remaining -= emitted_fallback
+                        if tracknet_detector is None:
+                            ball_rows_by_frame[frame_index] = ball_rows
+                        tracks.write_frame(
+                            indices[offset],
+                            _with_team_ids(
+                                [
+                                    row
+                                    for row in propagated.get(offset, [])
+                                    if str(row.get("class_name", "player")) == "player"
+                                ],
+                                {},
+                            ),
+                        )
 
                     active_rows = [] if segment.is_last else propagated.get(len(frames) - 1, [])
+                    active_ball_rows = [] if segment.is_last else filter_ball_rows(propagated.get(len(frames) - 1, []))
+                    active_rows = [
+                        row for row in active_rows if str(row.get("class_name", "player")) == "player"
+                    ]
 
                     summary.segments_processed += 1
                     summary.frames_processed += last_offset + 1
                     if on_progress is not None:
                         on_progress(summary.frames_processed, expected_frames)
+
+                if tracknet_detector is None:
+                    for frame_index in sorted(ball_rows_by_frame):
+                        ball_track_records += write_ball_track_rows(
+                            ball_tracks_file,
+                            frame_index=frame_index,
+                            rows=ball_rows_by_frame[frame_index],
+                            timestamp_seconds=_frame_timestamp_seconds(frame_index, info.fps),
+                        )
 
             summary.track_records = tracks.record_count
             summary.distinct_track_ids = len(tracks.track_ids)
@@ -672,6 +1006,8 @@ def run_pipeline(
     finally:
         if prefetch is not None:
             prefetch.close()
+        if tracknet_reader is not None:
+            tracknet_reader.close()
 
     summary.detector_calls = detector.call_count
     summary.wall_seconds = round(time.monotonic() - started, 2)
@@ -715,6 +1051,9 @@ def run_pipeline(
             "target_fps": config.target_fps,
             "frame_step": step,
             "effective_fps": round(effective_fps, 2),
+            "ball_target_fps": config.ball_target_fps,
+            "ball_all_frames": config.ball_all_frames,
+            "ball_frame_step": 1 if config.ball_all_frames else frame_step_for(info.fps, config.ball_target_fps),
             "shot_target_fps": config.shot_target_fps,
             "shot_frame_step": shot_step,
             "shot_effective_fps": round(shot_effective_fps, 2),
@@ -727,6 +1066,13 @@ def run_pipeline(
             "court_keypoint_confidence": config.court_keypoint_confidence,
             "sam2_model_id": config.sam2_model_id,
             "sam2_match_iou": config.sam2_match_iou,
+            "tracknet_enabled": config.tracknet_enabled,
+            "tracknet_checkpoint": config.tracknet_checkpoint,
+            "tracknet_context_size": TRACKNET_CONTEXT_SIZE if tracknet_detector is not None else None,
+            "tracknet_input_size": [512, 288] if tracknet_detector is not None else None,
+            "tracknet_seed_radius": config.tracknet_seed_radius,
+            "tracknet_heatmap_threshold": config.tracknet_heatmap_threshold,
+            "tracknet_fallback_budget": config.tracknet_fallback_budget,
             "max_frames": config.max_frames,
             "max_missed_detections": config.max_missed_detections,
             "reid_backend": getattr(embedder, "name", config.reid_backend),
@@ -747,6 +1093,7 @@ def run_pipeline(
         teams_file=TEAMS_FILENAME,
         numbers_file=NUMBERS_FILENAME,
         shot_events_file=SHOT_EVENTS_FILENAME,
+        ball_tracks_file=BALL_TRACKS_FILENAME if ball_track_records > 0 else None,
         projected_tracks_file=PROJECTED_TRACKS_FILENAME if projected_track_records > 0 else None,
         annotated_video_file=ANNOTATED_FILENAME if annotated_path else None,
     )
@@ -791,6 +1138,7 @@ def run_pipeline(
             max_frames=config.max_frames,
             frame_step=step,
             fps=effective_fps,
+            ball_tracks_path=output_dir / BALL_TRACKS_FILENAME,
         )
 
     (output_dir / TEAMS_FILENAME).write_text(

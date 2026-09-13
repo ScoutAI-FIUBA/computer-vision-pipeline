@@ -75,6 +75,25 @@ def test_from_env_reads_shot_target_fps(monkeypatch: pytest.MonkeyPatch):
     assert config.shot_target_fps == 7.5
 
 
+def test_ball_stream_defaults_to_source_frames_without_changing_player_cadence(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.delenv("BALL_TARGET_FPS", raising=False)
+    monkeypatch.delenv("BALL_ALL_FRAMES", raising=False)
+
+    config = PipelineConfig.from_env()
+
+    assert config.target_fps == 15.0
+    assert config.ball_all_frames is True
+    assert config.ball_target_fps is None
+
+    monkeypatch.setenv("BALL_TARGET_FPS", "24")
+    assert PipelineConfig.from_env().ball_target_fps == 24.0
+    monkeypatch.setenv("BALL_ALL_FRAMES", "0")
+    compatibility = PipelineConfig.from_env()
+    assert compatibility.ball_all_frames is False
+    assert compatibility.ball_target_fps == 24.0
+
+
 def test_from_env_defaults_court_projection_settings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
 
@@ -164,6 +183,30 @@ def test_submit_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch)
     assert captured["number_predictor_backend"] == "dummy"
 
 
+def test_submit_passes_tracknet_enabled(monkeypatch: pytest.MonkeyPatch):
+    import modal_app
+
+    monkeypatch.setenv("MODAL_WEBHOOK_TOKEN", "secret")
+    captured: dict[str, object] = {}
+
+    def spawn(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(object_id="call-1")
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(spawn=spawn)),
+    )
+
+    modal_app.submit.get_raw_f()(
+        {"r2_key": "videos/game.mp4", "tracknet_enabled": False},
+        authorization="Bearer secret",
+    )
+
+    assert captured["tracknet_enabled"] is False
+
+
 def test_submit_passes_pipeline_selector(monkeypatch: pytest.MonkeyPatch):
     import modal_app
 
@@ -186,6 +229,7 @@ def test_submit_passes_pipeline_selector(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert captured["pipeline"] == "player-positions"
+    assert captured["tracknet_enabled"] is True
 
 
 def test_main_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -208,6 +252,28 @@ def test_main_passes_number_predictor_backend(monkeypatch: pytest.MonkeyPatch, t
     modal_app.main(video_path=str(video_path), number_predictor_backend="dummy")
 
     assert captured["number_predictor_backend"] == "dummy"
+
+
+def test_main_passes_tracknet_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import modal_app
+
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"clip")
+    captured: dict[str, object] = {}
+
+    def remote(**kwargs):
+        captured.update(kwargs)
+        return {"summary": {}}
+
+    monkeypatch.setattr(
+        modal_app,
+        "Pipeline",
+        lambda: types.SimpleNamespace(process=types.SimpleNamespace(remote=remote)),
+    )
+
+    modal_app.main(video_path=str(video_path), tracknet_enabled=False)
+
+    assert captured["tracknet_enabled"] is False
 
 
 def test_main_passes_pipeline_selector(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

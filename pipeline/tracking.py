@@ -299,8 +299,9 @@ class Sam2SegmentTracker:
         if not seed_rows or len(frames) < 2:
             return {}
 
-        confidence_by_track_id = {int(row["track_id"]): row["confidence"] for row in seed_rows}
-        class_name_by_track_id = {int(row["track_id"]): row["class_name"] for row in seed_rows}
+        # One namespace per SAM2 state; enumerate the combined player + ball
+        # seeds so ball objects cannot collide with player objects internally.
+        seed_by_obj_id = {obj_id: row for obj_id, row in enumerate(seed_rows, start=1)}
 
         with self._torch.inference_mode(), self._autocast:
             with tempfile.TemporaryDirectory(prefix="sam2seg_") as temp_dir:
@@ -312,11 +313,11 @@ class Sam2SegmentTracker:
                     async_loading_frames=False,
                 )
 
-                for row in seed_rows:
+                for obj_id, row in seed_by_obj_id.items():
                     self._predictor.add_new_points_or_box(
                         inference_state=state,
                         frame_idx=0,
-                        obj_id=int(row["track_id"]),
+                        obj_id=obj_id,
                         box=np.asarray(row["xyxy"], dtype=np.float32),
                     )
 
@@ -332,7 +333,7 @@ class Sam2SegmentTracker:
 
                     rows = []
                     for mask_index, obj_id in enumerate(obj_ids):
-                        track_id = int(obj_id)
+                        seed = seed_by_obj_id[int(obj_id)]
                         xyxy = mask_to_xyxy(mask_logits[mask_index])
                         if xyxy is None:
                             continue
@@ -340,10 +341,10 @@ class Sam2SegmentTracker:
                         rows.append(
                             {
                                 "xyxy": xyxy,
-                                "confidence": confidence_by_track_id.get(track_id),
-                                "class_name": class_name_by_track_id.get(track_id, "player"),
-                                "track_id": track_id,
-                                "track_state": "propagated",
+                                "confidence": seed["confidence"],
+                                "class_name": seed["class_name"],
+                                "track_id": int(seed["track_id"]),
+                                "track_state": "fallback" if seed.get("track_state") == "fallback" else "propagated",
                                 "player_mask": player_mask,
                             }
                         )

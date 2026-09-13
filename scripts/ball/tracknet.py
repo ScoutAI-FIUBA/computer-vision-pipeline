@@ -71,6 +71,17 @@ class TemporalFrameBuffer:
         return self._items[-1].frame
 
 
+def padded_window(frame_indices: Sequence[int], target_position: int, size: int) -> tuple[int, ...]:
+    """Return a causal window with repeated edge frames at sequence bounds."""
+    if not frame_indices or size < 1:
+        raise ValueError("frame indices and window size must be positive")
+    last_position = len(frame_indices) - 1
+    return tuple(
+        frame_indices[max(0, min(last_position, target_position - size + 1 + offset))]
+        for offset in range(size)
+    )
+
+
 def preprocess_frame(
     frame: np.ndarray,
     input_size: FrameSize,

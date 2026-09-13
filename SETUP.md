@@ -1,5 +1,47 @@
 # Modal setup
 
+## TrackNet ball-only inspection
+
+This standalone script uses only the local TrackNet checkpoint. It does not
+load the player detector, SAM2, Roboflow, possession, pass, or Modal code.
+
+```bash
+uv run python scripts/ball/tracknet_ball_only.py clip_020.mp4 \
+  --model /absolute/path/to/TrackNet_best.pt \
+  --output-dir outputs/clip_020_ball
+```
+
+It writes `ball_tracks.jsonl` and `ball_only.mp4`. Use `--max-frames`,
+`--frame-stride` or `--target-fps`, `--threshold`, `--min-distance`, and
+`--max-candidates` to keep an inspection run small.
+
+## Local TrackNet ball detection
+
+The local pipeline keeps hosted ball detection as the default. To enable the
+temporal TrackNet primary detector, point it at a local checkpoint (the file is
+not stored in this repository):
+
+```bash
+export TRACKNET_ENABLED=1
+export TRACKNET_CHECKPOINT=/absolute/path/to/TrackNet_best.pt
+export TRACKNET_FALLBACK_BUDGET=12
+python -m pipeline.cli clips/short.mp4 --max-frames 90 --output-dir outputs/tracknet
+```
+
+TrackNet uses 8-frame windows at 512x288 with `bg_mode=concat`. When it misses,
+SAM2 may carry the last valid ball for at most
+`TRACKNET_FALLBACK_BUDGET` **emitted processed frames** (default 12). The
+counter resets only on a real TrackNet detection, not on fallback rows. After
+the hard cap, `ball_tracks.jsonl` emits one `track_state: "lost"` row with the
+stable public `track_id` and `xyxy`/`center_xy` set to `null`; no box is sent to
+SAM2 until TrackNet seeds the ball again. `TRACKNET_SEED_RADIUS` and
+`TRACKNET_HEATMAP_THRESHOLD` tune seed size and acceptance.
+
+The dense ball pass keeps only its 8-frame TrackNet window and previous
+fallback frame in memory, writes `ball_tracks.jsonl` in source-frame order, and
+adds `timestamp_seconds` from the source FPS. Dense misses use a separate
+two-frame, ball-only SAM2 fallback; the player SAM2 stream remains at 15 FPS.
+
 How to get the pipeline running on Modal GPUs. Follow it in order — each step
 gets cheaper to debug if the previous one worked.
 
@@ -111,6 +153,13 @@ loads SAM2, and processes **90 frames only**.
 modal run modal_app.py --video-path clips/short.mp4 --max-frames 90
 ```
 
+TrackNet is enabled by default. To skip loading its checkpoint and retain the
+hosted ball-detection compatibility path, use:
+
+```bash
+modal run modal_app.py --video-path clips/short.mp4 --no-tracknet-enabled
+```
+
 `--video-path` uploads a local file straight into the container, so this works
 before any R2 wiring exists. Keep the test clip small — it travels as a function
 argument.
@@ -182,6 +231,10 @@ Expect `401`. Now with the token:
 ```bash
 curl -X POST https://YOUR-ENDPOINT.modal.run -H "Authorization: Bearer YOUR_TOKEN" -H 'Content-Type: application/json' -d '{"r2_key":"videos/TEAM_ID/VIDEO_ID","output_prefix":"results/VIDEO_ID"}'
 ```
+
+The submit payload accepts `tracknet_enabled` and defaults it to `true` for
+backward compatibility. Set it to `false` to use hosted ball detection without
+loading the TrackNet checkpoint.
 
 Expect `{"call_id": "...", "status": "queued"}` immediately — it does not wait
 for the GPU.
@@ -367,3 +420,17 @@ Tests for the segment windowing, which also need no GPU:
 ```bash
 python -m pytest tests/test_video_segments.py
 ```
+Ball detection defaults to `BALL_ALL_FRAMES=1`: TrackNet consumes every decoded
+source frame independently of the player `target_fps=15`. TrackNet uses true
+8-frame windows on that dense stream; SAM2 only fills bounded TrackNet misses.
+For compatibility with the old FPS-derived mode, disable all-frame mode and
+set the ball cadence. This compatibility mode uses strided source-frame
+windows, not consecutive decoded frames:
+
+```bash
+modal run modal_app.py --video-path clips/match03.mp4 --no-ball-all-frames --ball-target-fps 15
+```
+
+Dense mode costs in proportion to the source frame count, while leaving
+player/SAM2 and court/team work at 15 FPS. Modal carries the mode through
+`BALL_ALL_FRAMES`; local SAM2 is not required for the Modal command.

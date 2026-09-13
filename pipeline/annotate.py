@@ -57,11 +57,12 @@ def rows_to_detections(rows: list[dict]):
 def draw_tracks(frame, rows: list[dict]):
     """Draw boxes and `#id name conf` labels onto a copy-safe frame."""
 
-    if any(row.get("team_id") is not None for row in rows):
+    drawable_rows = [row for row in rows if row.get("xyxy") is not None]
+    if any(row.get("team_id") is not None for row in drawable_rows):
         import cv2
 
         annotated = frame.copy()
-        for row in rows:
+        for row in drawable_rows:
             x1, y1, x2, y2 = [int(round(value)) for value in row["xyxy"]]
             team_id = row.get("team_id")
             label = track_label(row)
@@ -84,14 +85,14 @@ def draw_tracks(frame, rows: list[dict]):
 
     import supervision as sv
 
-    detections = rows_to_detections(rows)
+    detections = rows_to_detections(drawable_rows)
     if len(detections) == 0:
         return frame
 
     labels = [
         track_label(row)
         + ("" if row["confidence"] is None else f" {float(row['confidence']):.2f}")
-        for row in rows
+        for row in drawable_rows
     ]
     annotated = sv.BoxAnnotator(color_lookup=sv.ColorLookup.TRACK).annotate(
         scene=frame, detections=detections

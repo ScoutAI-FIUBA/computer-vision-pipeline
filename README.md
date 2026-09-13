@@ -94,6 +94,10 @@ modal run modal_app.py \
   --annotated
 ```
 
+TrackNet is enabled by default. To use the hosted ball-detection compatibility
+path without loading the TrackNet checkpoint, pass `--no-tracknet-enabled` to
+`modal run`, or send `"tracknet_enabled": false` to the HTTP submit endpoint.
+
 Run the dedicated player-position pipeline on Modal and save artifacts locally:
 
 ```bash
@@ -132,6 +136,7 @@ Expected local artifacts in `--output-dir`:
 - `teams.json`
 - `numbers.json`
 - `shot_events.jsonl`
+- `ball_tracks.jsonl` when TrackNet or the ball fallback emits ball rows
 - `annotated.mp4` when `--annotated` is set
 
 Expected local artifacts for `--pipeline player-positions`:
@@ -224,6 +229,7 @@ Current outputs from one pipeline run:
 | `teams.json` | Team assignments, skipped/unassigned tracks, selected-sample counts, and per-track diagnostics. |
 | `numbers.json` | Final per-track jersey-number confirmations and ambiguity details. |
 | `shot_events.jsonl` | Detector-frame make/miss event records from the active pipeline path. Empty means no shot events were resolved for that clip. |
+| `ball_tracks.jsonl` | Per-frame ball rows, using TrackNet detections first and bounded SAM2 fallback rows for TrackNet misses. |
 | `team_debug.json` | Per-track sample summaries when team debug is enabled. |
 | `team_debug/` | Crops and masks for manual team-ID inspection when team debug is enabled. |
 | `annotated.mp4` | Optional final render after team assignment/number aggregation, with confirmed jersey numbers when available. |
@@ -807,3 +813,17 @@ Video form fields:
 - `output_fps`: optional; must be greater than 0.
 
 Processing requires `ROBOFLOW_API_KEY` and returns `model_id`, `frames_read`, `roboflow_calls`, `output_fps`, `content_type`, `filename`, and `annotated_video_base64`.
+### Ball cadence
+
+The player/SAM2 pipeline defaults to `15` FPS. TrackNet is primary for the ball
+and defaults to `BALL_ALL_FRAMES=1`, so every decoded source frame is processed
+for ball windows while player cost stays at 15 FPS. This is independent of the
+declared video FPS. On TrackNet misses, a bounded ball-only SAM2 pass bridges
+dense frames; this adds fallback cost only during misses and does not alter the
+player SAM2 stream. For legacy FPS-based ball sampling, disable the frame mode
+and set its compatibility cadence. This mode uses strided source-frame
+windows, not consecutive decoded frames:
+
+```bash
+modal run modal_app.py --video-path clips/match03.mp4 --no-ball-all-frames --ball-target-fps 15
+```

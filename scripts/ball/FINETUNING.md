@@ -192,6 +192,32 @@ sqrt((pred_x - gt_x)^2 + (pred_y - gt_y)^2)
 frames sin señal útil / frames donde la pelota es visible
 ```
 
+### A/B de detección inicial con Roboflow
+
+Antes de propagar o interpolar, compará modelos directamente sobre un game, split o dataset procesado de TrackNet. El primer modelo es el baseline. Este dry-run valida labels/frames, selecciona 20 frames determinísticamente —incluyendo negativos cuando existen— y muestra las 40 llamadas planeadas sin usar la API:
+
+```bash
+python3 scripts/test_ball_detection.py \
+  --tracknet-root processed/basketball-v1/test/match20 \
+  --model-id basketball-player-detection-3-ycjdo/16 \
+  --model-id nba-ball-detection/2 \
+  --frame-cap 20 \
+  --dry-run
+```
+
+Ejecución real con los mismos frames:
+
+```bash
+ROBOFLOW_API_KEY=... python3 scripts/test_ball_detection.py \
+  --tracknet-root processed/basketball-v1/test/match20 \
+  --model-id basketball-player-detection-3-ycjdo/16 \
+  --model-id nba-ball-detection/2 \
+  --frame-cap 20 \
+  --json-output outputs/ball_seed_ab.json
+```
+
+Los CSV TrackNet usan `Frame,Visibility,X,Y`: `Visibility=0` cuenta como frame negativo y los puntos visibles se comparan contra el centro de cada detección con `--point-distance-px` (20 px por defecto, igual al umbral P@20 documentado arriba). El comando imprime recall, precision, falsos positivos por frame, error medio del centro y PASS/FAIL. `--ground-truth` sigue disponible para JSONL con cajas e IoU 0.5.
+
 ## Regla GO / NO-GO
 
 Usá esta regla después del primer fine-tune:
