@@ -19,6 +19,7 @@ from pipeline.team_id import KMeansTeamClusterer, TeamClusterer, TeamObservation
 
 
 IdentityResolver = Callable[[list[dict[str, Any]]], Mapping[str, str]]
+_DERIVED_OBSERVATION_FIELDS = frozenset({"stable_player_id", "reid_embedding", "team_id"})
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,13 @@ def _group_by_frame(rows: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]
     for row in rows:
         grouped[int(row["frame_index"])].append(row)
     return grouped
+
+
+def _scrub_derived_observations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in row.items() if key not in _DERIVED_OBSERVATION_FIELDS}
+        for row in rows
+    ]
 
 
 def _run_reid(rows: list[dict[str, Any]], embedder: Embedder, frames_by_index: Mapping[int, Any]) -> int:
@@ -213,6 +221,7 @@ class RunnerV2:
             # ReID may have run before a later team check failed. Never expose
             # that partial work as consumable output from a rejected run.
             downstream = {}
+            rows = _scrub_derived_observations(rows)
 
         acceptance = {
             "tracking_identity": "unvalidated" if structurally_valid else "rejected",
