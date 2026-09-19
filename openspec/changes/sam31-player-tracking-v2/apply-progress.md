@@ -37,6 +37,7 @@
 | Atomic rejected-run audit | `tests/test_runner_v2.py` | ✅ 13/13 prior runner tests passed | ✅ ReID output leaked beside conflicting team validation | ✅ 14 runner tests passed | ✅ ReID + conflicting team assignment yields empty downstream output | ✅ Rejected result is not consumable as partial derived data |
 | Rejected observation leakage audit | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ `reid_embedding` remained in rejected observations | ✅ 14 runner tests passed | ✅ Derived observation fields scrubbed while raw evidence remains | ✅ Centralized scrub set prevents consumer confusion |
 | Rejected derived-field assertion | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ Assertion strengthened from ReID-only to all derived fields | ✅ 14 runner tests passed | ✅ `stable_player_id`, `reid_embedding`, and `team_id` all absent | ✅ Test now checks the complete rejection contract |
+| Populated team-field rejection coverage | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ Regression setup strengthened with pre-existing `team_id` | ✅ 14 runner tests passed | ✅ Populated team field is scrubbed alongside identity/ReID fields | ✅ No production change required |
 
 ## Verification
 

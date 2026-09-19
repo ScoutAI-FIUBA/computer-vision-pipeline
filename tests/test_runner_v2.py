@@ -193,6 +193,7 @@ def test_conflicting_team_validation_discards_reid_output_atomically():
             return [0, 1]
 
     observations = [row(frame_index=60, raw_track_id=3), row(frame_index=61, raw_track_id=4)]
+    observations[0]["team_id"] = 1
     result = RunnerV2(
         RunnerV2Seams(
             identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
