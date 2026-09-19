@@ -15,8 +15,13 @@ unpleasant as one in-memory list.
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+import cv2
+import numpy as np
 
 RESULTS_SCHEMA_VERSION = 5
 
@@ -55,6 +60,8 @@ class PipelineResults:
     projected_shots_file: str | None = None
     projected_shots_image_file: str | None = None
     annotated_video_file: str | None = None
+    artifact_manifest_file: str | None = None
+    artifact_references: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -67,6 +74,10 @@ class PipelineResults:
             payload.pop("projected_tracks_file", None)
         if payload.get("ball_tracks_file") is None:
             payload.pop("ball_tracks_file", None)
+        if payload.get("artifact_manifest_file") is None:
+            payload.pop("artifact_manifest_file", None)
+        if payload.get("artifact_references") is None:
+            payload.pop("artifact_references", None)
         return payload
 
     def write(self, path: Path) -> None:
@@ -112,3 +123,94 @@ class TrackWriter:
 
     def __exit__(self, *_exc_info) -> None:
         self.close()
+
+
+def _artifact_ref(path: Path, key: str) -> dict[str, Any]:
+    data = path.read_bytes()
+    return {"key": key, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def package_artifacts(
+    output_dir: Path,
+    observations: Iterable[Mapping[str, Any]],
+    masks: Mapping[str, Any],
+    *,
+    input_fingerprint: str | None = None,
+    video_metadata: Mapping[str, Any] | None = None,
+    frame_bounds: list[int] | None = None,
+    prompts: Iterable[str] = (),
+    config: Mapping[str, Any] | None = None,
+    benchmark: Mapping[str, Any] | None = None,
+    acceptance: Mapping[str, Any] | None = None,
+    output_prefix: str = "",
+    transfer_errors: Iterable[str] = (),
+    truncated: bool = False,
+) -> dict[str, Any]:
+    """Write deterministic V2 evidence files and return a retrieval manifest."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = list(observations)
+    keys = [str(row["observation_key"]) for row in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate observation_key")
+
+    tracks_path = output_dir / "tracks.jsonl"
+    tracks_path.write_text(
+        "".join(json.dumps(dict(row), sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    mask_dir = output_dir / "masks"
+    mask_dir.mkdir(exist_ok=True)
+    missing_masks: list[str] = []
+    mask_refs: dict[str, dict[str, Any]] = {}
+    for key in keys:
+        if key not in masks:
+            missing_masks.append(key)
+            continue
+        mask = np.asarray(masks[key])
+        if mask.ndim != 2:
+            raise ValueError(f"mask for {key!r} must be a 2-D array")
+        if mask.dtype == bool:
+            mask = mask.astype(np.uint8)
+        if mask.dtype != np.uint8:
+            raise ValueError(f"mask for {key!r} must use lossless uint8 data")
+        filename = key.replace(":", "-") + ".png"
+        mask_path = mask_dir / filename
+        if not cv2.imwrite(str(mask_path), mask):
+            raise OSError(f"could not write mask for {key!r}")
+        mask_refs[key] = _artifact_ref(mask_path, f"{output_prefix}/masks/{filename}".lstrip("/"))
+
+    prefix = output_prefix.strip("/")
+    tracks_key = f"{prefix}/tracks.jsonl" if prefix else "tracks.jsonl"
+    manifest: dict[str, Any] = {
+        "schema": "sam31-artifacts",
+        "schema_version": 1,
+        "input_fingerprint": input_fingerprint,
+        "video": dict(video_metadata or {}),
+        "frame_bounds": frame_bounds,
+        "prompts": list(prompts),
+        "config": dict(config or {}),
+        "benchmark": dict(benchmark or {}),
+        "acceptance": dict(acceptance or {}),
+        "observation_count": len(rows),
+        "mask_encoding": "PNG uint8 lossless",
+        "artifacts": {
+            "manifest": {"key": f"{prefix}/manifest.json" if prefix else "manifest.json"},
+            "tracks": {**_artifact_ref(tracks_path, tracks_key)},
+            "masks": {
+                "key": f"{prefix}/masks/" if prefix else "masks/",
+                "count": len(mask_refs),
+                "missing": missing_masks,
+                "references": mask_refs,
+            },
+        },
+        "transfer_errors": list(transfer_errors),
+        "truncated": bool(truncated),
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    manifest["artifacts"]["manifest"] = _artifact_ref(
+        manifest_path, f"{prefix}/manifest.json" if prefix else "manifest.json"
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest

@@ -32,8 +32,8 @@ Chain strategy: feature-branch-chain
 
 ## Phase 2: Artifact Packaging and Core Pipeline
 
-- [ ] 2.1 **RED:** Add artifact-contract tests for manifest, tracks JSONL, lossless masks, config/benchmark metadata, retrieval references, and explicit transfer errors.
-- [ ] 2.2 **GREEN:** Extend `pipeline/results.py` with those manifest/artifact references and packaging behaviors; keep legacy serialization intact.
+- [x] 2.1 **RED:** Add artifact-contract tests for manifest, tracks JSONL, lossless masks, config/benchmark metadata, retrieval references, and explicit transfer errors.
+- [x] 2.2 **GREEN:** Extend `pipeline/results.py` with those manifest/artifact references and packaging behaviors; keep legacy serialization intact.
 - [ ] 2.3 Create `pipeline/runner_v2.py` to wire the SAM3.1 adapter through ReID, stable identity, Team ID, TrackNet, court, shot, and available analytics seams; block statistics acceptance until tracking/identity passes.
 - [ ] 2.4 Create `modal_app_v2.py` with the isolated SAM3.1 image, runner entrypoint, and Modal/R2 upload-retrieval response; never render or return remote `debug.mp4`. Leave `modal_app.py` byte-for-byte untouched.
 - [ ] 2.5 Add `tests/test_runner_v2.py` and `tests/test_modal_app_v2.py` for full wiring, artifact completeness/retrieval, no silent truncation, image boundary, and acceptance gating.
