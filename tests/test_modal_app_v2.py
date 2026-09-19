@@ -103,6 +103,20 @@ def test_direct_artifact_mapping_rejects_symlinked_file_outside_output_root(tmp_
         collect_artifacts(output_dir)
 
 
+def test_direct_artifact_mapping_rejects_symlinked_directory(tmp_path: Path):
+    from modal_app_v2 import collect_artifacts
+
+    output_dir = tmp_path / "artifacts"
+    output_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "mask.png").write_bytes(b"secret")
+    (output_dir / "masks").symlink_to(outside_dir, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        collect_artifacts(output_dir)
+
+
 def test_local_output_writer_recreates_nested_artifact_paths(tmp_path: Path):
     from modal_app_v2 import write_artifacts
 

@@ -76,10 +76,10 @@ def collect_artifacts(output_dir: Path, *, max_bytes: int | None = None) -> dict
     root = output_dir.resolve()
     files = []
     for path in sorted(output_dir.rglob("*")):
-        if not path.is_file():
-            continue
         if path.is_symlink():
             raise ValueError(f"artifact path is a symlink: {path.relative_to(output_dir)}")
+        if not path.is_file():
+            continue
         resolved = path.resolve()
         if resolved != root and root not in resolved.parents:
             raise ValueError(f"artifact path resolves outside output root: {path.relative_to(output_dir)}")

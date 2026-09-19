@@ -47,6 +47,7 @@
 | Modal V2 direct artifact return | `tests/test_modal_app_v2.py` | ✅ 16/16 prior Modal tests passed | ✅ R2-oriented boundary tests failed against the direct-return contract | ✅ 12 direct-return tests passed | ✅ Relative byte mapping, nested local writing, incomplete local manifest, and input bytes | ✅ Removed external-storage helpers and retained ephemeral packaging |
 | Modal V2 artifact size/path boundary | `tests/test_modal_app_v2.py` | ✅ 12/12 direct-return tests passed | ✅ Size-limit and unsafe-path regressions failed before implementation | ✅ 20 Modal tests passed | ✅ Explicit/env size limits, absolute/traversal/invalid paths, and nested masks | ✅ Preflight total size before reading bytes; validate all paths before writing |
 | Modal V2 symlink collection boundary | `tests/test_modal_app_v2.py` | ✅ 20/20 prior Modal tests passed | ✅ Outside symlink regression read bytes before implementation | ✅ 21 Modal tests passed | ✅ Symlinked outside file rejected while regular nested files remain valid | ✅ Reject symlinks and resolved escapes before stat/read |
+| Modal V2 symlink-directory boundary | `tests/test_modal_app_v2.py` | ✅ 21/21 prior Modal tests passed | ✅ Symlinked directory was silently skipped before implementation | ✅ 22 Modal tests passed | ✅ Symlinked directories rejected while regular nested directories remain valid | ✅ Check symlinks before `is_file()` traversal filtering |
 
 ## Verification
 
@@ -59,8 +60,9 @@
 - Modal V2 direct-return result: `12 passed`.
 - Modal V2 size/path result: `20 passed`.
 - Modal V2 symlink result: `21 passed`.
+- Modal V2 symlink-directory result: `22 passed`.
 - Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `69 passed`.
-- Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `47 passed`.
+- Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `48 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
 
