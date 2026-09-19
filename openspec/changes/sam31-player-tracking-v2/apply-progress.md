@@ -18,6 +18,7 @@
 - [x] 2.4 Added isolated `modal_app_v2.py` with the official SAM 3.1 multiplex predictor boundary, HF cache/auth, ephemeral processing, direct byte-artifact return, and no remote video rendering. V2 remains validation-only because `run_v2` is called without an identity authority.
 - [x] 2.4 boundary remediation: validated public inputs before lazy predictor/GPU initialization, rejected SAM cardinality mismatches, and added provenance/video/config/benchmark metadata and mask references.
 - [x] 2.4 direct-return correction: removed the unintended external-storage boundary; local `--video-path` bytes are sent to Modal, returned artifacts are `{relative_path: bytes}`, and local `--output-dir` writing mirrors V1.
+- [x] 2.4 setuptools compatibility remediation: kept the V2 image pinned to `setuptools<82` and added a static dependency-contract regression test for the SAM 3.1 `pkg_resources` requirement.
 
 ## TDD Cycle Evidence
 
@@ -48,6 +49,7 @@
 | Modal V2 artifact size/path boundary | `tests/test_modal_app_v2.py` | ✅ 12/12 direct-return tests passed | ✅ Size-limit and unsafe-path regressions failed before implementation | ✅ 20 Modal tests passed | ✅ Explicit/env size limits, absolute/traversal/invalid paths, and nested masks | ✅ Preflight total size before reading bytes; validate all paths before writing |
 | Modal V2 symlink collection boundary | `tests/test_modal_app_v2.py` | ✅ 20/20 prior Modal tests passed | ✅ Outside symlink regression read bytes before implementation | ✅ 21 Modal tests passed | ✅ Symlinked outside file rejected while regular nested files remain valid | ✅ Reject symlinks and resolved escapes before stat/read |
 | Modal V2 symlink-directory boundary | `tests/test_modal_app_v2.py` | ✅ 21/21 prior Modal tests passed | ✅ Symlinked directory was silently skipped before implementation | ✅ 22 Modal tests passed | ✅ Symlinked directories rejected while regular nested directories remain valid | ✅ Check symlinks before `is_file()` traversal filtering |
+| Modal V2 setuptools compatibility | `tests/test_modal_app_v2.py` | ✅ 27/27 prior Modal tests passed | ✅ Regression failed when the pin was temporarily removed | ✅ 28 Modal tests passed | ➖ Single structural dependency contract; no branching behavior | ✅ Parsed `pip_install` calls without importing Modal |
 
 ## Verification
 
@@ -61,8 +63,10 @@
 - Modal V2 size/path result: `20 passed`.
 - Modal V2 symlink result: `21 passed`.
 - Modal V2 symlink-directory result: `22 passed`.
+- Modal V2 setuptools compatibility result: `.venv/bin/python -m pytest tests/test_modal_app_v2.py` — `28 passed`.
 - Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `69 passed`.
 - Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `48 passed`.
+- Setuptools compatibility regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `54 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
 
@@ -78,9 +82,10 @@
 | Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
 |------|-----------|-------|------------|-----|-------|-------------|----------|
 | 2.5 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Unit with controlled process seam | ✅ 40/40 | ✅ Process/cardinality tests failed before seam correction | ✅ 27 Modal tests passed; 14 runner tests passed | ✅ Complete accepted fields/mask bytes, rejected process gating, size failure, cardinality mismatch, rejection/deferred paths | ✅ Reused existing artifact writer/runner contracts; no production change |
+| 2.4 compatibility remediation | `tests/test_modal_app_v2.py` | Unit/static boundary | ✅ 27/27 | ✅ Pin assertion failed with unbounded `setuptools` | ✅ 28 Modal tests passed | ➖ Structural contract has one valid output | ✅ Minimal AST-based static check |
 
 ## Verification
 
 - Task 2.5 baseline command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `40 passed` (26 Modal, 14 runner).
 - Task 2.5 final command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `41 passed` (27 Modal, 14 runner).
-- No real Modal deployment, GPU inference, `game_03` validation, renderer, or `modal_app.py` modification was performed.
+- No real Modal deployment, GPU inference, `game_03` validation, renderer, Phase 3 work, or `modal_app.py` modification was performed.

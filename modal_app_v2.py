@@ -27,6 +27,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "ffmpeg", "libgl1", "libglib2.0-0")
     .pip_install(
+        "setuptools<82",
         "torch==2.10.0",
         "torchvision==0.25.0",
         "transformers==5.0.0",

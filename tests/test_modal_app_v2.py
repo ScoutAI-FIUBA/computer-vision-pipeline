@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -19,6 +20,23 @@ def test_v2_image_isolated_and_uses_only_modal_model_storage():
     assert '"HF_HOME":' in source
     assert "HF_TOKEN" in source
     assert source.count("modal.Image") == 1
+
+
+def test_v2_image_pins_setuptools_below_sam31_compatibility_ceiling():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    pip_dependencies = [
+        argument.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "pip_install"
+        for argument in node.args
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+    ]
+
+    assert "setuptools<82" in pip_dependencies
 
 
 def test_entrypoint_accepts_nonempty_video_and_validates_public_values():
