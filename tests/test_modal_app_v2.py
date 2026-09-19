@@ -1,190 +1,128 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 
-def test_v2_image_isolated_and_uses_sam3_without_legacy_image_dependencies():
+def test_v2_image_isolated_and_uses_only_modal_model_storage():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
 
     assert "modal_app.py" not in source
     assert "facebookresearch/sam3" in source
     assert "facebookresearch/sam2" not in source
+    assert "R2" not in source
+    assert "r2_key" not in source
+    assert "output_prefix" not in source
+    assert "R2Storage" not in source
     assert '"HF_HOME":' in source
     assert "HF_TOKEN" in source
     assert source.count("modal.Image") == 1
 
 
-def test_entrypoint_requires_one_video_source_and_an_artifact_prefix():
+def test_entrypoint_accepts_nonempty_video_and_validates_public_values():
     from modal_app_v2 import validate_entrypoint_args
 
-    validate_entrypoint_args(video_bytes=b"video", r2_key=None, output_prefix="runs/job")
-    validate_entrypoint_args(video_bytes=None, r2_key="input.mp4", output_prefix="runs/job")
+    validate_entrypoint_args(video_bytes=b"video", prompt="player", frame_start=0, frame_end=1)
 
-    with pytest.raises(ValueError, match="exactly one"):
-        validate_entrypoint_args(video_bytes=b"video", r2_key="input.mp4", output_prefix="runs/job")
-    with pytest.raises(ValueError, match="exactly one"):
-        validate_entrypoint_args(video_bytes=None, r2_key=None, output_prefix="runs/job")
-    with pytest.raises(ValueError, match="output_prefix"):
-        validate_entrypoint_args(video_bytes=b"video", r2_key=None, output_prefix="")
+    with pytest.raises(ValueError, match="non-empty"):
+        validate_entrypoint_args(video_bytes=b"", prompt="player", frame_start=0, frame_end=1)
+    with pytest.raises(ValueError, match="prompt"):
+        validate_entrypoint_args(video_bytes=b"video", prompt=" ", frame_start=0, frame_end=1)
+    with pytest.raises(ValueError, match="frame"):
+        validate_entrypoint_args(video_bytes=b"video", prompt="player", frame_start=2, frame_end=1)
 
 
 @pytest.mark.parametrize(
     ("video_bytes", "prompt", "frame_start", "frame_end"),
     [
-        (b"", "player", 0, 1),
-        (b"video", " ", 0, 1),
+        ("video", "player", 0, 1),
         (b"video", "player", -1, 1),
-        (b"video", "player", 2, 1),
         (b"video", "player", True, 1),
         (b"video", "player", 0, 1.0),
     ],
 )
-def test_entrypoint_rejects_invalid_public_values(video_bytes, prompt, frame_start, frame_end):
+def test_entrypoint_rejects_wrong_public_types(video_bytes, prompt, frame_start, frame_end):
     from modal_app_v2 import validate_entrypoint_args
 
     with pytest.raises(ValueError):
         validate_entrypoint_args(
             video_bytes=video_bytes,
-            r2_key=None,
-            output_prefix="runs/job",
             prompt=prompt,
             frame_start=frame_start,
             frame_end=frame_end,
         )
 
 
-def test_artifact_response_returns_retrieval_references_not_file_bytes():
-    from modal_app_v2 import artifact_retrieval_response
+def test_direct_artifact_mapping_returns_relative_bytes(tmp_path: Path):
+    from modal_app_v2 import collect_artifacts
 
-    response = artifact_retrieval_response(
-        {"complete": True, "artifacts": {"manifest": {"key": "runs/job/manifest.json"}}},
-        ["runs/job/manifest.json", "runs/job/tracks.jsonl"],
-    )
+    (tmp_path / "manifest.json").write_text('{"complete": false}', encoding="utf-8")
+    (tmp_path / "masks").mkdir()
+    (tmp_path / "masks" / "1.png").write_bytes(b"png")
 
-    assert response == {
-        "manifest": {"complete": True, "key": "runs/job/manifest.json"},
-        "artifact_keys": ["runs/job/manifest.json", "runs/job/tracks.jsonl"],
+    artifacts = collect_artifacts(tmp_path)
+
+    assert artifacts == {
+        "manifest.json": b'{"complete": false}',
+        "masks/1.png": b"png",
     }
-    assert "artifacts" not in response
+    assert all(not Path(name).is_absolute() for name in artifacts)
 
 
-def test_artifact_response_cannot_advertise_complete_with_transfer_errors():
-    from modal_app_v2 import artifact_retrieval_response
+def test_local_output_writer_recreates_nested_artifact_paths(tmp_path: Path):
+    from modal_app_v2 import write_artifacts
 
-    response = artifact_retrieval_response(
-        {
-            "complete": True,
-            "truncated": False,
-            "transfer_errors": ["upload failed"],
-            "artifacts": {"manifest": {"key": "runs/job/manifest.json"}},
-        },
-        ["runs/job/manifest.json"],
+    write_artifacts(
+        {"manifest.json": b"{}", "masks/1.png": b"png"},
+        tmp_path / "output",
     )
 
-    assert response["manifest"]["complete"] is False
+    assert (tmp_path / "output" / "manifest.json").read_bytes() == b"{}"
+    assert (tmp_path / "output" / "masks" / "1.png").read_bytes() == b"png"
 
 
-def test_v2_upload_reports_transfer_errors_and_never_creates_debug_video(tmp_path: Path, monkeypatch):
-    from modal_app_v2 import upload_artifacts
+def test_local_entrypoint_writes_remote_artifact_bytes(tmp_path: Path, monkeypatch, capsys):
+    import modal_app_v2
 
-    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
 
-    class BrokenStorage:
-        def upload(self, _source, _key, _content_type=None):
-            raise OSError("R2 unavailable")
+    class FakeProcess:
+        def remote(self, **kwargs):
+            assert kwargs["video_bytes"] == b"video"
+            assert kwargs["return_artifacts"] is True
+            return {"acceptance": {"tracking_identity": "unvalidated"}, "artifacts": {"manifest.json": b"{}"}}
 
-    monkeypatch.setattr("modal_app_v2.R2Storage", BrokenStorage)
-    keys, errors = upload_artifacts(tmp_path, "runs/job")
-    assert keys == []
-    assert errors == ["OSError: R2 unavailable"]
-    assert not (tmp_path / "debug.mp4").exists()
+    class FakePipeline:
+        process = FakeProcess()
 
+    monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
+    modal_app_v2.main(video_path=str(video), output_dir=str(tmp_path / "output"))
+
+    assert (tmp_path / "output" / "manifest.json").read_bytes() == b"{}"
+    assert "tracking_identity" in capsys.readouterr().out
+
+
+def test_v2_process_returns_artifacts_and_never_remote_debug_video():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+
+    assert 'payload["artifacts"]' in source
+    assert "return_artifacts" in source
     assert "debug.mp4" not in source
+    assert "upload" not in source.lower()
 
 
-def test_failed_upload_overwrites_manifest_with_incomplete_state(tmp_path: Path, monkeypatch):
-    from modal_app_v2 import upload_artifacts
+def test_failed_or_incomplete_local_manifest_is_returned_without_claiming_complete(tmp_path: Path):
+    from modal_app_v2 import collect_artifacts
 
-    (tmp_path / "manifest.json").write_text(
-        '{"complete": true, "truncated": false, "transfer_errors": [], '
-        '"artifacts": {"manifest": {"key": "runs/job/manifest.json"}}}',
-        encoding="utf-8",
-    )
-    (tmp_path / "tracks.jsonl").write_text("{}\n", encoding="utf-8")
-    uploaded_manifests = []
+    manifest = {"complete": False, "truncated": True, "transfer_errors": ["artifact too large"]}
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
-    class BrokenStorage:
-        def upload(self, source, key, content_type=None):
-            if key.endswith("manifest.json"):
-                uploaded_manifests.append(source.read_text(encoding="utf-8"))
-            if key.endswith("tracks.jsonl"):
-                raise OSError("R2 unavailable")
-            return key
+    returned = json.loads(collect_artifacts(tmp_path)["manifest.json"])
 
-    monkeypatch.setattr("modal_app_v2.R2Storage", BrokenStorage)
-    keys, errors = upload_artifacts(tmp_path, "runs/job")
-
-    assert keys == ["runs/job/manifest.json"]
-    assert errors == ["OSError: R2 unavailable"]
-    assert uploaded_manifests
-    failed_manifest = __import__("json").loads(uploaded_manifests[-1])
-    assert failed_manifest["complete"] is False
-    assert failed_manifest["truncated"] is True
-    assert failed_manifest["transfer_errors"] == ["OSError: R2 unavailable"]
-
-
-def test_successful_upload_republishes_final_complete_manifest(tmp_path: Path, monkeypatch):
-    from modal_app_v2 import upload_artifacts
-
-    (tmp_path / "manifest.json").write_text(
-        '{"complete": true, "truncated": false, "transfer_errors": [], '
-        '"artifacts": {"manifest": {"key": "runs/job/manifest.json"}}}',
-        encoding="utf-8",
-    )
-    (tmp_path / "tracks.jsonl").write_text("{}\n", encoding="utf-8")
-    remote_manifests = []
-
-    class RecordingStorage:
-        def upload(self, source, key, content_type=None):
-            if key.endswith("manifest.json"):
-                remote_manifests.append(__import__("json").loads(source.read_text(encoding="utf-8")))
-            return key
-
-    monkeypatch.setattr("modal_app_v2.R2Storage", RecordingStorage)
-    keys, errors = upload_artifacts(tmp_path, "runs/job")
-
-    assert errors == []
-    assert keys == ["runs/job/manifest.json", "runs/job/tracks.jsonl"]
-    assert [manifest["complete"] for manifest in remote_manifests] == [False, True]
-    assert remote_manifests[-1]["truncated"] is False
-    assert remote_manifests[-1]["transfer_errors"] == []
-
-
-def test_session_output_rejects_cardinality_mismatches():
-    from modal_app_v2 import _session_objects
-
-    with pytest.raises(RuntimeError, match="boxes"):
-        _session_objects({"out_obj_ids": [1], "out_boxes_xywh": []})
-    with pytest.raises(RuntimeError, match="probabilities"):
-        _session_objects({"out_obj_ids": [1], "out_boxes_xywh": [[0, 0, 1, 1]], "out_probs": []})
-    with pytest.raises(RuntimeError, match="masks"):
-        _session_objects({"out_obj_ids": [1], "out_boxes_xywh": [[0, 0, 1, 1]], "out_binary_masks": []})
-
-
-def test_session_rows_include_explicit_mask_references_and_metadata_helpers():
-    from modal_app_v2 import _add_mask_references, _effective_run_metadata
-
-    rows = [{"observation_key": "60:3"}]
-    _add_mask_references(rows, {"60:3": object()}, "runs/job")
-    assert rows[0]["mask_ref"] == "runs/job/masks/" + __import__("hashlib").sha256(b"60:3").hexdigest() + ".png"
-    assert _effective_run_metadata("player", 60, 130) == {
-        "prompt": "player",
-        "frame_start": 60,
-        "frame_end": 130,
-    }
+    assert returned == manifest
 
 
 def test_legacy_modal_file_is_not_imported_by_v2():

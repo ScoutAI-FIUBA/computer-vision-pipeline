@@ -1,14 +1,9 @@
-"""Isolated SAM 3.1 Modal boundary.
-
-This wrapper only produces raw tracking evidence. Visualization remains a local
-consumer of the returned artifact references; the remote job never encodes it.
-"""
+"""Isolated SAM 3.1 Modal boundary with direct local artifact return."""
 
 from __future__ import annotations
 
-import json
 import hashlib
-import os
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -16,10 +11,9 @@ from typing import Any
 
 import modal
 
-from pipeline.results import _manifest_hash, _mask_filename, package_artifacts
+from pipeline.results import _mask_filename, package_artifacts
 from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
-from pipeline.storage import R2Storage
 
 SAM31_REPOSITORY = "git+https://github.com/facebookresearch/sam3.git"
 CACHE_DIR = "/cache"
@@ -27,9 +21,6 @@ CACHE_DIR = "/cache"
 app = modal.App("scoutai-pipeline-v2")
 model_cache = modal.Volume.from_name("scoutai-model-cache", create_if_missing=True)
 
-# SAM 3.1 needs the upstream SAM 3 repository and PyTorch 2.7+; these pins are
-# deliberately separate from the legacy SAM2 image. Existing V2 runner seams
-# only require the dependencies below.
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "ffmpeg", "libgl1", "libglib2.0-0")
@@ -44,7 +35,6 @@ image = (
         "umap-learn==0.5.9.post2",
         "boxmot==22.0.0",
         "timm==1.0.22",
-        "boto3==1.35.36",
         "python-dotenv==1.2.2",
     )
     .pip_install(SAM31_REPOSITORY)
@@ -53,26 +43,13 @@ image = (
 )
 
 hf_secret = modal.Secret.from_name("scoutai-huggingface", required_keys=["HF_TOKEN"])
-r2_secret = modal.Secret.from_name("scoutai-r2")
 
 
 def validate_entrypoint_args(
-    *,
-    video_bytes: bytes | None,
-    r2_key: str | None,
-    output_prefix: str,
-    prompt: str = "basketball player",
-    frame_start: int = 60,
-    frame_end: int = 130,
+    *, video_bytes: bytes, prompt: str, frame_start: int, frame_end: int
 ) -> None:
-    if (video_bytes is None) == (r2_key is None):
-        raise ValueError("Pass exactly one of r2_key or video_bytes")
-    if video_bytes is not None and (type(video_bytes) is not bytes or not video_bytes):
+    if type(video_bytes) is not bytes or not video_bytes:
         raise ValueError("video_bytes must be non-empty bytes")
-    if r2_key is not None and (not isinstance(r2_key, str) or not r2_key.strip()):
-        raise ValueError("r2_key must be a non-blank string")
-    if not isinstance(output_prefix, str) or not output_prefix.strip():
-        raise ValueError("output_prefix is required for V2 artifacts")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be a non-blank string")
     if type(frame_start) is not int or type(frame_end) is not int:
@@ -81,70 +58,27 @@ def validate_entrypoint_args(
         raise ValueError("frame range must be non-negative and ordered")
 
 
-def artifact_retrieval_response(manifest: dict[str, Any], keys: list[str]) -> dict[str, Any]:
-    transfer_errors = list(manifest.get("transfer_errors", []))
+def collect_artifacts(output_dir: Path) -> dict[str, bytes]:
     return {
-        "manifest": {
-            "complete": bool(manifest.get("complete", False)) and not transfer_errors and not manifest.get("truncated", False),
-            "key": manifest["artifacts"]["manifest"]["key"],
-        },
-        "artifact_keys": list(keys),
+        path.relative_to(output_dir).as_posix(): path.read_bytes()
+        for path in sorted(output_dir.rglob("*"))
+        if path.is_file()
     }
 
 
-def upload_artifacts(directory: Path, output_prefix: str) -> tuple[list[str], list[str]]:
-    manifest_path = directory / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest_key = f"{output_prefix.rstrip('/')}/manifest.json"
-    manifest.setdefault("artifacts", {}).setdefault("manifest", {"key": manifest_key})
-    content_types = {".json": "application/json", ".jsonl": "application/x-ndjson", ".png": "image/png"}
-    storage = R2Storage()
-    keys: list[str] = []
-
-    def write_manifest(*, complete: bool, errors: list[str]) -> None:
-        manifest["complete"] = complete
-        manifest["truncated"] = not complete
-        manifest["transfer_errors"] = errors
-        manifest["artifacts"]["manifest"]["sha256"] = _manifest_hash(manifest)
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-
-    # Publish an incomplete marker before any bulk object. A failed retry cannot
-    # leave a prior complete manifest advertising a partially replaced prefix.
-    write_manifest(complete=False, errors=["upload_pending"])
-    try:
-        keys.append(storage.upload(manifest_path, manifest_key, "application/json"))
-        for path in sorted(directory.rglob("*")):
-            if not path.is_file() or path == manifest_path:
-                continue
-            relative = path.relative_to(directory).as_posix()
-            key = f"{output_prefix.rstrip('/')}/{relative}"
-            keys.append(storage.upload(path, key, content_types.get(path.suffix)))
-        write_manifest(complete=True, errors=[])
-        # Re-publish after finalization so retrieval sees the same complete state
-        # returned by the process, not the initial upload_pending marker.
-        storage.upload(manifest_path, manifest_key, "application/json")
-        return keys, []
-    except Exception as error:  # noqa: BLE001 - preserve transfer failure in response
-        errors = [f"{type(error).__name__}: {error}"]
-        write_manifest(complete=False, errors=errors)
-        try:
-            if storage.upload(manifest_path, manifest_key, "application/json") not in keys:
-                keys.append(manifest_key)
-        except Exception:
-            pass
-        return keys, errors
+def write_artifacts(artifacts: dict[str, bytes], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for relative_path, data in artifacts.items():
+        destination = output_dir / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
 
 
-def _add_mask_references(rows: list[dict[str, Any]], masks: dict[str, Any], output_prefix: str) -> None:
-    prefix = output_prefix.strip("/")
+def _add_mask_references(rows: list[dict[str, Any]], masks: dict[str, Any]) -> None:
     for row in rows:
         key = str(row["observation_key"])
         if key in masks:
-            row["mask_ref"] = f"{prefix}/masks/{_mask_filename(key)}" if prefix else f"masks/{_mask_filename(key)}"
-
-
-def _effective_run_metadata(prompt: str, frame_start: int, frame_end: int) -> dict[str, Any]:
-    return {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
+            row["mask_ref"] = f"masks/{_mask_filename(key)}"
 
 
 def _file_fingerprint(path: Path) -> str:
@@ -205,9 +139,7 @@ def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int, frame_end: int):
-    start = predictor.handle_request(
-        {"type": "start_session", "resource_path": str(video_path)}
-    )
+    start = predictor.handle_request({"type": "start_session", "resource_path": str(video_path)})
     session_id = start["session_id"]
     predictor.handle_request(
         {"type": "add_prompt", "session_id": session_id, "frame_index": frame_start, "text": prompt}
@@ -233,7 +165,7 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
     return rows, masks
 
 
-@app.cls(image=image, gpu="L4", volumes={CACHE_DIR: model_cache}, secrets=[hf_secret, r2_secret], timeout=1800)
+@app.cls(image=image, gpu="L4", volumes={CACHE_DIR: model_cache}, secrets=[hf_secret], timeout=1800)
 class PipelineV2:
     def _ensure_predictor(self) -> Any:
         if hasattr(self, "predictor"):
@@ -248,17 +180,14 @@ class PipelineV2:
     def process(
         self,
         *,
-        video_bytes: bytes | None = None,
-        r2_key: str | None = None,
-        output_prefix: str,
+        video_bytes: bytes,
         prompt: str = "basketball player",
         frame_start: int = 60,
         frame_end: int = 130,
+        return_artifacts: bool = False,
     ) -> dict[str, Any]:
         validate_entrypoint_args(
             video_bytes=video_bytes,
-            r2_key=r2_key,
-            output_prefix=output_prefix,
             prompt=prompt,
             frame_start=frame_start,
             frame_end=frame_end,
@@ -266,16 +195,15 @@ class PipelineV2:
         with tempfile.TemporaryDirectory(prefix="sam31-v2-") as work_dir:
             root = Path(work_dir)
             video_path = root / "input.mp4"
-            if r2_key is not None:
-                R2Storage().download(r2_key, video_path)
-            else:
-                video_path.write_bytes(video_bytes or b"")
-            started = time.perf_counter()
-            rows, masks = _track_video(self._ensure_predictor(), video_path, prompt, frame_start, frame_end)
-            _add_mask_references(rows, masks, output_prefix)
-            result = run_v2(rows)
             output_dir = root / "artifacts"
-            manifest = package_artifacts(
+            video_path.write_bytes(video_bytes)
+            started = time.perf_counter()
+            rows, masks = _track_video(
+                self._ensure_predictor(), video_path, prompt, frame_start, frame_end
+            )
+            _add_mask_references(rows, masks)
+            result = run_v2(rows)
+            package_artifacts(
                 output_dir,
                 result.observations,
                 masks,
@@ -283,41 +211,44 @@ class PipelineV2:
                 video_metadata=_video_metadata(video_path),
                 frame_bounds=[frame_start, frame_end],
                 prompts=[prompt],
-                config=_effective_run_metadata(prompt, frame_start, frame_end),
+                config={"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end},
                 benchmark={"wall_seconds": time.perf_counter() - started},
                 acceptance=result.acceptance,
-                output_prefix=output_prefix,
             )
-            keys, transfer_errors = upload_artifacts(output_dir, output_prefix)
-            if transfer_errors:
-                manifest["transfer_errors"] = transfer_errors
-                manifest["truncated"] = True
-                manifest["complete"] = False
-                manifest["artifacts"]["manifest"]["sha256"] = _manifest_hash(manifest)
-                (output_dir / "manifest.json").write_text(
-                    json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
-                )
-            response = artifact_retrieval_response(manifest, keys)
-            response["transfer_errors"] = transfer_errors
-            response["acceptance"] = result.acceptance
-            return response
+            payload = {"acceptance": result.acceptance}
+            if return_artifacts:
+                payload["artifacts"] = collect_artifacts(output_dir)
+            return payload
 
 
 @app.local_entrypoint()
 def main(
     video_path: str = "",
-    r2_key: str = "",
-    output_prefix: str = "",
+    output_dir: str = "",
     prompt: str = "basketball player",
     frame_start: int = 60,
     frame_end: int = 130,
 ) -> None:
-    if bool(video_path) == bool(r2_key):
-        raise ValueError("Pass exactly one of --video-path or --r2-key")
-    prefix = output_prefix or os.getenv("SAM31_OUTPUT_PREFIX", "")
-    validate_entrypoint_args(video_bytes=b"local" if video_path else None, r2_key=r2_key or None, output_prefix=prefix, prompt=prompt, frame_start=frame_start, frame_end=frame_end)
-    payload = {"r2_key": r2_key or None, "output_prefix": prefix, "prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
-    if video_path:
-        payload["video_bytes"] = Path(video_path).read_bytes()
-    response = PipelineV2().process.remote(**payload)
-    print(json.dumps(response, indent=2, sort_keys=True))
+    if not video_path:
+        raise ValueError("--video-path is required")
+    source = Path(video_path)
+    if not source.is_file():
+        raise SystemExit(f"Video not found: {source}")
+    video_bytes = source.read_bytes()
+    validate_entrypoint_args(
+        video_bytes=video_bytes,
+        prompt=prompt,
+        frame_start=frame_start,
+        frame_end=frame_end,
+    )
+    payload = PipelineV2().process.remote(
+        video_bytes=video_bytes,
+        prompt=prompt,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        return_artifacts=bool(output_dir),
+    )
+    artifacts = payload.pop("artifacts", None)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if artifacts is not None:
+        write_artifacts(artifacts, Path(output_dir))
