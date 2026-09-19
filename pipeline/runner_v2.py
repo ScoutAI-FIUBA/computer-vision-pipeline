@@ -1,4 +1,4 @@
-"""Truthful SAM 3.1 V2 boundary for normalized player observations.
+"""Validation-only SAM 3.1 V2 boundary for normalized player observations.
 
 The repository has real contracts for ReID and team features, but TrackNet,
 court projection, and shot detection currently consume video/model streams
@@ -45,12 +45,9 @@ def _copy_observations(observations: Iterable[Mapping[str, Any]]) -> list[dict[s
     for observation in observations:
         row = dict(observation)
         raw_id = row.get("raw_track_id")
-        if isinstance(raw_id, bool):
+        if type(raw_id) is not int:
             raise ValueError("raw_track_id must be an integer")
-        try:
-            row["raw_track_id"] = int(raw_id)
-        except (TypeError, ValueError):
-            raise ValueError("raw_track_id must be an integer") from None
+        row["raw_track_id"] = raw_id
         rows.append(row)
     return rows
 
@@ -66,6 +63,7 @@ def _resolve_identity(
     resolved = resolver(rows)
     reasons: list[str] = []
     stable_by_raw: dict[int, set[str]] = defaultdict(set)
+    stable_by_frame: dict[int, dict[str, int]] = defaultdict(dict)
     for row in rows:
         key = str(row.get("observation_key", ""))
         stable_id = resolved.get(key)
@@ -77,6 +75,13 @@ def _resolve_identity(
             reasons.append(f"conflicting_stable_player_id:{key}")
         row["stable_player_id"] = stable_id
         stable_by_raw[row["raw_track_id"]].add(stable_id)
+        frame_index = int(row["frame_index"])
+        previous_raw = stable_by_frame[frame_index].get(stable_id)
+        if previous_raw is not None and previous_raw != row["raw_track_id"]:
+            reasons.append(
+                f"conflicting_stable_player_id:frame={frame_index}:stable_player_id={stable_id}"
+            )
+        stable_by_frame[frame_index][stable_id] = row["raw_track_id"]
 
     for raw_id, stable_ids in stable_by_raw.items():
         if len(stable_ids) > 1:
@@ -155,7 +160,12 @@ def _run_team_id(
 
 
 class RunnerV2:
-    """Normalize identity and invoke only supported production stage contracts."""
+    """Validate identity evidence and invoke supported production stage contracts.
+
+    A resolver assigns candidate identities, but this boundary never treats that
+    assignment alone as acceptance. A structurally valid result is reported as
+    ``unvalidated`` until a later identity-authority stage supplies acceptance.
+    """
 
     def __init__(self, seams: RunnerV2Seams | None = None) -> None:
         self.seams = seams or RunnerV2Seams()
@@ -168,13 +178,13 @@ class RunnerV2:
     ) -> RunnerV2Result:
         rows = _copy_observations(observations)
         reasons = _resolve_identity(rows, self.seams.identity)
-        accepted = not reasons
+        structurally_valid = not reasons
         frames = frames_by_index or {}
         downstream: dict[str, Any] = {}
 
-        if accepted and self.seams.reid is not None:
+        if structurally_valid and self.seams.reid is not None:
             downstream["reid_records"] = _run_reid(rows, self.seams.reid, frames)
-        if accepted and self.seams.team_embedder is not None:
+        if structurally_valid and self.seams.team_embedder is not None:
             downstream["team_assignments"] = _run_team_id(
                 rows,
                 self.seams.team_embedder,
@@ -184,7 +194,7 @@ class RunnerV2:
             )
 
         acceptance = {
-            "tracking_identity": "accepted" if accepted else "rejected",
+            "tracking_identity": "unvalidated" if structurally_valid else "rejected",
             "statistics": "deferred",
         }
         return RunnerV2Result(rows, downstream, acceptance, reasons)

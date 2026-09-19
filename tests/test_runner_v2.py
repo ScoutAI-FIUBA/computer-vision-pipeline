@@ -28,9 +28,10 @@ def test_empty_input_is_rejected_without_statistics():
     assert result.acceptance_reasons == ["empty_observations"]
 
 
-def test_malformed_raw_id_is_rejected_at_the_boundary():
+@pytest.mark.parametrize("raw_track_id", ["3", 3.0, True, float("nan"), None])
+def test_malformed_raw_id_is_rejected_at_the_boundary(raw_track_id):
     with pytest.raises(ValueError, match="raw_track_id must be an integer"):
-        RunnerV2(RunnerV2Seams(identity=resolve)).run([row(raw_track_id="not-an-id")])
+        RunnerV2(RunnerV2Seams(identity=resolve)).run([row(raw_track_id=raw_track_id)])
 
 
 def test_missing_identity_mapping_rejects_acceptance_and_statistics():
@@ -54,6 +55,21 @@ def test_conflicting_stable_ids_for_one_raw_track_reject_acceptance():
     assert result.acceptance_reasons == ["conflicting_stable_player_id:raw_track_id=3"]
 
 
+def test_same_frame_raw_tracks_cannot_share_one_stable_player():
+    observations = [row(raw_track_id=3), row(raw_track_id=4)]
+
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {"60:3": "player-7", "60:4": "player-7"}
+        )
+    ).run(observations)
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == [
+        "conflicting_stable_player_id:frame=60:stable_player_id=player-7"
+    ]
+
+
 def test_reid_uses_the_repository_embedder_contract_and_stable_rows():
     calls = []
 
@@ -69,7 +85,7 @@ def test_reid_uses_the_repository_embedder_contract_and_stable_rows():
     assert calls == [("frame-60", [[1, 2, 11, 22]])]
     assert result.observations[0]["stable_player_id"] == "player-3"
     assert result.observations[0]["reid_embedding"] == [0.25, 0.75]
-    assert result.acceptance["tracking_identity"] == "accepted"
+    assert result.acceptance["tracking_identity"] == "unvalidated"
 
 
 def test_team_embedder_and_team_id_use_production_contracts_then_map_to_stable_ids():
@@ -101,3 +117,4 @@ def test_team_embedder_and_team_id_use_production_contracts_then_map_to_stable_i
         "player-3": 0,
         "player-4": 1,
     }
+    assert result.acceptance["tracking_identity"] == "unvalidated"
