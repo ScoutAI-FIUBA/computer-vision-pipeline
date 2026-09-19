@@ -16,6 +16,7 @@
 - [x] 2.2 Added deterministic artifact packaging in `pipeline/results.py`, optional manifest references on `PipelineResults`, and legacy serialization preservation.
 - [x] 2.3 Added a truthful validation-only `RunnerV2`/`run_v2` adapter: identity evidence is structurally validated, repository ReID/team contracts are invoked when frame data is available, and acceptance plus unsupported video-stream stages remain deferred.
 - [x] 2.4 Added isolated `modal_app_v2.py` with the official SAM 3.1 multiplex predictor boundary, HF cache/auth, R2 input/output transfer, raw artifact packaging, retrieval-key response, and no remote video rendering. V2 remains validation-only because `run_v2` is called without an identity authority.
+- [x] 2.4 boundary remediation: validated public inputs before lazy predictor/GPU initialization, rejected SAM cardinality mismatches, added provenance/video/config/benchmark metadata and mask references, and made R2 failure manifests explicitly incomplete before and after transfer attempts.
 
 ## TDD Cycle Evidence
 
@@ -40,6 +41,7 @@
 | Rejected observation leakage audit | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ `reid_embedding` remained in rejected observations | ✅ 14 runner tests passed | ✅ Derived observation fields scrubbed while raw evidence remains | ✅ Centralized scrub set prevents consumer confusion |
 | Rejected derived-field assertion | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ Assertion strengthened from ReID-only to all derived fields | ✅ 14 runner tests passed | ✅ `stable_player_id`, `reid_embedding`, and `team_id` all absent | ✅ Test now checks the complete rejection contract |
 | Populated team-field rejection coverage | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ Regression setup strengthened with pre-existing `team_id` | ✅ 14 runner tests passed | ✅ Populated team field is scrubbed alongside identity/ReID fields | ✅ No production change required |
+| Modal V2 critical boundary findings | `tests/test_modal_app_v2.py` | ✅ 5/5 prior Modal tests passed | ✅ 9 regression tests failed against the permissive boundary | ✅ 15 Modal tests passed | ✅ Invalid inputs, upload failure, metadata/mask references, and all cardinality paths | ✅ Lazy predictor initialization; manifest state is written before transfer |
 
 ## Verification
 
@@ -47,7 +49,9 @@
 - Result: `14 passed`.
 - Modal V2 focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py`
 - Modal V2 result: `5 passed`.
+- Modal V2 remediation result: `15 passed`.
 - Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `69 passed`.
+- Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `41 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
 
