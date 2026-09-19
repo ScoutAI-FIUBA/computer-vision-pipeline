@@ -21,6 +21,7 @@
 - [x] 2.4 setuptools compatibility remediation: kept the V2 image pinned to `setuptools<82` and added a static dependency-contract regression test for the SAM 3.1 `pkg_resources` requirement.
 - [x] `sam31-runtime-deps`: tightened the V2 image to `setuptools<81`, added `einops`, and disabled optional FlashAttention 3 for the baseline predictor with `use_fa3=False`.
 - [x] `sam31-runtime-deps` runtime coverage: added controlled fake `sam3.model_builder` modules and executed `PipelineV2._ensure_predictor()` to verify the builder receives `use_fa3=False` and is cached.
+- [x] `scipy-numpy-compat`: kept the V2 image on `scipy==1.14.1` and added a focused AST regression test for the NumPy 1.26-compatible pin.
 - [x] `sam31-import-smoke`: added the reviewed SAM3 commit pin, official import dependencies, and a GPU/model-free Modal dependency smoke test with focused structural coverage.
 - [x] `sam31-import-smoke` hardening: extracted injectable `check_sam31_imports`, preserved independent attempts/failures, and made the Modal wrapper raise a concise failure summary without model construction.
 - [x] `sam31-import-smoke` review fixes: extracted injectable `run_sam31_dependency_smoke` wrapper logic with runtime failure coverage and documented the exact-image import command in `SETUP.md`.
@@ -57,6 +58,7 @@
 | Modal V2 setuptools compatibility | `tests/test_modal_app_v2.py` | ✅ 27/27 prior Modal tests passed | ✅ Regression failed when the pin was temporarily removed | ✅ 28 Modal tests passed | ➖ Single structural dependency contract; no branching behavior | ✅ Parsed `pip_install` calls without importing Modal |
 | SAM31 runtime dependency baseline | `tests/test_modal_app_v2.py` | ✅ 28/28 prior Modal tests passed | ✅ Setuptools/einops/FlashAttention contracts failed before implementation | ✅ 29 Modal tests passed | ➖ Structural image/predictor contracts; no branching behavior | ✅ Minimal AST-based static checks |
 | SAM31 runtime predictor coverage | `tests/test_modal_app_v2.py` | ✅ 29/29 prior Modal tests passed | ✅ Runtime test exercises the pre-existing path and would fail without the keyword | ✅ 30 Modal tests passed | ✅ Builder invocation plus cached second call | ✅ Controlled module seam; no production change |
+| scipy-numpy-compat | `tests/test_modal_app_v2.py` | ✅ 37/37 prior Modal tests passed | ✅ New exact SciPy pin assertion written before verification | ✅ 38 Modal tests passed | ➖ Single structural dependency contract | ✅ Minimal AST-based assertion; no production change |
 
 ## `sam31-import-smoke` TDD Cycle Evidence
 
@@ -86,6 +88,8 @@
 - `sam31-runtime-deps` relevant command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `55 passed`.
 - `sam31-runtime-deps` runtime-test focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py` — `30 passed`.
 - `sam31-runtime-deps` runtime-test relevant command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `56 passed`.
+- `scipy-numpy-compat` focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py` — `38 passed`.
+- `scipy-numpy-compat` relevant command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_dependency_compatibility.py` — `42 passed, 1 skipped`.
 - `sam31-import-smoke` focused command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py -q` — `33 passed`.
 - `sam31-import-smoke` relevant command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py tests/test_dependency_compatibility.py -q` — `37 passed, 1 skipped`.
 - Full suite: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest -q` — `346 passed, 1 skipped`.

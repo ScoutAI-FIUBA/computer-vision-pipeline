@@ -45,6 +45,23 @@ def test_v2_image_pins_sam31_runtime_dependencies():
     assert "psutil" in pip_dependencies
 
 
+def test_v2_image_pins_scipy_for_numpy_1_26_compatibility():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    pip_dependencies = [
+        argument.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "pip_install"
+        for argument in node.args
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+    ]
+
+    assert "scipy==1.14.1" in pip_dependencies
+
+
 def test_v2_image_pins_reviewed_sam31_commit():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
 

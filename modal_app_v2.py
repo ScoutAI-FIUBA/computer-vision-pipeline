@@ -49,7 +49,7 @@ image = (
         "huggingface_hub==1.7.1",
         "opencv-python-headless==4.10.0.84",
         "numpy",
-        "scipy==1.18.0",
+        "scipy==1.14.1",
         "umap-learn==0.5.9.post2",
         "boxmot==22.0.0",
         "timm==1.0.22",
