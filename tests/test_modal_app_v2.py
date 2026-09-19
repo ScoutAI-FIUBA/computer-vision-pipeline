@@ -187,6 +187,7 @@ def test_legacy_modal_file_is_not_imported_by_v2():
 
 
 def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
+    import cv2
     import numpy as np
     import modal_app_v2
     from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
@@ -223,13 +224,67 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     artifacts = payload["artifacts"]
     assert payload["acceptance"] == {"tracking_identity": "unvalidated", "statistics": "deferred"}
     assert {"tracks.jsonl", "manifest.json"} <= set(artifacts)
-    assert [name for name in artifacts if name.startswith("masks/")]
+    mask = np.array([[0, 255]], dtype=np.uint8)
+    mask_path = next(name for name in artifacts if name.startswith("masks/"))
     manifest = json.loads(artifacts["manifest.json"])
     assert manifest["complete"] is True
     assert manifest["observation_count"] == 1
     assert manifest["config"] == {"prompt": "basketball player", "frame_end": 60, "frame_start": 60}
     assert "wall_seconds" in manifest["benchmark"]
-    assert json.loads(artifacts["tracks.jsonl"].decode())["stable_player_id"] == "player-3"
+    observation = json.loads(artifacts["tracks.jsonl"].decode())
+    assert observation == {
+        "bbox_xyxy": [1.0, 2.0, 11.0, 22.0],
+        "confidence": None,
+        "frame_index": 60,
+        "mask_ref": mask_path,
+        "observation_key": "60:3",
+        "probability": 0.9,
+        "raw_track_id": 3,
+        "stable_player_id": "player-3",
+        "timestamp_seconds": 0.0,
+        "track_state": "tracked",
+    }
+    decoded_mask = cv2.imdecode(np.frombuffer(artifacts[mask_path], dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    assert np.array_equal(decoded_mask, mask)
+
+
+def test_process_rejects_missing_identity_and_defers_statistics(monkeypatch):
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
+
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda rows: RunnerV2(RunnerV2Seams(identity=lambda _items: {})).run(rows),
+    )
+    monkeypatch.setattr(
+        cls,
+        "_ensure_predictor",
+        lambda _self: type("FakePredictor", (), {
+            "handle_request": lambda _self, request: {"session_id": "fake"}
+            if request["type"] == "start_session" else None,
+            "handle_stream_request": lambda _self, _request: iter([{
+                "frame_index": 60,
+                "out_obj_ids": [3],
+                "out_boxes_xywh": [[1, 2, 10, 20]],
+                "out_probs": [0.9],
+            }]),
+        })(),
+    )
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
+
+    assert payload["acceptance"] == {"tracking_identity": "rejected", "statistics": "deferred"}
+    manifest = json.loads(payload["artifacts"]["manifest.json"])
+    assert manifest["acceptance"] == payload["acceptance"]
+    observation = json.loads(payload["artifacts"]["tracks.jsonl"].decode())
+    assert observation["raw_track_id"] == 3
+    assert "stable_player_id" not in observation
+    assert "reid_embedding" not in observation
+    assert "team_id" not in observation
 
 
 def test_process_size_limit_fails_before_returning_partial_artifacts(monkeypatch):

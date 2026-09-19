@@ -77,9 +77,10 @@
 
 | Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
 |------|-----------|-------|------------|-----|-------|-------------|----------|
-| 2.5 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Unit with controlled process seam | ✅ 36/36 | ✅ Process/cardinality tests failed before seam correction | ✅ 26 Modal tests passed; 14 runner tests passed | ✅ Accepted process, size failure, cardinality mismatch, rejection/deferred paths | ✅ Reused existing artifact writer/runner contracts; no production change |
+| 2.5 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Unit with controlled process seam | ✅ 40/40 | ✅ Process/cardinality tests failed before seam correction | ✅ 27 Modal tests passed; 14 runner tests passed | ✅ Complete accepted fields/mask bytes, rejected process gating, size failure, cardinality mismatch, rejection/deferred paths | ✅ Reused existing artifact writer/runner contracts; no production change |
 
 ## Verification
 
-- Task 2.5 focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `40 passed`.
+- Task 2.5 baseline command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `40 passed` (26 Modal, 14 runner).
+- Task 2.5 final command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `41 passed` (27 Modal, 14 runner).
 - No real Modal deployment, GPU inference, `game_03` validation, renderer, or `modal_app.py` modification was performed.
