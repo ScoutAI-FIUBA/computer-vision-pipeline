@@ -73,7 +73,17 @@ def _artifact_size_limit(max_bytes: int | None) -> int:
 
 
 def collect_artifacts(output_dir: Path, *, max_bytes: int | None = None) -> dict[str, bytes]:
-    files = [path for path in sorted(output_dir.rglob("*")) if path.is_file()]
+    root = output_dir.resolve()
+    files = []
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.is_symlink():
+            raise ValueError(f"artifact path is a symlink: {path.relative_to(output_dir)}")
+        resolved = path.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(f"artifact path resolves outside output root: {path.relative_to(output_dir)}")
+        files.append(path)
     total_bytes = sum(path.stat().st_size for path in files)
     limit = _artifact_size_limit(max_bytes)
     if total_bytes > limit:

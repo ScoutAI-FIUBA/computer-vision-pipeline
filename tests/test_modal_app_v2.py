@@ -90,6 +90,19 @@ def test_direct_artifact_mapping_reads_size_limit_from_environment(tmp_path: Pat
         collect_artifacts(tmp_path)
 
 
+def test_direct_artifact_mapping_rejects_symlinked_file_outside_output_root(tmp_path: Path):
+    from modal_app_v2 import collect_artifacts
+
+    output_dir = tmp_path / "artifacts"
+    output_dir.mkdir()
+    outside = tmp_path / "secret.bin"
+    outside.write_bytes(b"secret")
+    (output_dir / "tracks.jsonl").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink|outside"):
+        collect_artifacts(output_dir)
+
+
 def test_local_output_writer_recreates_nested_artifact_paths(tmp_path: Path):
     from modal_app_v2 import write_artifacts
 
