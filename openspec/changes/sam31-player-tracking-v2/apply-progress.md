@@ -21,6 +21,7 @@
 - [x] 2.4 setuptools compatibility remediation: kept the V2 image pinned to `setuptools<82` and added a static dependency-contract regression test for the SAM 3.1 `pkg_resources` requirement.
 - [x] `sam31-runtime-deps`: tightened the V2 image to `setuptools<81`, added `einops`, and disabled optional FlashAttention 3 for the baseline predictor with `use_fa3=False`.
 - [x] `sam31-runtime-deps` runtime coverage: added controlled fake `sam3.model_builder` modules and executed `PipelineV2._ensure_predictor()` to verify the builder receives `use_fa3=False` and is cached.
+- [x] `sam31-import-smoke`: added the reviewed SAM3 commit pin, official import dependencies, and a GPU/model-free Modal dependency smoke test with focused structural coverage.
 
 ## TDD Cycle Evidence
 
@@ -55,6 +56,12 @@
 | SAM31 runtime dependency baseline | `tests/test_modal_app_v2.py` | ✅ 28/28 prior Modal tests passed | ✅ Setuptools/einops/FlashAttention contracts failed before implementation | ✅ 29 Modal tests passed | ➖ Structural image/predictor contracts; no branching behavior | ✅ Minimal AST-based static checks |
 | SAM31 runtime predictor coverage | `tests/test_modal_app_v2.py` | ✅ 29/29 prior Modal tests passed | ✅ Runtime test exercises the pre-existing path and would fail without the keyword | ✅ 30 Modal tests passed | ✅ Builder invocation plus cached second call | ✅ Controlled module seam; no production change |
 
+## `sam31-import-smoke` TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| `sam31-import-smoke` | `tests/test_modal_app_v2.py` | Unit/static boundary | ✅ 33/33 | ✅ Dependency/pin/smoke assertions failed before implementation | ✅ 33 Modal tests passed | ✅ Seven module names, callable builder, and no model construction | ✅ One image and one independent import loop |
+
 ## Verification
 
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py`
@@ -75,14 +82,18 @@
 - `sam31-runtime-deps` relevant command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `55 passed`.
 - `sam31-runtime-deps` runtime-test focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py` — `30 passed`.
 - `sam31-runtime-deps` runtime-test relevant command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `56 passed`.
+- `sam31-import-smoke` focused command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py -q` — `33 passed`.
+- `sam31-import-smoke` relevant command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py tests/test_dependency_compatibility.py -q` — `37 passed, 1 skipped`.
+- Full suite: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest -q` — `346 passed, 1 skipped`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
-- Full suite: deferred to verification phase.
+- Full suite was executed for `sam31-import-smoke`; final renderer/rollback verification remains deferred.
 
 ## Remaining Tasks
 
 - [x] 2.1–2.3 Artifact packaging and truthful runner adapter boundary.
 - [x] 2.4 Modal V2 wiring and raw artifact retrieval boundary.
 - [x] 2.5 Added controlled-fake process coverage for complete direct artifacts, lossless masks, manifest config/benchmark metadata, explicit size-limit failure, SAM cardinality errors, and existing local nested-path, acceptance, no-R2, no-debug-video, and legacy-isolation contracts.
+- [x] `sam31-import-smoke` added explicit `pycocotools`, `Pillow`, and `psutil` dependencies; pinned SAM3 to `2345a4a`; and added `sam31_dependency_smoke_test` without model construction or GPU requirements.
 - [ ] 3.1–3.3 Local renderer, validation, and final rollback/full-suite verification.
 
 ## Task 2.5 TDD Cycle Evidence
@@ -97,3 +108,4 @@
 - Task 2.5 baseline command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `40 passed` (26 Modal, 14 runner).
 - Task 2.5 final command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `41 passed` (27 Modal, 14 runner).
 - No real Modal deployment, GPU inference, `game_03` validation, renderer, Phase 3 work, or `modal_app.py` modification was performed.
+- `sam31-import-smoke` also made no real Modal deployment or model download; the smoke function only imports dependencies and validates builder callability.

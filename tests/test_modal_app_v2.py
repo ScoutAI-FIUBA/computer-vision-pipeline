@@ -40,6 +40,64 @@ def test_v2_image_pins_sam31_runtime_dependencies():
 
     assert "setuptools<81" in pip_dependencies
     assert "einops" in pip_dependencies
+    assert "pycocotools" in pip_dependencies
+    assert "Pillow" in pip_dependencies
+    assert "psutil" in pip_dependencies
+
+
+def test_v2_image_pins_reviewed_sam31_commit():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+
+    assert "2345a4a" in source
+    assert "SAM31_REPOSITORY}@{SAM31_COMMIT}" in source
+    assert "git+https://github.com/facebookresearch/sam3.git\")" not in source
+
+
+def test_v2_dependency_smoke_reports_each_import_and_builder():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    smoke = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sam31_dependency_smoke_test"
+    )
+    source_segment = ast.get_source_segment(source, smoke)
+    assert source_segment is not None
+    assert "SAM31_SMOKE_MODULES" in source_segment
+    for module_name in (
+        "pycocotools.mask",
+        "PIL",
+        "psutil",
+        "einops",
+        "scipy",
+        "cv2",
+        "sam3.model_builder",
+    ):
+        assert module_name in source
+    assert "callable" in source_segment
+
+
+def test_v2_dependency_smoke_does_not_construct_model():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    smoke = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sam31_dependency_smoke_test"
+    )
+
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_sam3_multiplex_video_predictor"
+        for node in ast.walk(smoke)
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "PipelineV2"
+        for node in ast.walk(smoke)
+    )
 
 
 def test_v2_baseline_predictor_disables_optional_flashattention3():

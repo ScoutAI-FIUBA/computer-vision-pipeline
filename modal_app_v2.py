@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import tempfile
@@ -18,6 +19,16 @@ from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
 
 SAM31_REPOSITORY = "git+https://github.com/facebookresearch/sam3.git"
+SAM31_COMMIT = "2345a4a"
+SAM31_SMOKE_MODULES = (
+    "pycocotools.mask",
+    "PIL",
+    "psutil",
+    "einops",
+    "scipy",
+    "cv2",
+    "sam3.model_builder",
+)
 CACHE_DIR = "/cache"
 
 app = modal.App("scoutai-pipeline-v2")
@@ -29,6 +40,9 @@ image = (
     .pip_install(
         "setuptools<81",
         "einops",
+        "pycocotools",
+        "Pillow",
+        "psutil",
         "torch==2.10.0",
         "torchvision==0.25.0",
         "transformers==5.0.0",
@@ -41,12 +55,30 @@ image = (
         "timm==1.0.22",
         "python-dotenv==1.2.2",
     )
-    .pip_install(SAM31_REPOSITORY)
+    .pip_install(f"{SAM31_REPOSITORY}@{SAM31_COMMIT}")
     .env({"HF_HOME": f"{CACHE_DIR}/huggingface", "HF_HUB_CACHE": f"{CACHE_DIR}/huggingface/hub"})
     .add_local_python_source("pipeline")
 )
 
 hf_secret = modal.Secret.from_name("scoutai-huggingface", required_keys=["HF_TOKEN"])
+
+
+@app.function(image=image, timeout=60)
+def sam31_dependency_smoke_test() -> dict[str, Any]:
+    """Check the official SAM3.1 import boundary without loading model weights."""
+    failures: dict[str, str] = {}
+    imported: list[str] = []
+    for module_name in SAM31_SMOKE_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+            if module_name == "sam3.model_builder":
+                builder = getattr(module, "build_sam3_multiplex_video_predictor", None)
+                if not callable(builder):
+                    raise TypeError("build_sam3_multiplex_video_predictor is not callable")
+            imported.append(module_name)
+        except Exception as error:
+            failures[module_name] = f"{type(error).__name__}: {error}"
+    return {"ok": not failures, "imported": imported, "failures": failures}
 
 
 def validate_entrypoint_args(
