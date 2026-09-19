@@ -45,6 +45,7 @@
 | Modal V2 critical boundary findings | `tests/test_modal_app_v2.py` | ✅ 5/5 prior Modal tests passed | ✅ 9 regression tests failed against the permissive boundary | ✅ 15 Modal tests passed | ✅ Invalid inputs, upload failure, metadata/mask references, and all cardinality paths | ✅ Lazy predictor initialization; manifest state is written before transfer |
 | Modal V2 finalized manifest publication | `tests/test_modal_app_v2.py` | ✅ 15/15 prior Modal tests passed | ✅ Success-path regression observed only the incomplete marker remotely | ✅ 16 Modal tests passed | ✅ Initial incomplete marker plus finalized complete manifest; failed uploads remain incomplete | ✅ Final manifest upload is inside the transfer transaction |
 | Modal V2 direct artifact return | `tests/test_modal_app_v2.py` | ✅ 16/16 prior Modal tests passed | ✅ R2-oriented boundary tests failed against the direct-return contract | ✅ 12 direct-return tests passed | ✅ Relative byte mapping, nested local writing, incomplete local manifest, and input bytes | ✅ Removed external-storage helpers and retained ephemeral packaging |
+| Modal V2 artifact size/path boundary | `tests/test_modal_app_v2.py` | ✅ 12/12 direct-return tests passed | ✅ Size-limit and unsafe-path regressions failed before implementation | ✅ 20 Modal tests passed | ✅ Explicit/env size limits, absolute/traversal/invalid paths, and nested masks | ✅ Preflight total size before reading bytes; validate all paths before writing |
 
 ## Verification
 
@@ -55,8 +56,9 @@
 - Modal V2 remediation result: `15 passed`.
 - Modal V2 final manifest result: `16 passed`.
 - Modal V2 direct-return result: `12 passed`.
+- Modal V2 size/path result: `20 passed`.
 - Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `69 passed`.
-- Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `38 passed`.
+- Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `46 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
 

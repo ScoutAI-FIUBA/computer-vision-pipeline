@@ -71,6 +71,25 @@ def test_direct_artifact_mapping_returns_relative_bytes(tmp_path: Path):
     assert all(not Path(name).is_absolute() for name in artifacts)
 
 
+def test_direct_artifact_mapping_rejects_configured_size_limit(tmp_path: Path):
+    from modal_app_v2 import collect_artifacts
+
+    (tmp_path / "tracks.jsonl").write_bytes(b"1234")
+
+    with pytest.raises(ValueError, match="exceeds configured artifact return limit"):
+        collect_artifacts(tmp_path, max_bytes=3)
+
+
+def test_direct_artifact_mapping_reads_size_limit_from_environment(tmp_path: Path, monkeypatch):
+    from modal_app_v2 import collect_artifacts
+
+    (tmp_path / "tracks.jsonl").write_bytes(b"1234")
+    monkeypatch.setenv("SAM31_MAX_ARTIFACT_BYTES", "3")
+
+    with pytest.raises(ValueError, match="exceeds configured artifact return limit"):
+        collect_artifacts(tmp_path)
+
+
 def test_local_output_writer_recreates_nested_artifact_paths(tmp_path: Path):
     from modal_app_v2 import write_artifacts
 
@@ -81,6 +100,16 @@ def test_local_output_writer_recreates_nested_artifact_paths(tmp_path: Path):
 
     assert (tmp_path / "output" / "manifest.json").read_bytes() == b"{}"
     assert (tmp_path / "output" / "masks" / "1.png").read_bytes() == b"png"
+
+
+@pytest.mark.parametrize("relative_path", ["", ".", "/tmp/out", "../escape", "masks/../../escape", "bad\\path"])
+def test_local_output_writer_rejects_unsafe_artifact_paths(tmp_path: Path, relative_path: str):
+    from modal_app_v2 import write_artifacts
+
+    with pytest.raises(ValueError, match="artifact path"):
+        write_artifacts({relative_path: b"nope"}, tmp_path / "output")
+
+    assert not (tmp_path / "escape").exists()
 
 
 def test_local_entrypoint_writes_remote_artifact_bytes(tmp_path: Path, monkeypatch, capsys):

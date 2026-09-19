@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 import modal
@@ -58,18 +60,54 @@ def validate_entrypoint_args(
         raise ValueError("frame range must be non-negative and ordered")
 
 
-def collect_artifacts(output_dir: Path) -> dict[str, bytes]:
+DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+
+
+def _artifact_size_limit(max_bytes: int | None) -> int:
+    if max_bytes is None:
+        raw = os.getenv("SAM31_MAX_ARTIFACT_BYTES")
+        max_bytes = DEFAULT_MAX_ARTIFACT_BYTES if raw is None else int(raw)
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("max artifact return size must be a positive integer")
+    return max_bytes
+
+
+def collect_artifacts(output_dir: Path, *, max_bytes: int | None = None) -> dict[str, bytes]:
+    files = [path for path in sorted(output_dir.rglob("*")) if path.is_file()]
+    total_bytes = sum(path.stat().st_size for path in files)
+    limit = _artifact_size_limit(max_bytes)
+    if total_bytes > limit:
+        raise ValueError(
+            f"artifact return size {total_bytes} exceeds configured artifact return limit {limit}"
+        )
     return {
         path.relative_to(output_dir).as_posix(): path.read_bytes()
-        for path in sorted(output_dir.rglob("*"))
-        if path.is_file()
+        for path in files
     }
 
 
+def _artifact_destination(relative_path: str, output_dir: Path) -> Path:
+    if not isinstance(relative_path, str) or not relative_path or "\x00" in relative_path:
+        raise ValueError(f"invalid artifact path: {relative_path!r}")
+    if relative_path != relative_path.strip() or "\\" in relative_path:
+        raise ValueError(f"invalid artifact path: {relative_path!r}")
+    path = PurePosixPath(relative_path)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"invalid artifact path: {relative_path!r}")
+    root = output_dir.resolve()
+    destination = (root / Path(*path.parts)).resolve()
+    if destination == root or root not in destination.parents:
+        raise ValueError(f"invalid artifact path: {relative_path!r}")
+    return destination
+
+
 def write_artifacts(artifacts: dict[str, bytes], output_dir: Path) -> None:
+    destinations = [
+        (_artifact_destination(relative_path, output_dir), data)
+        for relative_path, data in artifacts.items()
+    ]
     output_dir.mkdir(parents=True, exist_ok=True)
-    for relative_path, data in artifacts.items():
-        destination = output_dir / relative_path
+    for destination, data in destinations:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
 
@@ -185,6 +223,7 @@ class PipelineV2:
         frame_start: int = 60,
         frame_end: int = 130,
         return_artifacts: bool = False,
+        max_artifact_bytes: int | None = None,
     ) -> dict[str, Any]:
         validate_entrypoint_args(
             video_bytes=video_bytes,
@@ -217,7 +256,7 @@ class PipelineV2:
             )
             payload = {"acceptance": result.acceptance}
             if return_artifacts:
-                payload["artifacts"] = collect_artifacts(output_dir)
+                payload["artifacts"] = collect_artifacts(output_dir, max_bytes=max_artifact_bytes)
             return payload
 
 
@@ -228,6 +267,7 @@ def main(
     prompt: str = "basketball player",
     frame_start: int = 60,
     frame_end: int = 130,
+    max_artifact_bytes: int = 0,
 ) -> None:
     if not video_path:
         raise ValueError("--video-path is required")
@@ -247,6 +287,7 @@ def main(
         frame_start=frame_start,
         frame_end=frame_end,
         return_artifacts=bool(output_dir),
+        max_artifact_bytes=max_artifact_bytes or None,
     )
     artifacts = payload.pop("artifacts", None)
     print(json.dumps(payload, indent=2, sort_keys=True))
