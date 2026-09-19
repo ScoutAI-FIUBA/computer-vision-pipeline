@@ -42,6 +42,7 @@
 | Rejected derived-field assertion | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ Assertion strengthened from ReID-only to all derived fields | ✅ 14 runner tests passed | ✅ `stable_player_id`, `reid_embedding`, and `team_id` all absent | ✅ Test now checks the complete rejection contract |
 | Populated team-field rejection coverage | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ Regression setup strengthened with pre-existing `team_id` | ✅ 14 runner tests passed | ✅ Populated team field is scrubbed alongside identity/ReID fields | ✅ No production change required |
 | Modal V2 critical boundary findings | `tests/test_modal_app_v2.py` | ✅ 5/5 prior Modal tests passed | ✅ 9 regression tests failed against the permissive boundary | ✅ 15 Modal tests passed | ✅ Invalid inputs, upload failure, metadata/mask references, and all cardinality paths | ✅ Lazy predictor initialization; manifest state is written before transfer |
+| Modal V2 finalized manifest publication | `tests/test_modal_app_v2.py` | ✅ 15/15 prior Modal tests passed | ✅ Success-path regression observed only the incomplete marker remotely | ✅ 16 Modal tests passed | ✅ Initial incomplete marker plus finalized complete manifest; failed uploads remain incomplete | ✅ Final manifest upload is inside the transfer transaction |
 
 ## Verification
 
@@ -50,8 +51,9 @@
 - Modal V2 focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py`
 - Modal V2 result: `5 passed`.
 - Modal V2 remediation result: `15 passed`.
+- Modal V2 final manifest result: `16 passed`.
 - Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `69 passed`.
-- Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `41 passed`.
+- Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `42 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
 

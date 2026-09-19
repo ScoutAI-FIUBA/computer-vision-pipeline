@@ -120,6 +120,9 @@ def upload_artifacts(directory: Path, output_prefix: str) -> tuple[list[str], li
             key = f"{output_prefix.rstrip('/')}/{relative}"
             keys.append(storage.upload(path, key, content_types.get(path.suffix)))
         write_manifest(complete=True, errors=[])
+        # Re-publish after finalization so retrieval sees the same complete state
+        # returned by the process, not the initial upload_pending marker.
+        storage.upload(manifest_path, manifest_key, "application/json")
         return keys, []
     except Exception as error:  # noqa: BLE001 - preserve transfer failure in response
         errors = [f"{type(error).__name__}: {error}"]

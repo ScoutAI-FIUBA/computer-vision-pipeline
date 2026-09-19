@@ -136,6 +136,33 @@ def test_failed_upload_overwrites_manifest_with_incomplete_state(tmp_path: Path,
     assert failed_manifest["transfer_errors"] == ["OSError: R2 unavailable"]
 
 
+def test_successful_upload_republishes_final_complete_manifest(tmp_path: Path, monkeypatch):
+    from modal_app_v2 import upload_artifacts
+
+    (tmp_path / "manifest.json").write_text(
+        '{"complete": true, "truncated": false, "transfer_errors": [], '
+        '"artifacts": {"manifest": {"key": "runs/job/manifest.json"}}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "tracks.jsonl").write_text("{}\n", encoding="utf-8")
+    remote_manifests = []
+
+    class RecordingStorage:
+        def upload(self, source, key, content_type=None):
+            if key.endswith("manifest.json"):
+                remote_manifests.append(__import__("json").loads(source.read_text(encoding="utf-8")))
+            return key
+
+    monkeypatch.setattr("modal_app_v2.R2Storage", RecordingStorage)
+    keys, errors = upload_artifacts(tmp_path, "runs/job")
+
+    assert errors == []
+    assert keys == ["runs/job/manifest.json", "runs/job/tracks.jsonl"]
+    assert [manifest["complete"] for manifest in remote_manifests] == [False, True]
+    assert remote_manifests[-1]["truncated"] is False
+    assert remote_manifests[-1]["transfer_errors"] == []
+
+
 def test_session_output_rejects_cardinality_mismatches():
     from modal_app_v2 import _session_objects
 
