@@ -46,4 +46,4 @@ Chain strategy: feature-branch-chain
 
 ## Status
 
-Phase 1 and completed Phase 2 contract/runner work remain complete; corrected direct-return Modal work is marked complete, with 2.5 and Phase 3 still pending.
+Phase 1 and Phase 2 work through task 2.5 are complete; Phase 3 remains pending.
