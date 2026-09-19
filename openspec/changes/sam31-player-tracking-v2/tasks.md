@@ -46,4 +46,4 @@ Chain strategy: feature-branch-chain
 
 ## Status
 
-Phase 1 foundation/contracts and adapter boundary complete; ready for the next work unit.
+Phase 1 foundation/contracts and Phase 2 artifact contract/packaging complete; ready for the next work unit.

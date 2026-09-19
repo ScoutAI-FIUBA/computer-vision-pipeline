@@ -4,7 +4,7 @@
 
 - Boundary: Phase 1 foundation/contracts and adapter boundary, tasks 1.1–1.3; Phase 2 artifact packaging, tasks 2.1–2.2.
 - Delivery: feature-branch-chain strategy implemented as ordered local atomic commits; no PR.
-- Rollback: revert the single work-unit commit.
+- Rollback: revert the artifact work-unit commits `0242d74` and the follow-up integrity fix commit.
 - Scope guard: `modal_app.py` untouched; runner, Modal wiring, remote rendering, and local renderer deferred.
 
 ## Completed Tasks
@@ -22,13 +22,19 @@
 | 1.1 | `tests/test_sam31_tracking.py` | Unit | N/A (new) | ✅ Missing module failure | ✅ 3 focused tests passed | ✅ Multiple objects, xywh, null identity | ✅ Contract kept as pure normalization helpers |
 | 1.2 | `tests/test_sam31_tracking.py` | Unit | N/A (new) | ✅ Missing module failure | ✅ 3 focused tests passed | ✅ Prompt/lifecycle, bounded loss, pre-start guard | ✅ Session dependency injected; no model import at module load |
 | 1.3 | `tests/test_config.py` | Unit | ✅ 23/23 | ✅ Missing V2 fields/config behavior | ✅ 24 config tests passed, then 26 after triangulation | ✅ Environment parsing and invalid range/retention cases | ✅ Reused existing env parsing conventions |
-| 2.1 | `tests/test_results_artifacts.py` | Unit | ✅ 30 prior focused tests | ✅ Import failure for missing `package_artifacts` | ✅ 4 artifact tests passed | ✅ Complete package, missing mask/transfer failure, duplicate keys, legacy payload | ✅ Kept contract assertions focused on persisted/retrievable values |
-| 2.2 | `tests/test_results_artifacts.py` | Unit | ✅ 4/4 artifact tests | ✅ Same missing production API | ✅ 4 artifact tests passed; 74 legacy/results tests passed | ✅ PNG round-trip and incomplete transfer paths | ✅ Small pure reference helper; no bulk inline return |
+| 2.1 | `tests/test_results_artifacts.py` | Unit | N/A (new test file) | ✅ Import failure for missing `package_artifacts` | ✅ 4 artifact tests passed | ✅ Complete package, missing mask/transfer failure, duplicate keys, legacy payload | ✅ Kept contract assertions focused on persisted/retrievable values |
+| 2.2 | `tests/test_results_artifacts.py` | Unit | N/A (initial baseline not captured before first implementation) | ✅ Missing production API | ✅ 4 artifact tests passed; 70 legacy result tests passed afterward | ✅ PNG round-trip and incomplete transfer paths | ✅ Small pure reference helper; no bulk inline return |
+
+### Review Fix Evidence
+
+| Fix | Test File | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|
+| Manifest integrity, collision-free masks, incomplete packages | `tests/test_results_artifacts.py` | ✅ 74 focused/result tests passed before edits | ✅ 3 authoritative review tests failed | ✅ 6 artifact tests passed | ✅ Prefix/no-prefix manifests, adversarial keys, missing masks and transfer errors | ✅ Canonical self-reference-excluding hash helper |
 
 ## Verification
 
 - Focused command: `.venv/bin/python -m pytest tests/test_results_artifacts.py tests/test_ball_tracking.py tests/test_shot_events.py tests/test_number_evidence.py`
-- Result: `74 passed`.
+- Result: `76 passed`.
 - Full suite: deferred to verification phase.
 
 ## Remaining Tasks

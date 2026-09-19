@@ -14,8 +14,8 @@ unpleasant as one in-memory list.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -130,6 +130,17 @@ def _artifact_ref(path: Path, key: str) -> dict[str, Any]:
     return {"key": key, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def _mask_filename(observation_key: str) -> str:
+    return f"{hashlib.sha256(observation_key.encode('utf-8')).hexdigest()}.png"
+
+
+def _manifest_hash(manifest: Mapping[str, Any]) -> str:
+    payload = json.loads(json.dumps(manifest))
+    payload["artifacts"]["manifest"].pop("sha256", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def package_artifacts(
     output_dir: Path,
     observations: Iterable[Mapping[str, Any]],
@@ -174,7 +185,7 @@ def package_artifacts(
             mask = mask.astype(np.uint8)
         if mask.dtype != np.uint8:
             raise ValueError(f"mask for {key!r} must use lossless uint8 data")
-        filename = key.replace(":", "-") + ".png"
+        filename = _mask_filename(key)
         mask_path = mask_dir / filename
         if not cv2.imwrite(str(mask_path), mask):
             raise OSError(f"could not write mask for {key!r}")
@@ -182,6 +193,8 @@ def package_artifacts(
 
     prefix = output_prefix.strip("/")
     tracks_key = f"{prefix}/tracks.jsonl" if prefix else "tracks.jsonl"
+    transfer_errors_list = list(transfer_errors)
+    incomplete = bool(truncated or missing_masks or transfer_errors_list)
     manifest: dict[str, Any] = {
         "schema": "sam31-artifacts",
         "schema_version": 1,
@@ -204,13 +217,11 @@ def package_artifacts(
                 "references": mask_refs,
             },
         },
-        "transfer_errors": list(transfer_errors),
-        "truncated": bool(truncated),
+        "transfer_errors": transfer_errors_list,
+        "truncated": incomplete,
+        "complete": not incomplete,
     }
     manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    manifest["artifacts"]["manifest"] = _artifact_ref(
-        manifest_path, f"{prefix}/manifest.json" if prefix else "manifest.json"
-    )
+    manifest["artifacts"]["manifest"]["sha256"] = _manifest_hash(manifest)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     return manifest

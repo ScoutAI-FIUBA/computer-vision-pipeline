@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import cv2
@@ -54,8 +55,32 @@ def test_package_writes_manifest_tracks_and_lossless_mask(tmp_path: Path):
     assert manifest["truncated"] is False
 
     assert json.loads((tmp_path / "tracks.jsonl").read_text())["observation_key"] == "60:3"
-    written = cv2.imread(str(tmp_path / "masks" / "60-3.png"), cv2.IMREAD_UNCHANGED)
+    mask_key = manifest["artifacts"]["masks"]["references"]["60:3"]["key"]
+    written = cv2.imread(str(tmp_path / mask_key.removeprefix("runs/game-03/")), cv2.IMREAD_UNCHANGED)
     np.testing.assert_array_equal(written, mask)
+
+
+def test_manifest_integrity_hash_excludes_its_own_hash(tmp_path: Path):
+    manifest = package_artifacts(tmp_path, _observations(), {"60:3": np.ones((2, 2), dtype=np.uint8)})
+    manifest_ref = manifest["artifacts"]["manifest"]
+    expected_payload = json.loads(json.dumps(manifest))
+    expected_payload["artifacts"]["manifest"].pop("sha256")
+    canonical = json.dumps(expected_payload, sort_keys=True, separators=(",", ":")).encode()
+
+    assert manifest_ref["sha256"] == hashlib.sha256(canonical).hexdigest()
+
+
+def test_adversarial_observation_keys_get_distinct_mask_artifacts(tmp_path: Path):
+    observations = [{**_observations()[0], "observation_key": key} for key in ("a:b", "a-b")]
+    manifest = package_artifacts(
+        tmp_path,
+        observations,
+        {"a:b": np.ones((1, 1), dtype=np.uint8), "a-b": np.zeros((1, 1), dtype=np.uint8)},
+    )
+
+    refs = manifest["artifacts"]["masks"]["references"]
+    assert refs["a:b"]["key"] != refs["a-b"]["key"]
+    assert len(list((tmp_path / "masks").glob("*.png"))) == 2
 
 
 def test_package_records_missing_mask_and_transfer_failure_explicitly(tmp_path: Path):
@@ -68,6 +93,7 @@ def test_package_records_missing_mask_and_transfer_failure_explicitly(tmp_path: 
     )
 
     assert manifest["truncated"] is True
+    assert manifest["complete"] is False
     assert manifest["transfer_errors"] == ["upload timed out"]
     assert manifest["artifacts"]["masks"]["missing"] == ["60:3"]
 
