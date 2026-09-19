@@ -63,7 +63,7 @@ def test_v2_dependency_smoke_reports_each_import_and_builder():
     )
     source_segment = ast.get_source_segment(source, smoke)
     assert source_segment is not None
-    assert "check_sam31_imports" in source_segment
+    assert "run_sam31_dependency_smoke" in source_segment
     for module_name in (
         "pycocotools.mask",
         "PIL",
@@ -75,7 +75,7 @@ def test_v2_dependency_smoke_reports_each_import_and_builder():
     ):
         assert module_name in source
     assert "callable" in source
-    assert "raise RuntimeError" in source_segment
+    assert "raise RuntimeError" in source
 
 
 def test_v2_dependency_smoke_does_not_construct_model():
@@ -139,6 +139,32 @@ def test_v2_import_check_reports_non_callable_builder_without_skipping_modules()
     assert report["imported"] == [module for module in SAM31_SMOKE_MODULES if module != "sam3.model_builder"]
     assert set(report["failures"]) == {"sam3.model_builder"}
     assert "not callable" in report["failures"]["sam3.model_builder"]
+
+
+def test_v2_smoke_wrapper_raises_concise_failure_for_controlled_checker():
+    from modal_app_v2 import run_sam31_dependency_smoke
+
+    calls = []
+
+    def fake_checker():
+        calls.append(True)
+        return {"ok": False, "imported": [], "failures": {"PIL": "blocked", "scipy": "blocked"}}
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^SAM3\.1 dependency smoke failed: PIL, scipy$",
+    ):
+        run_sam31_dependency_smoke(import_checker=fake_checker)
+
+    assert calls == [True]
+
+
+def test_v2_smoke_wrapper_returns_successful_checker_report():
+    from modal_app_v2 import run_sam31_dependency_smoke
+
+    report = {"ok": True, "imported": ["PIL"], "failures": {}}
+
+    assert run_sam31_dependency_smoke(import_checker=lambda: report) is report
 
 
 def test_v2_baseline_predictor_disables_optional_flashattention3():

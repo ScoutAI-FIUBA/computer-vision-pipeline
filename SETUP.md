@@ -147,7 +147,27 @@ modal secret list
 
 ---
 
-## 3. First run — smallest possible
+## 3. Validate the SAM3.1 import image without GPU inference
+
+Run the dependency smoke test in the exact image defined by
+`modal_app_v2.py`:
+
+```bash
+modal run modal_app_v2.py::sam31_dependency_smoke_test
+```
+
+This checks the official SAM3.1 import path (`pycocotools.mask`, `PIL`,
+`psutil`, `einops`, `scipy`, OpenCV, and `sam3.model_builder`) and verifies
+that the predictor builder is callable. It does **not** construct the model,
+download model weights, or require a GPU.
+
+This is an import/environment check only. It does not replace the GPU
+predictor smoke or inference path: `PipelineV2.process` initializes the
+predictor lazily when the normal V2 video command is run.
+
+---
+
+## 4. First run — smallest possible
 
 This builds the image (slow the first time, ~5-10 min, cached afterwards),
 loads SAM2, and processes **90 frames only**.
@@ -190,7 +210,7 @@ If it fails, the likely causes in order:
 
 ---
 
-## 4. Check what it cost
+## 5. Check what it cost
 
 ```bash
 modal app list
@@ -205,7 +225,7 @@ around 20-30 minutes of GPU time. Measure rather than trust that.
 
 ---
 
-## 5. Scale up gradually
+## 6. Scale up gradually
 
 Once 90 frames works, increase deliberately. Do not jump straight to a full game.
 
@@ -221,7 +241,7 @@ modal run modal_app.py --r2-key videos/TEAM_ID/VIDEO_ID --output-prefix results/
 
 ---
 
-## 6. Deploy the endpoint
+## 7. Deploy the endpoint
 
 Only needed when something else has to call the pipeline over HTTP. `modal run`
 does not require this.
@@ -252,7 +272,7 @@ for the GPU.
 
 ---
 
-## 7. Configuration quick path
+## 8. Configuration quick path
 
 `pipeline/config.py` is the source of truth for the deployed pipeline.
 
@@ -341,7 +361,7 @@ system yet.
 
 ---
 
-## 8. The cost knobs, and what they cost
+## 9. The cost knobs, and what they cost
 
 All of these live in `modal_app.py` and `pipeline/config.py`, each with a `COST:`
 comment next to it. Summary:
@@ -424,7 +444,7 @@ Two safety habits worth keeping:
 
 ---
 
-## 9. Running without Modal
+## 10. Running without Modal
 
 The pipeline is plain Python and imports nothing from Modal. On a machine with a
 GPU:

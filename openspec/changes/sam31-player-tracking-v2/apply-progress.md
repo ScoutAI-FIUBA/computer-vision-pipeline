@@ -23,6 +23,7 @@
 - [x] `sam31-runtime-deps` runtime coverage: added controlled fake `sam3.model_builder` modules and executed `PipelineV2._ensure_predictor()` to verify the builder receives `use_fa3=False` and is cached.
 - [x] `sam31-import-smoke`: added the reviewed SAM3 commit pin, official import dependencies, and a GPU/model-free Modal dependency smoke test with focused structural coverage.
 - [x] `sam31-import-smoke` hardening: extracted injectable `check_sam31_imports`, preserved independent attempts/failures, and made the Modal wrapper raise a concise failure summary without model construction.
+- [x] `sam31-import-smoke` review fixes: extracted injectable `run_sam31_dependency_smoke` wrapper logic with runtime failure coverage and documented the exact-image import command in `SETUP.md`.
 
 ## TDD Cycle Evidence
 
@@ -63,6 +64,7 @@
 |------|-----------|-------|------------|-----|-------|-------------|----------|
 | `sam31-import-smoke` | `tests/test_modal_app_v2.py` | Unit/static boundary | ✅ 33/33 | ✅ Dependency/pin/smoke assertions failed before implementation | ✅ 33 Modal tests passed | ✅ Seven module names, callable builder, and no model construction | ✅ One image and one independent import loop |
 | `sam31-import-smoke` hardening | `tests/test_modal_app_v2.py` | Unit | ✅ 33/33 | ✅ Injectable helper test failed before extraction | ✅ 35 Modal tests passed | ✅ Selected import failures plus non-callable builder while all modules were attempted | ✅ Small pure helper; Modal wrapper only formats/raises |
+| `sam31-import-smoke` review fixes | `tests/test_modal_app_v2.py`, `SETUP.md` | Unit/docs | ✅ 35/35 | ✅ Runtime wrapper test failed before injectable wrapper logic | ✅ 37 Modal tests passed | ✅ Failure and success wrapper paths; command purpose and GPU distinction documented | ✅ Modal function delegates to the same minimal wrapper |
 
 ## Verification
 
@@ -90,6 +92,9 @@
 - `sam31-import-smoke` hardening focused command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py -q` — `35 passed`.
 - `sam31-import-smoke` hardening relevant command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py tests/test_dependency_compatibility.py -q` — `39 passed, 1 skipped`.
 - Full suite after hardening: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest -q` — `348 passed, 1 skipped`.
+- `sam31-import-smoke` review-fix focused command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py -q` — `37 passed`.
+- `sam31-import-smoke` review-fix relevant command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py tests/test_dependency_compatibility.py -q` — `41 passed, 1 skipped`.
+- Full suite after review fixes: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest -q` — `350 passed, 1 skipped`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite was executed for `sam31-import-smoke`; final renderer/rollback verification remains deferred.
 
@@ -100,6 +105,7 @@
 - [x] 2.5 Added controlled-fake process coverage for complete direct artifacts, lossless masks, manifest config/benchmark metadata, explicit size-limit failure, SAM cardinality errors, and existing local nested-path, acceptance, no-R2, no-debug-video, and legacy-isolation contracts.
 - [x] `sam31-import-smoke` added explicit `pycocotools`, `Pillow`, and `psutil` dependencies; pinned SAM3 to `2345a4a`; and added `sam31_dependency_smoke_test` without model construction or GPU requirements.
 - [x] `sam31-import-smoke` hardening added controlled import-failure and non-callable-builder coverage while preserving all dependency, pin, isolation, and no-download contracts.
+- [x] `sam31-import-smoke` review fixes added runtime wrapper failure/success coverage and documented `modal run modal_app_v2.py::sam31_dependency_smoke_test` in `SETUP.md`.
 - [ ] 3.1–3.3 Local renderer, validation, and final rollback/full-suite verification.
 
 ## Task 2.5 TDD Cycle Evidence

@@ -79,14 +79,18 @@ def check_sam31_imports(import_module=importlib.import_module) -> dict[str, Any]
     return {"ok": not failures, "imported": imported, "failures": failures}
 
 
-@app.function(image=image, timeout=60)
-def sam31_dependency_smoke_test() -> dict[str, Any]:
-    """Check the official SAM3.1 import boundary without loading model weights."""
-    report = check_sam31_imports()
+def run_sam31_dependency_smoke(import_checker=check_sam31_imports) -> dict[str, Any]:
+    report = import_checker()
     if report["failures"]:
         failed_modules = ", ".join(sorted(report["failures"]))
         raise RuntimeError(f"SAM3.1 dependency smoke failed: {failed_modules}")
     return report
+
+
+@app.function(image=image, timeout=60)
+def sam31_dependency_smoke_test() -> dict[str, Any]:
+    """Check the official SAM3.1 import boundary without loading model weights."""
+    return run_sam31_dependency_smoke()
 
 
 def validate_entrypoint_args(
