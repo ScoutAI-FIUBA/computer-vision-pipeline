@@ -173,3 +173,35 @@ def test_same_stable_player_with_consistent_team_assignments_is_retained():
 
     assert result.downstream["team_assignments"] == {"player-7": 1}
     assert result.acceptance["tracking_identity"] == "unvalidated"
+
+
+def test_conflicting_team_validation_discards_reid_output_atomically():
+    class FakeEmbedder:
+        def embed(self, frame, boxes):
+            return [[0.25, 0.75] for _ in boxes]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class ConflictingClusterer:
+        name = "conflicting-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0, 1]
+
+    observations = [row(frame_index=60, raw_track_id=3), row(frame_index=61, raw_track_id=4)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
+            reid=FakeEmbedder(),
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=ConflictingClusterer(),
+        )
+    ).run(observations, frames_by_index={60: "frame-60", 61: "frame-61"})
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance["statistics"] == "deferred"
+    assert result.downstream == {}

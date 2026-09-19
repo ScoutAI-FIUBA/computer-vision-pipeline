@@ -209,6 +209,10 @@ class RunnerV2:
                 downstream["team_assignments"] = team_assignments
 
         structurally_valid = not reasons
+        if not structurally_valid:
+            # ReID may have run before a later team check failed. Never expose
+            # that partial work as consumable output from a rejected run.
+            downstream = {}
 
         acceptance = {
             "tracking_identity": "unvalidated" if structurally_valid else "rejected",
