@@ -3,94 +3,101 @@ from __future__ import annotations
 import pytest
 
 from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
+from pipeline.team_embedder import TeamFeatures
 
 
-def test_runner_preserves_raw_ids_and_routes_stable_ids_to_downstream_seams():
+def row(frame_index=60, raw_track_id=3, stable_player_id=None):
+    return {
+        "observation_key": f"{frame_index}:{raw_track_id}",
+        "frame_index": frame_index,
+        "raw_track_id": raw_track_id,
+        "stable_player_id": stable_player_id,
+        "bbox_xyxy": [1, 2, 11, 22],
+        "track_state": "tracked",
+    }
+
+
+def resolve(rows):
+    return {item["observation_key"]: f"player-{item['raw_track_id']}" for item in rows}
+
+
+def test_empty_input_is_rejected_without_statistics():
+    result = RunnerV2(RunnerV2Seams(identity=resolve)).run([])
+
+    assert result.acceptance == {"tracking_identity": "rejected", "statistics": "deferred"}
+    assert result.acceptance_reasons == ["empty_observations"]
+
+
+def test_malformed_raw_id_is_rejected_at_the_boundary():
+    with pytest.raises(ValueError, match="raw_track_id must be an integer"):
+        RunnerV2(RunnerV2Seams(identity=resolve)).run([row(raw_track_id="not-an-id")])
+
+
+def test_missing_identity_mapping_rejects_acceptance_and_statistics():
+    result = RunnerV2(RunnerV2Seams(identity=lambda rows: {})).run([row()])
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == ["missing_stable_player_id:60:3"]
+    assert "statistics" not in result.downstream
+
+
+def test_conflicting_stable_ids_for_one_raw_track_reject_acceptance():
+    observations = [row(raw_track_id=3), row(frame_index=61, raw_track_id=3)]
+
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {"60:3": "player-3", "61:3": "player-9"}
+        )
+    ).run(observations)
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == ["conflicting_stable_player_id:raw_track_id=3"]
+
+
+def test_reid_uses_the_repository_embedder_contract_and_stable_rows():
     calls = []
 
-    def resolve_identity(rows):
-        return {row["observation_key"]: f"player-{row['raw_track_id']}" for row in rows}
-
-    def downstream(rows):
-        calls.append(rows)
-        return {row["stable_player_id"] for row in rows}
+    class FakeEmbedder:
+        def embed(self, frame, boxes):
+            calls.append((frame, boxes))
+            return [[0.25, 0.75] for _ in boxes]
 
     result = RunnerV2(
-        seams=RunnerV2Seams(identity=resolve_identity, team_id=downstream, analytics=downstream)
-    ).run(
-        [
-            {
-                "observation_key": "60:3",
-                "frame_index": 60,
-                "raw_track_id": 3,
-                "stable_player_id": None,
-                "bbox_xyxy": [1, 2, 3, 4],
-                "track_state": "tracked",
-            }
-        ],
-        tracking_identity_accepted=True,
-    )
+        RunnerV2Seams(identity=resolve, reid=FakeEmbedder())
+    ).run([row()], frames_by_index={60: "frame-60"})
 
-    assert result.observations[0]["raw_track_id"] == 3
+    assert calls == [("frame-60", [[1, 2, 11, 22]])]
     assert result.observations[0]["stable_player_id"] == "player-3"
-    assert result.downstream["team_id"] == {"player-3"}
-    assert calls[0][0]["raw_track_id"] == 3
+    assert result.observations[0]["reid_embedding"] == [0.25, 0.75]
+    assert result.acceptance["tracking_identity"] == "accepted"
 
 
-def test_runner_blocks_statistics_when_tracking_identity_gate_fails():
-    statistics_calls = []
+def test_team_embedder_and_team_id_use_production_contracts_then_map_to_stable_ids():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [
+                TeamFeatures(color_signature=[float(sample.track_id)], embedding=None)
+                for sample in samples
+            ]
+
+    class FakeClusterer:
+        name = "fake-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0, 1]
+
+    observations = [row(raw_track_id=3), row(frame_index=60, raw_track_id=4)]
     result = RunnerV2(
-        seams=RunnerV2Seams(
-            analytics=lambda rows: {"accepted_rows": len(rows)},
-            statistics=lambda rows: statistics_calls.append(rows),
+        RunnerV2Seams(
+            identity=resolve,
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=FakeClusterer(),
         )
-    ).run(
-        [
-            {
-                "observation_key": "60:3",
-                "frame_index": 60,
-                "raw_track_id": 3,
-                "stable_player_id": "player-3",
-                "bbox_xyxy": [1, 2, 3, 4],
-                "track_state": "tracked",
-            }
-        ],
-        tracking_identity_accepted=False,
-    )
+    ).run(observations, frames_by_index={60: "frame-60"})
 
-    assert result.acceptance == {
-        "tracking_identity": "rejected",
-        "statistics": "deferred",
+    assert result.downstream["team_assignments"] == {
+        "player-3": 0,
+        "player-4": 1,
     }
-    assert result.downstream["analytics"] == {"accepted_rows": 1}
-    assert "statistics" not in result.downstream
-    assert statistics_calls == []
-
-
-def test_runner_rejects_rows_without_raw_identity():
-    with pytest.raises(ValueError, match="raw_track_id"):
-        RunnerV2().run(
-            [{"observation_key": "60:3", "stable_player_id": "player-3"}],
-            tracking_identity_accepted=True,
-        )
-
-
-def test_runner_accepts_statistics_only_after_identity_gate_passes():
-    result = RunnerV2(
-        seams=RunnerV2Seams(statistics=lambda rows: {"players": len(rows)})
-    ).run(
-        [
-            {
-                "observation_key": "61:8",
-                "frame_index": 61,
-                "raw_track_id": 8,
-                "stable_player_id": "player-8",
-                "bbox_xyxy": [4, 5, 6, 7],
-                "track_state": "tracked",
-            }
-        ],
-        tracking_identity_accepted=True,
-    )
-
-    assert result.downstream["statistics"] == {"players": 1}
-    assert result.acceptance["statistics"] == "accepted"
