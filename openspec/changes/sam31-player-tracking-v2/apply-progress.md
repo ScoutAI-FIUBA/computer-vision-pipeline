@@ -19,6 +19,7 @@
 - [x] 2.4 boundary remediation: validated public inputs before lazy predictor/GPU initialization, rejected SAM cardinality mismatches, and added provenance/video/config/benchmark metadata and mask references.
 - [x] 2.4 direct-return correction: removed the unintended external-storage boundary; local `--video-path` bytes are sent to Modal, returned artifacts are `{relative_path: bytes}`, and local `--output-dir` writing mirrors V1.
 - [x] 2.4 setuptools compatibility remediation: kept the V2 image pinned to `setuptools<82` and added a static dependency-contract regression test for the SAM 3.1 `pkg_resources` requirement.
+- [x] `sam31-runtime-deps`: tightened the V2 image to `setuptools<81`, added `einops`, and disabled optional FlashAttention 3 for the baseline predictor with `use_fa3=False`.
 
 ## TDD Cycle Evidence
 
@@ -50,6 +51,7 @@
 | Modal V2 symlink collection boundary | `tests/test_modal_app_v2.py` | ✅ 20/20 prior Modal tests passed | ✅ Outside symlink regression read bytes before implementation | ✅ 21 Modal tests passed | ✅ Symlinked outside file rejected while regular nested files remain valid | ✅ Reject symlinks and resolved escapes before stat/read |
 | Modal V2 symlink-directory boundary | `tests/test_modal_app_v2.py` | ✅ 21/21 prior Modal tests passed | ✅ Symlinked directory was silently skipped before implementation | ✅ 22 Modal tests passed | ✅ Symlinked directories rejected while regular nested directories remain valid | ✅ Check symlinks before `is_file()` traversal filtering |
 | Modal V2 setuptools compatibility | `tests/test_modal_app_v2.py` | ✅ 27/27 prior Modal tests passed | ✅ Regression failed when the pin was temporarily removed | ✅ 28 Modal tests passed | ➖ Single structural dependency contract; no branching behavior | ✅ Parsed `pip_install` calls without importing Modal |
+| SAM31 runtime dependency baseline | `tests/test_modal_app_v2.py` | ✅ 28/28 prior Modal tests passed | ✅ Setuptools/einops/FlashAttention contracts failed before implementation | ✅ 29 Modal tests passed | ➖ Structural image/predictor contracts; no branching behavior | ✅ Minimal AST-based static checks |
 
 ## Verification
 
@@ -67,6 +69,8 @@
 - Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `69 passed`.
 - Remediation regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `48 passed`.
 - Setuptools compatibility regression command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `54 passed`.
+- `sam31-runtime-deps` focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py` — `29 passed`.
+- `sam31-runtime-deps` relevant command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_results_artifacts.py tests/test_sam31_tracking.py` — `55 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
 

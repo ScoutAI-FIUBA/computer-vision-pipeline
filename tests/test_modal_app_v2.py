@@ -22,7 +22,7 @@ def test_v2_image_isolated_and_uses_only_modal_model_storage():
     assert source.count("modal.Image") == 1
 
 
-def test_v2_image_pins_setuptools_below_sam31_compatibility_ceiling():
+def test_v2_image_pins_sam31_runtime_dependencies():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
 
@@ -36,7 +36,26 @@ def test_v2_image_pins_setuptools_below_sam31_compatibility_ceiling():
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
     ]
 
-    assert "setuptools<82" in pip_dependencies
+    assert "setuptools<81" in pip_dependencies
+    assert "einops" in pip_dependencies
+
+
+def test_v2_baseline_predictor_disables_optional_flashattention3():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    predictor_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_sam3_multiplex_video_predictor"
+    ]
+
+    assert len(predictor_calls) == 1
+    assert [
+        keyword.value.value for keyword in predictor_calls[0].keywords if keyword.arg == "use_fa3"
+    ] == [False]
 
 
 def test_entrypoint_accepts_nonempty_video_and_validates_public_values():

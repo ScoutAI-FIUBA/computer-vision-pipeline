@@ -27,7 +27,8 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "ffmpeg", "libgl1", "libglib2.0-0")
     .pip_install(
-        "setuptools<82",
+        "setuptools<81",
+        "einops",
         "torch==2.10.0",
         "torchvision==0.25.0",
         "transformers==5.0.0",
@@ -221,7 +222,7 @@ class PipelineV2:
             return self.predictor
         from sam3.model_builder import build_sam3_multiplex_video_predictor
 
-        self.predictor = build_sam3_multiplex_video_predictor()
+        self.predictor = build_sam3_multiplex_video_predictor(use_fa3=False)
         model_cache.commit()
         return self.predictor
 
