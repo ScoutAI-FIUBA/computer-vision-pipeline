@@ -25,7 +25,7 @@
 | 1.3 | `tests/test_config.py` | Unit | ✅ 23/23 | ✅ Missing V2 fields/config behavior | ✅ 24 config tests passed, then 26 after triangulation | ✅ Environment parsing and invalid range/retention cases | ✅ Reused existing env parsing conventions |
 | 2.1 | `tests/test_results_artifacts.py` | Unit | N/A (new test file) | ✅ Import failure for missing `package_artifacts` | ✅ 4 artifact tests passed | ✅ Complete package, missing mask/transfer failure, duplicate keys, legacy payload | ✅ Kept contract assertions focused on persisted/retrievable values |
 | 2.2 | `tests/test_results_artifacts.py` | Unit | N/A (initial baseline not captured before first implementation) | ✅ Missing production API | ✅ 4 artifact tests passed; 70 legacy result tests passed afterward | ✅ PNG round-trip and incomplete transfer paths | ✅ Small pure reference helper; no bulk inline return |
-| 2.3 | `tests/test_runner_v2.py` | Unit | ✅ 14/14 baseline | ✅ Rejected observation still contained `reid_embedding` | ✅ 14 focused tests passed | ✅ Downstream and observation-derived fields are scrubbed on rejection; valid assignments remain available | ✅ Centralized derived-field scrubbing |
+| 2.3 | `tests/test_runner_v2.py` | Unit | ✅ 14/14 baseline | ✅ Strengthened rejected-observation assertion | ✅ 14 focused tests passed | ✅ Each rejected observation excludes stable identity, ReID, and team-derived fields | ✅ Centralized derived-field scrubbing |
 
 ### Review Fix Evidence
 
@@ -36,6 +36,7 @@
 | Team assignment collision audit | `tests/test_runner_v2.py` | ✅ 11/11 prior runner tests passed | ✅ Conflicting same-stable team test failed by silent overwrite | ✅ 13 runner tests passed | ✅ Conflicting assignments rejected; consistent assignments retained | ✅ Deterministic conflict reasons and no partial team output |
 | Atomic rejected-run audit | `tests/test_runner_v2.py` | ✅ 13/13 prior runner tests passed | ✅ ReID output leaked beside conflicting team validation | ✅ 14 runner tests passed | ✅ ReID + conflicting team assignment yields empty downstream output | ✅ Rejected result is not consumable as partial derived data |
 | Rejected observation leakage audit | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ `reid_embedding` remained in rejected observations | ✅ 14 runner tests passed | ✅ Derived observation fields scrubbed while raw evidence remains | ✅ Centralized scrub set prevents consumer confusion |
+| Rejected derived-field assertion | `tests/test_runner_v2.py` | ✅ 14/14 prior runner tests passed | ✅ Assertion strengthened from ReID-only to all derived fields | ✅ 14 runner tests passed | ✅ `stable_player_id`, `reid_embedding`, and `team_id` all absent | ✅ Test now checks the complete rejection contract |
 
 ## Verification
 

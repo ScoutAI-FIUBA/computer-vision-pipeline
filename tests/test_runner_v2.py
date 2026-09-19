@@ -205,4 +205,5 @@ def test_conflicting_team_validation_discards_reid_output_atomically():
     assert result.acceptance["tracking_identity"] == "rejected"
     assert result.acceptance["statistics"] == "deferred"
     assert result.downstream == {}
-    assert all("reid_embedding" not in observation for observation in result.observations)
+    derived_fields = {"stable_player_id", "reid_embedding", "team_id"}
+    assert all(not derived_fields.intersection(observation) for observation in result.observations)
