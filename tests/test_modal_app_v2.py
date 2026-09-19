@@ -63,7 +63,7 @@ def test_v2_dependency_smoke_reports_each_import_and_builder():
     )
     source_segment = ast.get_source_segment(source, smoke)
     assert source_segment is not None
-    assert "SAM31_SMOKE_MODULES" in source_segment
+    assert "check_sam31_imports" in source_segment
     for module_name in (
         "pycocotools.mask",
         "PIL",
@@ -74,7 +74,8 @@ def test_v2_dependency_smoke_reports_each_import_and_builder():
         "sam3.model_builder",
     ):
         assert module_name in source
-    assert "callable" in source_segment
+    assert "callable" in source
+    assert "raise RuntimeError" in source_segment
 
 
 def test_v2_dependency_smoke_does_not_construct_model():
@@ -98,6 +99,46 @@ def test_v2_dependency_smoke_does_not_construct_model():
         and node.func.id == "PipelineV2"
         for node in ast.walk(smoke)
     )
+
+
+def test_v2_import_check_attempts_every_module_and_reports_failures_independently():
+    from modal_app_v2 import SAM31_SMOKE_MODULES, check_sam31_imports
+
+    attempted = []
+    failed_modules = {"PIL", "scipy"}
+
+    def fake_import_module(module_name):
+        attempted.append(module_name)
+        if module_name in failed_modules:
+            raise ImportError(f"blocked {module_name}")
+        if module_name == "sam3.model_builder":
+            return types.SimpleNamespace(build_sam3_multiplex_video_predictor=lambda: None)
+        return types.SimpleNamespace()
+
+    report = check_sam31_imports(import_module=fake_import_module)
+
+    assert attempted == list(SAM31_SMOKE_MODULES)
+    assert report["imported"] == [module for module in SAM31_SMOKE_MODULES if module not in failed_modules]
+    assert set(report["failures"]) == failed_modules
+    assert all(module in report["failures"] for module in failed_modules)
+    assert all("blocked" in report["failures"][module] for module in failed_modules)
+
+
+def test_v2_import_check_reports_non_callable_builder_without_skipping_modules():
+    from modal_app_v2 import SAM31_SMOKE_MODULES, check_sam31_imports
+
+    attempted = []
+
+    def fake_import_module(module_name):
+        attempted.append(module_name)
+        return types.SimpleNamespace()
+
+    report = check_sam31_imports(import_module=fake_import_module)
+
+    assert attempted == list(SAM31_SMOKE_MODULES)
+    assert report["imported"] == [module for module in SAM31_SMOKE_MODULES if module != "sam3.model_builder"]
+    assert set(report["failures"]) == {"sam3.model_builder"}
+    assert "not callable" in report["failures"]["sam3.model_builder"]
 
 
 def test_v2_baseline_predictor_disables_optional_flashattention3():

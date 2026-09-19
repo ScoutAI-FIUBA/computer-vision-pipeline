@@ -63,14 +63,12 @@ image = (
 hf_secret = modal.Secret.from_name("scoutai-huggingface", required_keys=["HF_TOKEN"])
 
 
-@app.function(image=image, timeout=60)
-def sam31_dependency_smoke_test() -> dict[str, Any]:
-    """Check the official SAM3.1 import boundary without loading model weights."""
+def check_sam31_imports(import_module=importlib.import_module) -> dict[str, Any]:
     failures: dict[str, str] = {}
     imported: list[str] = []
     for module_name in SAM31_SMOKE_MODULES:
         try:
-            module = importlib.import_module(module_name)
+            module = import_module(module_name)
             if module_name == "sam3.model_builder":
                 builder = getattr(module, "build_sam3_multiplex_video_predictor", None)
                 if not callable(builder):
@@ -79,6 +77,16 @@ def sam31_dependency_smoke_test() -> dict[str, Any]:
         except Exception as error:
             failures[module_name] = f"{type(error).__name__}: {error}"
     return {"ok": not failures, "imported": imported, "failures": failures}
+
+
+@app.function(image=image, timeout=60)
+def sam31_dependency_smoke_test() -> dict[str, Any]:
+    """Check the official SAM3.1 import boundary without loading model weights."""
+    report = check_sam31_imports()
+    if report["failures"]:
+        failed_modules = ", ".join(sorted(report["failures"]))
+        raise RuntimeError(f"SAM3.1 dependency smoke failed: {failed_modules}")
+    return report
 
 
 def validate_entrypoint_args(
