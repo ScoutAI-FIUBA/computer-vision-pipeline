@@ -70,7 +70,16 @@ image = (
     # "sam-2" with a hyphen, so the PEP 508 named form fails the name check and
     # pip then falls back to the unrelated third-party `sam2` package on PyPI.
     .pip_install(f"git+https://github.com/facebookresearch/sam2.git@{SAM2_COMMIT}")
-    .env({"HF_HOME": f"{CACHE_DIR}/huggingface"})
+    # The "dummy" number backend is the library default so tests and local runs
+    # cost nothing. Deployed jobs feed the app's box scores, which are useless
+    # without jersey numbers, so opt into the hosted OCR here. Per-job payloads
+    # still override it.
+    .env(
+        {
+            "HF_HOME": f"{CACHE_DIR}/huggingface",
+            "NUMBER_PREDICTOR_BACKEND": "roboflow-hosted",
+        }
+    )
     # Ship our own package into the container. Without this the image has no
     # `pipeline` module.
     .add_local_python_source("pipeline")
