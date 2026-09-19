@@ -184,3 +184,79 @@ def test_failed_or_incomplete_local_manifest_is_returned_without_claiming_comple
 def test_legacy_modal_file_is_not_imported_by_v2():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
     assert "import modal_app" not in source
+
+
+def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
+
+    class FakePredictor:
+        def handle_request(self, request):
+            if request["type"] == "start_session":
+                return {"session_id": "fake-session"}
+            return None
+
+        def handle_stream_request(self, _request):
+            yield {
+                "frame_index": 60,
+                "out_obj_ids": [3],
+                "out_boxes_xywh": [[1, 2, 10, 20]],
+                "out_probs": [0.9],
+                "out_binary_masks": [np.array([[0, 255]], dtype=np.uint8)],
+            }
+
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {"fps": 30.0})
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda rows: RunnerV2(RunnerV2Seams(identity=lambda items: {item["observation_key"]: "player-3" for item in items})).run(rows),
+    )
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: FakePredictor())
+
+    payload = process(cls(),
+        video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True
+    )
+
+    artifacts = payload["artifacts"]
+    assert payload["acceptance"] == {"tracking_identity": "unvalidated", "statistics": "deferred"}
+    assert {"tracks.jsonl", "manifest.json"} <= set(artifacts)
+    assert [name for name in artifacts if name.startswith("masks/")]
+    manifest = json.loads(artifacts["manifest.json"])
+    assert manifest["complete"] is True
+    assert manifest["observation_count"] == 1
+    assert manifest["config"] == {"prompt": "basketball player", "frame_end": 60, "frame_start": 60}
+    assert "wall_seconds" in manifest["benchmark"]
+    assert json.loads(artifacts["tracks.jsonl"].decode())["stable_player_id"] == "player-3"
+
+
+def test_process_size_limit_fails_before_returning_partial_artifacts(monkeypatch):
+    import modal_app_v2
+
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args: ([], {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+
+    with pytest.raises(ValueError, match="exceeds configured artifact return limit"):
+        process(cls(),
+            video_bytes=b"fake-video", frame_start=0, frame_end=0,
+            return_artifacts=True, max_artifact_bytes=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("ids", "boxes", "message"),
+    [([1, 2], [[0, 0, 1, 1]], "object ids and boxes"), ([1], [[0, 0, 1, 1]], "probabilities")],
+)
+def test_fake_sam_cardinality_errors_are_explicit(ids, boxes, message):
+    from modal_app_v2 import _session_objects
+
+    output = {"out_obj_ids": ids, "out_boxes_xywh": boxes}
+    if message == "probabilities":
+        output["out_probs"] = [0.5, 0.6]
+    with pytest.raises(RuntimeError, match=message):
+        _session_objects(output)

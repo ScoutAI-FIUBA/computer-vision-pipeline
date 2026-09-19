@@ -70,5 +70,16 @@
 
 - [x] 2.1–2.3 Artifact packaging and truthful runner adapter boundary.
 - [x] 2.4 Modal V2 wiring and raw artifact retrieval boundary.
-- [ ] 2.5 Broader runner/Modal tests.
+- [x] 2.5 Added controlled-fake process coverage for complete direct artifacts, lossless masks, manifest config/benchmark metadata, explicit size-limit failure, SAM cardinality errors, and existing local nested-path, acceptance, no-R2, no-debug-video, and legacy-isolation contracts.
 - [ ] 3.1–3.3 Local renderer, validation, and final rollback/full-suite verification.
+
+## Task 2.5 TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| 2.5 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Unit with controlled process seam | ✅ 36/36 | ✅ Process/cardinality tests failed before seam correction | ✅ 26 Modal tests passed; 14 runner tests passed | ✅ Accepted process, size failure, cardinality mismatch, rejection/deferred paths | ✅ Reused existing artifact writer/runner contracts; no production change |
+
+## Verification
+
+- Task 2.5 focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `40 passed`.
+- No real Modal deployment, GPU inference, `game_03` validation, renderer, or `modal_app.py` modification was performed.
