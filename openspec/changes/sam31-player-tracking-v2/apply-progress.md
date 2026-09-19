@@ -25,7 +25,7 @@
 | 1.3 | `tests/test_config.py` | Unit | ✅ 23/23 | ✅ Missing V2 fields/config behavior | ✅ 24 config tests passed, then 26 after triangulation | ✅ Environment parsing and invalid range/retention cases | ✅ Reused existing env parsing conventions |
 | 2.1 | `tests/test_results_artifacts.py` | Unit | N/A (new test file) | ✅ Import failure for missing `package_artifacts` | ✅ 4 artifact tests passed | ✅ Complete package, missing mask/transfer failure, duplicate keys, legacy payload | ✅ Kept contract assertions focused on persisted/retrievable values |
 | 2.2 | `tests/test_results_artifacts.py` | Unit | N/A (initial baseline not captured before first implementation) | ✅ Missing production API | ✅ 4 artifact tests passed; 70 legacy result tests passed afterward | ✅ PNG round-trip and incomplete transfer paths | ✅ Small pure reference helper; no bulk inline return |
-| 2.3 | `tests/test_runner_v2.py` | Unit | ✅ 4/4 baseline | ✅ New contract tests failed against caller-controlled gate/callback API | ✅ 11 focused tests passed | ✅ Malformed IDs, same-frame collisions, raw conflicts, empty/missing evidence; ReID/team seams | ✅ Validation-only status; no arbitrary acceptance or callbacks |
+| 2.3 | `tests/test_runner_v2.py` | Unit | ✅ 4/4 baseline | ✅ New contract tests failed against caller-controlled gate/callback API | ✅ 13 focused tests passed | ✅ Malformed IDs, identity collisions, empty/missing evidence, consistent/conflicting team assignments; ReID/team seams | ✅ Validation-only status; no arbitrary acceptance or callbacks |
 
 ### Review Fix Evidence
 
@@ -33,12 +33,13 @@
 |---|---|---|---|---|---|---|
 | Manifest integrity, collision-free masks, incomplete packages | `tests/test_results_artifacts.py` | ✅ 74 focused/result tests passed before edits | ✅ 3 authoritative review tests failed | ✅ 6 artifact tests passed | ✅ Prefix/no-prefix manifests, adversarial keys, missing masks and transfer errors | ✅ Canonical self-reference-excluding hash helper |
 | Runner identity/seam audit findings | `tests/test_runner_v2.py` | ✅ 4/4 prior runner tests passed | ✅ 6 replacement contract tests failed against old API | ✅ 11 runner tests passed | ✅ Production ReID/team contracts and malformed/conflicting identity cases | ✅ Removed caller-controlled acceptance and arbitrary stage callbacks |
+| Team assignment collision audit | `tests/test_runner_v2.py` | ✅ 11/11 prior runner tests passed | ✅ Conflicting same-stable team test failed by silent overwrite | ✅ 13 runner tests passed | ✅ Conflicting assignments rejected; consistent assignments retained | ✅ Deterministic conflict reasons and no partial team output |
 
 ## Verification
 
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py`
-- Result: `11 passed`.
-- Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `66 passed`.
+- Result: `13 passed`.
+- Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `68 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
 

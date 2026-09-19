@@ -118,3 +118,58 @@ def test_team_embedder_and_team_id_use_production_contracts_then_map_to_stable_i
         "player-4": 1,
     }
     assert result.acceptance["tracking_identity"] == "unvalidated"
+
+
+def test_same_stable_player_with_conflicting_team_assignments_is_rejected():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class ConflictingClusterer:
+        name = "conflicting-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0, 1]
+
+    observations = [row(frame_index=60, raw_track_id=3), row(frame_index=61, raw_track_id=4)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=ConflictingClusterer(),
+        )
+    ).run(observations, frames_by_index={60: "frame-60", 61: "frame-61"})
+
+    assert "team_assignments" not in result.downstream
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == [
+        "conflicting_team_assignment:stable_player_id=player-7"
+    ]
+
+
+def test_same_stable_player_with_consistent_team_assignments_is_retained():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class ConsistentClusterer:
+        name = "consistent-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [1, 1]
+
+    observations = [row(frame_index=60, raw_track_id=3), row(frame_index=61, raw_track_id=4)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=ConsistentClusterer(),
+        )
+    ).run(observations, frames_by_index={60: "frame-60", 61: "frame-61"})
+
+    assert result.downstream["team_assignments"] == {"player-7": 1}
+    assert result.acceptance["tracking_identity"] == "unvalidated"

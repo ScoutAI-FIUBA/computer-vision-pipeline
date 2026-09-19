@@ -116,7 +116,7 @@ def _run_team_id(
     clusterer: TeamClusterer,
     team_count: int,
     frames_by_index: Mapping[int, Any],
-) -> dict[str, int]:
+) -> tuple[dict[str, int], list[str]]:
     observations: list[TeamObservation] = []
     next_detection_id = 1
     for frame_index, frame_rows in _group_by_frame(rows).items():
@@ -152,11 +152,23 @@ def _run_team_id(
         minimum_samples=1,
     )
     raw_to_stable = {row["raw_track_id"]: row["stable_player_id"] for row in rows}
-    return {
-        raw_to_stable[assignment.track_id]: int(assignment.team_id)
-        for assignment in result.assignments
-        if assignment.track_id is not None and assignment.team_id is not None
+    team_ids_by_stable: dict[str, set[int]] = defaultdict(set)
+    for assignment in result.assignments:
+        if assignment.track_id is None or assignment.team_id is None:
+            continue
+        team_ids_by_stable[raw_to_stable[assignment.track_id]].add(int(assignment.team_id))
+
+    conflicts = [
+        f"conflicting_team_assignment:stable_player_id={stable_id}"
+        for stable_id, team_ids in sorted(team_ids_by_stable.items())
+        if len(team_ids) > 1
+    ]
+    assignments = {
+        stable_id: next(iter(team_ids))
+        for stable_id, team_ids in team_ids_by_stable.items()
+        if len(team_ids) == 1
     }
+    return assignments, conflicts
 
 
 class RunnerV2:
@@ -185,13 +197,18 @@ class RunnerV2:
         if structurally_valid and self.seams.reid is not None:
             downstream["reid_records"] = _run_reid(rows, self.seams.reid, frames)
         if structurally_valid and self.seams.team_embedder is not None:
-            downstream["team_assignments"] = _run_team_id(
+            team_assignments, team_reasons = _run_team_id(
                 rows,
                 self.seams.team_embedder,
                 self.seams.team_clusterer or KMeansTeamClusterer(),
                 self.seams.team_count,
                 frames,
             )
+            reasons.extend(team_reasons)
+            if not team_reasons:
+                downstream["team_assignments"] = team_assignments
+
+        structurally_valid = not reasons
 
         acceptance = {
             "tracking_identity": "unvalidated" if structurally_valid else "rejected",
