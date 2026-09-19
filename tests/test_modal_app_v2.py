@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,37 @@ def test_v2_baseline_predictor_disables_optional_flashattention3():
     assert [
         keyword.value.value for keyword in predictor_calls[0].keywords if keyword.arg == "use_fa3"
     ] == [False]
+
+
+def test_v2_predictor_initialization_disables_optional_flashattention3(monkeypatch):
+    import modal_app_v2
+
+    calls = []
+    fake_predictor = object()
+
+    def fake_builder(**kwargs):
+        calls.append(kwargs)
+        return fake_predictor
+
+    fake_model_builder = types.ModuleType("sam3.model_builder")
+    fake_model_builder.build_sam3_multiplex_video_predictor = fake_builder
+    fake_sam3 = types.ModuleType("sam3")
+    fake_sam3.model_builder = fake_model_builder
+    monkeypatch.setitem(sys.modules, "sam3", fake_sam3)
+    monkeypatch.setitem(sys.modules, "sam3.model_builder", fake_model_builder)
+    monkeypatch.setattr(modal_app_v2, "model_cache", types.SimpleNamespace(commit=lambda: None))
+
+    pipeline_cls = next(
+        value
+        for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+
+    pipeline = pipeline_cls()
+    assert pipeline._ensure_predictor() is fake_predictor
+    assert calls == [{"use_fa3": False}]
+    assert pipeline._ensure_predictor() is fake_predictor
+    assert calls == [{"use_fa3": False}]
 
 
 def test_entrypoint_accepts_nonempty_video_and_validates_public_values():
