@@ -99,6 +99,12 @@ DEFAULT_PLAYER_MODEL_ID = "basketball-player-detection-3-ycjdo/16"
 DEFAULT_SHOT_MODEL_ID = "basketball-player-detection-3-ycjdo/1"
 DEFAULT_SHOT_FRAME_STRIDE = 1
 DEFAULT_COURT_KEYPOINT_CONFIDENCE = 0.7
+DEFAULT_SAM31_PROMPT = "basketball player"
+DEFAULT_SAM31_FRAME_START = 60
+DEFAULT_SAM31_FRAME_END = 130
+DEFAULT_SAM31_RETENTION_FRAMES = 2
+DEFAULT_SAM31_OUTPUT_PREFIX = None
+DEFAULT_SAM31_ACCEPTANCE_REQUIRED = True
 
 
 
@@ -117,6 +123,11 @@ def _env_optional_float(name: str) -> float | None:
     return None if value in (None, "") else float(value)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    return default if value in (None, "") else value.lower() in {"1", "true", "yes"}
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     """Every tunable the pipeline has. Build with `from_env()` or directly."""
@@ -128,6 +139,14 @@ class PipelineConfig:
     shot_model_id: str = DEFAULT_SHOT_MODEL_ID
     court_model_id: str | None = None
     court_keypoint_confidence: float = DEFAULT_COURT_KEYPOINT_CONFIDENCE
+
+    # --- SAM 3.1 V2 (kept separate from legacy SAM2 settings) ---
+    sam31_prompt: str = DEFAULT_SAM31_PROMPT
+    sam31_frame_start: int = DEFAULT_SAM31_FRAME_START
+    sam31_frame_end: int = DEFAULT_SAM31_FRAME_END
+    sam31_retention_frames: int = DEFAULT_SAM31_RETENTION_FRAMES
+    sam31_output_prefix: str | None = DEFAULT_SAM31_OUTPUT_PREFIX
+    sam31_acceptance_required: bool = DEFAULT_SAM31_ACCEPTANCE_REQUIRED
 
     # --- Sampling ---
     # COST: the biggest lever there is. SAM2's image encoder runs on every
@@ -292,6 +311,12 @@ class PipelineConfig:
             raise ValueError("number_predictor_score_threshold must be between 0 and 1")
         if not 0.0 <= self.court_keypoint_confidence <= 1.0:
             raise ValueError("court_keypoint_confidence must be between 0 and 1")
+        if self.sam31_frame_start < 0:
+            raise ValueError("sam31_frame_start must be at least 0")
+        if self.sam31_frame_end < self.sam31_frame_start:
+            raise ValueError("sam31_frame_end must not precede sam31_frame_start")
+        if self.sam31_retention_frames < 0:
+            raise ValueError("sam31_retention_frames must be at least 0")
         if not self.roboflow_api_key:
             raise ValueError("roboflow_api_key is required")
 
@@ -327,6 +352,16 @@ class PipelineConfig:
             "shot_frame_stride": _env_int("SHOT_FRAME_STRIDE", DEFAULT_SHOT_FRAME_STRIDE),
             "court_keypoint_confidence": _env_float(
                 "COURT_KEYPOINT_CONFIDENCE", DEFAULT_COURT_KEYPOINT_CONFIDENCE
+            ),
+            "sam31_prompt": os.getenv("SAM31_PROMPT", DEFAULT_SAM31_PROMPT),
+            "sam31_frame_start": _env_int("SAM31_FRAME_START", DEFAULT_SAM31_FRAME_START),
+            "sam31_frame_end": _env_int("SAM31_FRAME_END", DEFAULT_SAM31_FRAME_END),
+            "sam31_retention_frames": _env_int(
+                "SAM31_RETENTION_FRAMES", DEFAULT_SAM31_RETENTION_FRAMES
+            ),
+            "sam31_output_prefix": os.getenv("SAM31_OUTPUT_PREFIX") or DEFAULT_SAM31_OUTPUT_PREFIX,
+            "sam31_acceptance_required": _env_bool(
+                "SAM31_ACCEPTANCE_REQUIRED", DEFAULT_SAM31_ACCEPTANCE_REQUIRED
             ),
             "team_embedder_backend": os.getenv(
                 "TEAM_EMBEDDER_BACKEND", DEFAULT_TEAM_EMBEDDER_BACKEND

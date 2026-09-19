@@ -44,6 +44,26 @@ def test_from_env_reads_team_identification_settings(monkeypatch: pytest.MonkeyP
     assert config.number_predictor_backend == "dummy"
 
 
+def test_from_env_reads_v2_tracking_settings_without_changing_legacy_defaults(monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("SAM31_PROMPT", "basketball player")
+    monkeypatch.setenv("SAM31_FRAME_START", "60")
+    monkeypatch.setenv("SAM31_FRAME_END", "130")
+    monkeypatch.setenv("SAM31_RETENTION_FRAMES", "4")
+    monkeypatch.setenv("SAM31_OUTPUT_PREFIX", "runs/game-03")
+    monkeypatch.setenv("SAM31_ACCEPTANCE_REQUIRED", "1")
+
+    config = PipelineConfig.from_env()
+
+    assert config.sam31_prompt == "basketball player"
+    assert config.sam31_frame_start == 60
+    assert config.sam31_frame_end == 130
+    assert config.sam31_retention_frames == 4
+    assert config.sam31_output_prefix == "runs/game-03"
+    assert config.sam31_acceptance_required is True
+    assert config.sam2_model_id == "facebook/sam2-hiera-small"
+
+
 def test_from_env_defaults_main_and_shot_models_separately(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
     monkeypatch.setenv("PLAYER_MODEL_ID", "basketball-player-detection-3-ycjdo/16")
@@ -124,6 +144,12 @@ def test_pipeline_config_rejects_invalid_team_identification_values():
 
     with pytest.raises(ValueError, match="team_assignment_margin must be at least 0"):
         PipelineConfig(roboflow_api_key="test-key", team_assignment_margin=-0.01)
+
+    with pytest.raises(ValueError, match="sam31_frame_end must not precede"):
+        PipelineConfig(roboflow_api_key="test-key", sam31_frame_start=10, sam31_frame_end=9)
+
+    with pytest.raises(ValueError, match="sam31_retention_frames must be at least 0"):
+        PipelineConfig(roboflow_api_key="test-key", sam31_retention_frames=-1)
 
 
 def test_pipeline_config_rejects_unsupported_number_predictor_backend():
