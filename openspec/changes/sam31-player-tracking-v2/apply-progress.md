@@ -2,10 +2,10 @@
 
 ## Work Unit
 
-- Boundary: Phase 1 foundation/contracts and adapter boundary, tasks 1.1–1.3; Phase 2 artifact packaging, tasks 2.1–2.2; runner wiring task 2.3.
+- Boundary: Phase 1 foundation/contracts and adapter boundary, tasks 1.1–1.3; Phase 2 artifact packaging, tasks 2.1–2.2; runner wiring task 2.3; Modal V2 boundary task 2.4.
 - Delivery: feature-branch-chain strategy implemented as ordered local atomic commits; no PR.
-- Rollback: revert the artifact work-unit commits `0242d74` and the follow-up integrity fix commit.
-- Scope guard: `modal_app.py` untouched; Modal wiring, remote rendering, and local renderer deferred.
+- Rollback: revert this Modal V2 work-unit commit plus the prior artifact/runner commits; `modal_app.py` remains the legacy fallback.
+- Scope guard: `modal_app.py` untouched; remote rendering and local renderer deferred.
 
 ## Completed Tasks
 
@@ -15,6 +15,7 @@
 - [x] 2.1 Added strict-TDD artifact-contract tests for manifest, JSONL, lossless masks, metadata, retrieval references, and transfer failures.
 - [x] 2.2 Added deterministic artifact packaging in `pipeline/results.py`, optional manifest references on `PipelineResults`, and legacy serialization preservation.
 - [x] 2.3 Added a truthful validation-only `RunnerV2`/`run_v2` adapter: identity evidence is structurally validated, repository ReID/team contracts are invoked when frame data is available, and acceptance plus unsupported video-stream stages remain deferred.
+- [x] 2.4 Added isolated `modal_app_v2.py` with the official SAM 3.1 multiplex predictor boundary, HF cache/auth, R2 input/output transfer, raw artifact packaging, retrieval-key response, and no remote video rendering. V2 remains validation-only because `run_v2` is called without an identity authority.
 
 ## TDD Cycle Evidence
 
@@ -26,6 +27,7 @@
 | 2.1 | `tests/test_results_artifacts.py` | Unit | N/A (new test file) | ✅ Import failure for missing `package_artifacts` | ✅ 4 artifact tests passed | ✅ Complete package, missing mask/transfer failure, duplicate keys, legacy payload | ✅ Kept contract assertions focused on persisted/retrievable values |
 | 2.2 | `tests/test_results_artifacts.py` | Unit | N/A (initial baseline not captured before first implementation) | ✅ Missing production API | ✅ 4 artifact tests passed; 70 legacy result tests passed afterward | ✅ PNG round-trip and incomplete transfer paths | ✅ Small pure reference helper; no bulk inline return |
 | 2.3 | `tests/test_runner_v2.py` | Unit | ✅ 14/14 baseline | ✅ Strengthened rejected-observation assertion | ✅ 14 focused tests passed | ✅ Each rejected observation excludes stable identity, ReID, and team-derived fields | ✅ Centralized derived-field scrubbing |
+| 2.4 | `tests/test_modal_app_v2.py` | Unit/static boundary | N/A (new files) | ✅ Missing module and helpers failed | ✅ 5 focused tests passed | ✅ Bytes/R2 argument paths, transfer failure, retrieval-only response, isolation | ✅ Thin helpers; Modal/model calls remain lazy at runtime |
 
 ### Review Fix Evidence
 
@@ -43,6 +45,8 @@
 
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py`
 - Result: `14 passed`.
+- Modal V2 focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py`
+- Modal V2 result: `5 passed`.
 - Relevant existing tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py tests/test_player_positions.py` — `69 passed`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite: deferred to verification phase.
@@ -50,5 +54,6 @@
 ## Remaining Tasks
 
 - [x] 2.1–2.3 Artifact packaging and truthful runner adapter boundary.
-- [ ] 2.4–2.5 Modal V2 wiring and broader runner/Modal tests.
+- [x] 2.4 Modal V2 wiring and raw artifact retrieval boundary.
+- [ ] 2.5 Broader runner/Modal tests.
 - [ ] 3.1–3.3 Local renderer, validation, and final rollback/full-suite verification.
