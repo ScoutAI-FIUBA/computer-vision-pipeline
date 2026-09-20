@@ -443,6 +443,32 @@ def test_start_session_filters_rebuilt_init_state_kwargs_and_returns_session_id(
     assert start_request["offload_state_to_cpu"] is True
 
 
+def test_start_session_filters_each_rebuilt_kwarg_against_intermediate_signature(tmp_path: Path):
+    from modal_app_v2 import _start_session
+
+    class FakeModel:
+        def init_state(self, resource_path, offload_state_to_cpu):
+            return resource_path, offload_state_to_cpu
+
+    class FakePredictor:
+        def __init__(self):
+            self.model = FakeModel()
+            self.init_result = None
+
+        def handle_request(self, request):
+            self.init_result = self.model.init_state(
+                **{key: value for key, value in request.items() if key != "type"}
+            )
+            return {"session_id": "intermediate-signature"}
+
+    predictor = FakePredictor()
+
+    start = _start_session(predictor, tmp_path / "clip.mp4")
+
+    assert start["session_id"] == "intermediate-signature"
+    assert predictor.init_result == (str(tmp_path / "clip.mp4"), True)
+
+
 def test_start_session_restores_unsupported_init_state_after_success(tmp_path: Path):
     from modal_app_v2 import _start_session
 

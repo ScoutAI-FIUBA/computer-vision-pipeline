@@ -27,7 +27,7 @@
 - [x] `sam31-import-smoke` review fixes: extracted injectable `run_sam31_dependency_smoke` wrapper logic with runtime failure coverage and documented the exact-image import command in `SETUP.md`.
 - [x] `sam31-session-compat`: added `_start_session` in `modal_app_v2.py`, which inspects the predictor model's actual `init_state` signature and removes only unsupported optional session kwargs before normal `handle_request` registration; `_track_video` uses the helper and retains add/propagate/close lifecycle.
 - [x] `sam31-session-compat` test strengthening: added focused `_track_video` lifecycle/session-ID assertions and unchanged genuine start-session exception propagation coverage; production code unchanged.
-- [x] `sam31-session-compat-fix`: temporarily wraps unsupported model `init_state` methods while SAM3 `handle_request` rebuilds the request, restores the bound original method on success/failure, and preserves the original resource path/session ID.
+- [x] `sam31-session-compat-fix`: temporarily wraps model `init_state` methods whenever SAM3 `handle_request` rebuilds any unsupported keyword, filters every rebuilt keyword against the original bound signature, restores the bound original method on success/failure, and preserves the original resource path/session ID.
 
 ## TDD Cycle Evidence
 
@@ -72,7 +72,7 @@
 | `sam31-import-smoke` review fixes | `tests/test_modal_app_v2.py`, `SETUP.md` | Unit/docs | ✅ 35/35 | ✅ Runtime wrapper test failed before injectable wrapper logic | ✅ 37 Modal tests passed | ✅ Failure and success wrapper paths; command purpose and GPU distinction documented | ✅ Modal function delegates to the same minimal wrapper |
 | `sam31-session-compat` | `tests/test_modal_app_v2.py` | Unit | ✅ 38/38 | ✅ Import failed before `_start_session` existed | ✅ 40 Modal tests passed | ✅ `init_state` accepting and rejecting `offload_state_to_cpu`; session id and registration kwargs verified | ✅ Small signature filter; official builder and predictor lifecycle unchanged |
 | `sam31-session-compat` test strengthening | `tests/test_modal_app_v2.py` | Unit | ✅ 40/40 | ✅ New lifecycle/error assertions added against the active implementation | ✅ 42 Modal tests passed | ✅ Session ID propagation, ordered cleanup, and unchanged start exception | ✅ Tests-only; no production change required |
-| `sam31-session-compat-fix` | `tests/test_modal_app_v2.py` | Unit | ✅ 42/42 | ✅ Rebuilt request passed unsupported kwarg before wrapper | ✅ 44 Modal tests passed | ✅ Supported/unsupported signatures plus success/failure restoration and session ID | ✅ Bound original captured once; wrapper removed in `finally`; exceptions propagate |
+| `sam31-session-compat-fix` | `tests/test_modal_app_v2.py` | Unit | ✅ 44/44 | ✅ Intermediate signature passed unsupported kwarg before generalized wrapper | ✅ 45 Modal tests passed | ✅ Supported/unsupported/intermediate signatures plus success/failure restoration and session ID | ✅ Every request kwarg is checked; bound original captured once; wrapper removed in `finally`; exceptions propagate |
 
 ## Verification
 
@@ -117,7 +117,7 @@
 - [x] `sam31-import-smoke` hardening added controlled import-failure and non-callable-builder coverage while preserving all dependency, pin, isolation, and no-download contracts.
 - [x] `sam31-import-smoke` review fixes added runtime wrapper failure/success coverage and documented `modal run modal_app_v2.py::sam31_dependency_smoke_test` in `SETUP.md`.
 - [x] `sam31-session-compat` added signature-compatible session registration coverage for both official-model signature variants.
-- [x] `sam31-session-compat-fix` corrected compatibility for SAM3 base `handle_request` request rebuilding and added restoration/error coverage.
+- [x] `sam31-session-compat-fix` corrected compatibility for SAM3 base `handle_request` request rebuilding, generalized per-keyword filtering, and added intermediate-signature coverage.
 - [ ] 3.1–3.3 Local renderer, validation, and final rollback/full-suite verification.
 
 ## Task 2.5 TDD Cycle Evidence

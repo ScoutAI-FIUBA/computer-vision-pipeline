@@ -244,14 +244,14 @@ def _start_session(predictor: Any, video_path: Path) -> dict[str, Any]:
         "offload_state_to_cpu": True,
         "async_loading_frames": False,
     }
-    supports_offload = accepts_kwargs or "offload_state_to_cpu" in init_state.parameters
-    if supports_offload:
+    supported = set(init_state.parameters)
+    request_kwargs = set(request) - {"type"}
+    if accepts_kwargs or request_kwargs <= supported:
         return predictor.handle_request(request)
 
-    supported = set(init_state.parameters)
-
     def compatible_init_state(**kwargs: Any):
-        return original_init_state(**{key: value for key, value in kwargs.items() if key in supported})
+        filtered_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+        return original_init_state(**filtered_kwargs)
 
     model.init_state = compatible_init_state
     try:
