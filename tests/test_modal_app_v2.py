@@ -13,8 +13,27 @@ def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
     v2_source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
     legacy_source = (Path(__file__).parents[1] / "modal_app.py").read_text(encoding="utf-8")
 
-    assert 'gpu="A100-40GB"' in v2_source
-    assert 'gpu="L4"' in legacy_source
+    def decorated_gpu(source: str, class_name: str) -> str:
+        tree = ast.parse(source)
+        pipeline = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        modal_decorator = next(
+            decorator
+            for decorator in pipeline.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "cls"
+        )
+        gpu = next(keyword for keyword in modal_decorator.keywords if keyword.arg == "gpu")
+        assert isinstance(gpu.value, ast.Constant)
+        assert isinstance(gpu.value.value, str)
+        return gpu.value.value
+
+    assert decorated_gpu(v2_source, "PipelineV2") == "A100-40GB"
+    assert decorated_gpu(legacy_source, "Pipeline") == "L4"
 
 
 def test_v2_image_isolated_and_uses_only_modal_model_storage():
