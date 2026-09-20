@@ -258,11 +258,11 @@ def test_v2_predictor_initialization_disables_optional_flashattention3(monkeypat
     pipeline = pipeline_cls()
     assert pipeline._ensure_predictor() is fake_predictor
     assert calls == [
-        {"max_num_objects": 10, "multiplex_count": 10, "use_fa3": False}
+        {"max_num_objects": 16, "multiplex_count": 16, "use_fa3": False}
     ]
     assert pipeline._ensure_predictor() is fake_predictor
     assert calls == [
-        {"max_num_objects": 10, "multiplex_count": 10, "use_fa3": False}
+        {"max_num_objects": 16, "multiplex_count": 16, "use_fa3": False}
     ]
 
 

@@ -165,3 +165,26 @@
 
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
+
+## `sam31-multiplex-restore` Work Unit
+
+- Boundary: Restore checkpoint-compatible SAM 3.1 multiplex capacity while retaining FA3 disablement, CPU video offload, and A100-40GB execution.
+- Delivery: One local conventional commit on the active native branch; no branch reset/acquisition and no PR.
+- Scope guard: Only `modal_app_v2.py`, its focused configuration test, and this progress record changed; legacy, R2, renderer, game validation, and model checkpoint remain untouched.
+
+### Completed
+
+- [x] Restored `_ensure_predictor` to `max_num_objects=16` and `multiplex_count=16`.
+- [x] Retained `use_fa3=False`, `offload_video_to_cpu=True`, and `gpu="A100-40GB"`.
+- [x] Updated focused builder-configuration regression coverage.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `sam31-multiplex-restore` | `tests/test_modal_app_v2.py` | Unit/static boundary | ✅ 51/51 | ✅ Updated expected capacity failed against 10/10 | ✅ 51 passed | ➖ Structural configuration contract; cached second-call assertion retained | ✅ Minimal two-value configuration change |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.

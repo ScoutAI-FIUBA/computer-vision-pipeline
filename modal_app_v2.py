@@ -307,8 +307,8 @@ class PipelineV2:
         from sam3.model_builder import build_sam3_multiplex_video_predictor
 
         self.predictor = build_sam3_multiplex_video_predictor(
-            max_num_objects=10,
-            multiplex_count=10,
+            max_num_objects=16,
+            multiplex_count=16,
             use_fa3=False,
         )
         model_cache.commit()
