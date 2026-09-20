@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 import os
 import tempfile
@@ -232,8 +233,30 @@ def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _start_session(predictor: Any, video_path: Path) -> dict[str, Any]:
+    init_state = inspect.signature(predictor.model.init_state)
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in init_state.parameters.values()
+    )
+    request = {
+        "type": "start_session",
+        "resource_path": str(video_path),
+        "offload_state_to_cpu": True,
+        "async_loading_frames": False,
+    }
+    if not accepts_kwargs:
+        supported = set(init_state.parameters)
+        request = {
+            key: value
+            for key, value in request.items()
+            if key in {"type", "resource_path"} or key in supported
+        }
+    return predictor.handle_request(request)
+
+
 def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int, frame_end: int):
-    start = predictor.handle_request({"type": "start_session", "resource_path": str(video_path)})
+    start = _start_session(predictor, video_path)
     session_id = start["session_id"]
     predictor.handle_request(
         {"type": "add_prompt", "session_id": session_id, "frame_index": frame_start, "text": prompt}

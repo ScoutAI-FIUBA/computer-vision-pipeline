@@ -398,6 +398,50 @@ def test_legacy_modal_file_is_not_imported_by_v2():
     assert "import modal_app" not in source
 
 
+@pytest.mark.parametrize("accepts_offload", [True, False])
+def test_track_video_registers_session_with_signature_compatible_init_state(
+    accepts_offload: bool, tmp_path: Path
+):
+    from modal_app_v2 import _start_session
+
+    class FakeModel:
+        if accepts_offload:
+
+            def init_state(self, resource_path, offload_state_to_cpu, async_loading_frames):
+                return resource_path, offload_state_to_cpu, async_loading_frames
+        else:
+
+            def init_state(self, resource_path, async_loading_frames):
+                return resource_path, async_loading_frames
+
+    class FakePredictor:
+        def __init__(self):
+            self.model = FakeModel()
+            self.requests = []
+            self.session_id = None
+
+        def handle_request(self, request):
+            self.requests.append(request)
+            if request["type"] == "start_session":
+                self.model.init_state(**{key: value for key, value in request.items() if key != "type"})
+                self.session_id = "compatible-session"
+                return {"session_id": self.session_id}
+            return None
+
+        def handle_stream_request(self, request):
+            assert request["session_id"] == self.session_id
+            return iter(())
+
+    predictor = FakePredictor()
+    start = _start_session(predictor, tmp_path / "clip.mp4")
+
+    assert start["session_id"] == "compatible-session"
+    start_request = predictor.requests[0]
+    assert start_request["resource_path"] == str(tmp_path / "clip.mp4")
+    assert start_request["async_loading_frames"] is False
+    assert ("offload_state_to_cpu" in start_request) is accepts_offload
+
+
 def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     import cv2
     import numpy as np
@@ -405,6 +449,12 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
 
     class FakePredictor:
+        class Model:
+            def init_state(self, **_kwargs):
+                return None
+
+        model = Model()
+
         def handle_request(self, request):
             if request["type"] == "start_session":
                 return {"session_id": "fake-session"}
@@ -475,6 +525,7 @@ def test_process_rejects_missing_identity_and_defers_statistics(monkeypatch):
         cls,
         "_ensure_predictor",
         lambda _self: type("FakePredictor", (), {
+            "model": type("FakeModel", (), {"init_state": lambda _self, **_kwargs: None})(),
             "handle_request": lambda _self, request: {"session_id": "fake"}
             if request["type"] == "start_session" else None,
             "handle_stream_request": lambda _self, _request: iter([{
