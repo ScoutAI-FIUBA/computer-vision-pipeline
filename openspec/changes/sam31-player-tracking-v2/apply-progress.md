@@ -26,6 +26,7 @@
 - [x] `sam31-import-smoke` hardening: extracted injectable `check_sam31_imports`, preserved independent attempts/failures, and made the Modal wrapper raise a concise failure summary without model construction.
 - [x] `sam31-import-smoke` review fixes: extracted injectable `run_sam31_dependency_smoke` wrapper logic with runtime failure coverage and documented the exact-image import command in `SETUP.md`.
 - [x] `sam31-session-compat`: added `_start_session` in `modal_app_v2.py`, which inspects the predictor model's actual `init_state` signature and removes only unsupported optional session kwargs before normal `handle_request` registration; `_track_video` uses the helper and retains add/propagate/close lifecycle.
+- [x] `sam31-session-compat` test strengthening: added focused `_track_video` lifecycle/session-ID assertions and unchanged genuine start-session exception propagation coverage; production code unchanged.
 
 ## TDD Cycle Evidence
 
@@ -69,6 +70,7 @@
 | `sam31-import-smoke` hardening | `tests/test_modal_app_v2.py` | Unit | ✅ 33/33 | ✅ Injectable helper test failed before extraction | ✅ 35 Modal tests passed | ✅ Selected import failures plus non-callable builder while all modules were attempted | ✅ Small pure helper; Modal wrapper only formats/raises |
 | `sam31-import-smoke` review fixes | `tests/test_modal_app_v2.py`, `SETUP.md` | Unit/docs | ✅ 35/35 | ✅ Runtime wrapper test failed before injectable wrapper logic | ✅ 37 Modal tests passed | ✅ Failure and success wrapper paths; command purpose and GPU distinction documented | ✅ Modal function delegates to the same minimal wrapper |
 | `sam31-session-compat` | `tests/test_modal_app_v2.py` | Unit | ✅ 38/38 | ✅ Import failed before `_start_session` existed | ✅ 40 Modal tests passed | ✅ `init_state` accepting and rejecting `offload_state_to_cpu`; session id and registration kwargs verified | ✅ Small signature filter; official builder and predictor lifecycle unchanged |
+| `sam31-session-compat` test strengthening | `tests/test_modal_app_v2.py` | Unit | ✅ 40/40 | ✅ New lifecycle/error assertions added against the active implementation | ✅ 42 Modal tests passed | ✅ Session ID propagation, ordered cleanup, and unchanged start exception | ✅ Tests-only; no production change required |
 
 ## Verification
 
@@ -129,3 +131,4 @@
 - No real Modal deployment, GPU inference, `game_03` validation, renderer, Phase 3 work, or `modal_app.py` modification was performed.
 - `sam31-import-smoke` also made no real Modal deployment or model download; the smoke function only imports dependencies and validates builder callability.
 - `sam31-session-compat` made no upstream or vendored package changes; only `modal_app_v2.py` and its focused fake-predictor tests changed.
+- `sam31-session-compat` test strengthening changed tests and cumulative progress only; the production helper required no modification.

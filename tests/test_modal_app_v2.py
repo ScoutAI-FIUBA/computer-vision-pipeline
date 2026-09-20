@@ -442,6 +442,67 @@ def test_track_video_registers_session_with_signature_compatible_init_state(
     assert ("offload_state_to_cpu" in start_request) is accepts_offload
 
 
+def test_track_video_propagates_session_id_and_closes_in_lifecycle_order(tmp_path: Path):
+    from modal_app_v2 import _track_video
+
+    class FakeModel:
+        def init_state(self, resource_path, offload_state_to_cpu, async_loading_frames):
+            return resource_path, offload_state_to_cpu, async_loading_frames
+
+    class FakePredictor:
+        def __init__(self):
+            self.model = FakeModel()
+            self.calls = []
+
+        def handle_request(self, request):
+            self.calls.append(request)
+            if request["type"] == "start_session":
+                self.model.init_state(**{key: value for key, value in request.items() if key != "type"})
+                return {"session_id": "session-17"}
+            return None
+
+        def handle_stream_request(self, request):
+            self.calls.append(request)
+            return iter(())
+
+    predictor = FakePredictor()
+
+    assert _track_video(predictor, tmp_path / "clip.mp4", "person", 4, 8) == ([], {})
+    assert [call["type"] for call in predictor.calls] == [
+        "start_session",
+        "add_prompt",
+        "propagate_in_video",
+        "close_session",
+    ]
+    assert predictor.calls[1]["session_id"] == "session-17"
+    assert predictor.calls[2]["session_id"] == "session-17"
+    assert predictor.calls[3]["session_id"] == "session-17"
+
+
+def test_track_video_propagates_genuine_start_exception_unchanged(tmp_path: Path):
+    from modal_app_v2 import _track_video
+
+    expected = RuntimeError("init failed")
+
+    class FakeModel:
+        def init_state(self, resource_path, offload_state_to_cpu, async_loading_frames):
+            raise expected
+
+    class FakePredictor:
+        def __init__(self):
+            self.model = FakeModel()
+
+        def handle_request(self, request):
+            return self.model.init_state(
+                **{key: value for key, value in request.items() if key != "type"}
+            )
+
+    with pytest.raises(RuntimeError) as error:
+        _track_video(FakePredictor(), tmp_path / "clip.mp4", "person", 4, 8)
+
+    assert error.value is expected
+
+
 def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     import cv2
     import numpy as np
