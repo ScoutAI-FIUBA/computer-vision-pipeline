@@ -9,6 +9,14 @@ from pathlib import Path
 import pytest
 
 
+def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
+    v2_source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    legacy_source = (Path(__file__).parents[1] / "modal_app.py").read_text(encoding="utf-8")
+
+    assert 'gpu="A100-40GB"' in v2_source
+    assert 'gpu="L4"' in legacy_source
+
+
 def test_v2_image_isolated_and_uses_only_modal_model_storage():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
 
