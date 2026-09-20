@@ -34,7 +34,7 @@ def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
         assert isinstance(gpu.value.value, str)
         return gpu.value.value
 
-    assert decorated_gpu(v2_source, "PipelineV2") == "A100-40GB"
+    assert decorated_gpu(v2_source, "PipelineV2") == "A100-80GB"
     assert decorated_gpu(legacy_source, "Pipeline") == "L4"
 
 

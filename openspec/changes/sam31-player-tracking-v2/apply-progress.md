@@ -166,6 +166,28 @@
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
 
+## `sam31-gpu80` Work Unit
+
+- Boundary: Move only the V2 Modal `PipelineV2` class from `A100-40GB` to `A100-80GB`; retain the legacy `modal_app.py` `L4` binding and all model, checkpoint, offload, renderer, R2, and game behavior.
+- Delivery: One local conventional commit on the active native branch; no branch acquisition or reset.
+- Scope guard: Only `modal_app_v2.py`, `tests/test_modal_app_v2.py`, and this progress record changed.
+
+### Completed
+
+- [x] Updated the exact AST GPU regression test to require V2 `A100-80GB` while requiring legacy `L4`.
+- [x] Changed only the V2 Modal class GPU binding to `A100-80GB`; legacy `modal_app.py` remains unchanged.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `sam31-gpu80` | `tests/test_modal_app_v2.py` | Unit/static boundary | ✅ 51/51 | ✅ Updated AST expectation failed (`1 failed`) | ✅ 51 focused tests passed | ➖ Skipped: purely structural GPU configuration with one expected output and legacy-L4 assertion | ➖ None needed |
+
+### Verification
+
+- Focused red: `.venv/bin/python -m pytest tests/test_modal_app_v2.py::test_v2_and_legacy_gpu_capacity_are_explicitly_separate -q` — expected `1 failed` before the production change.
+- Focused green: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
+
 ## `sam31-multiplex-restore` Work Unit
 
 - Boundary: Restore checkpoint-compatible SAM 3.1 multiplex capacity while retaining FA3 disablement, CPU video offload, and A100-40GB execution.

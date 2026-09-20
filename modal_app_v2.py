@@ -299,7 +299,7 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
     return rows, masks
 
 
-@app.cls(image=image, gpu="A100-40GB", volumes={CACHE_DIR: model_cache}, secrets=[hf_secret], timeout=1800)
+@app.cls(image=image, gpu="A100-80GB", volumes={CACHE_DIR: model_cache}, secrets=[hf_secret], timeout=1800)
 class PipelineV2:
     def _ensure_predictor(self) -> Any:
         if hasattr(self, "predictor"):
