@@ -142,3 +142,26 @@
 - `sam31-session-compat` test strengthening changed tests and cumulative progress only; the production helper required no modification.
 - `sam31-session-compat-fix` changed only `modal_app_v2.py`, its focused fake-predictor tests, and this progress record; no upstream/legacy/R2/renderer/game files were touched.
 - `sam31-output-envelope` changed only `modal_app_v2.py`, `tests/test_modal_app_v2.py`, this progress record, and the task checkbox; no upstream/legacy/R2/renderer/game files were touched.
+
+## `sam31-memory-mitigation` Work Unit
+
+- Boundary: Configure the official SAM 3.1 multiplex predictor for ten objects/streams and request CPU video offload during session initialization; preserve signature filtering for older `init_state` variants.
+- Delivery: One local conventional commit on the active native branch; no PR and no branch reset/acquisition.
+- Scope guard: A100-40GB remains unchanged; no model, legacy `modal_app.py`, R2, renderer, or game changes.
+
+### Completed
+
+- [x] `_start_session` includes `offload_video_to_cpu=True` and filters it when the bound `init_state` does not support it.
+- [x] `_ensure_predictor` calls `build_sam3_multiplex_video_predictor` with `max_num_objects=10`, `multiplex_count=10`, and `use_fa3=False`.
+- [x] Added focused propagation/filtering and builder-configuration regression coverage.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `sam31-memory-mitigation` | `tests/test_modal_app_v2.py` | Unit | ✅ 50/50 | ✅ 4 failures before implementation | ✅ 51 passed | ✅ Supported and unsupported `offload_video_to_cpu`; cached builder call | ✅ Minimal request/builder changes |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.

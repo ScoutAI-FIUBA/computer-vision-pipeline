@@ -253,6 +253,7 @@ def _start_session(predictor: Any, video_path: Path) -> dict[str, Any]:
         "type": "start_session",
         "resource_path": str(video_path),
         "offload_state_to_cpu": True,
+        "offload_video_to_cpu": True,
         "async_loading_frames": False,
     }
     supported = set(init_state.parameters)
@@ -305,7 +306,11 @@ class PipelineV2:
             return self.predictor
         from sam3.model_builder import build_sam3_multiplex_video_predictor
 
-        self.predictor = build_sam3_multiplex_video_predictor(use_fa3=False)
+        self.predictor = build_sam3_multiplex_video_predictor(
+            max_num_objects=10,
+            multiplex_count=10,
+            use_fa3=False,
+        )
         model_cache.commit()
         return self.predictor
 

@@ -257,9 +257,13 @@ def test_v2_predictor_initialization_disables_optional_flashattention3(monkeypat
 
     pipeline = pipeline_cls()
     assert pipeline._ensure_predictor() is fake_predictor
-    assert calls == [{"use_fa3": False}]
+    assert calls == [
+        {"max_num_objects": 10, "multiplex_count": 10, "use_fa3": False}
+    ]
     assert pipeline._ensure_predictor() is fake_predictor
-    assert calls == [{"use_fa3": False}]
+    assert calls == [
+        {"max_num_objects": 10, "multiplex_count": 10, "use_fa3": False}
+    ]
 
 
 def test_entrypoint_accepts_nonempty_video_and_validates_public_values():
@@ -453,6 +457,7 @@ def test_start_session_filters_rebuilt_init_state_kwargs_and_returns_session_id(
             self.requests.append(request)
             if request["type"] == "start_session":
                 assert "offload_state_to_cpu" in request
+                assert "offload_video_to_cpu" in request
                 self.model.init_state(**{key: value for key, value in request.items() if key != "type"})
                 self.session_id = "compatible-session"
                 return {"session_id": self.session_id}
@@ -470,6 +475,31 @@ def test_start_session_filters_rebuilt_init_state_kwargs_and_returns_session_id(
     assert start_request["resource_path"] == str(tmp_path / "clip.mp4")
     assert start_request["async_loading_frames"] is False
     assert start_request["offload_state_to_cpu"] is True
+    assert start_request["offload_video_to_cpu"] is True
+
+
+def test_start_session_propagates_offload_video_to_cpu_when_supported(tmp_path: Path):
+    from modal_app_v2 import _start_session
+
+    class FakeModel:
+        def init_state(self, resource_path, offload_video_to_cpu, async_loading_frames):
+            return resource_path, offload_video_to_cpu, async_loading_frames
+
+    class FakePredictor:
+        def __init__(self):
+            self.model = FakeModel()
+            self.init_result = None
+
+        def handle_request(self, request):
+            self.init_result = self.model.init_state(
+                **{key: value for key, value in request.items() if key != "type"}
+            )
+            return {"session_id": "video-offload"}
+
+    predictor = FakePredictor()
+
+    assert _start_session(predictor, tmp_path / "clip.mp4")["session_id"] == "video-offload"
+    assert predictor.init_result == (str(tmp_path / "clip.mp4"), True, False)
 
 
 def test_start_session_filters_each_rebuilt_kwarg_against_intermediate_signature(tmp_path: Path):
