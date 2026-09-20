@@ -25,6 +25,8 @@ def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
             for decorator in pipeline.decorator_list
             if isinstance(decorator, ast.Call)
             and isinstance(decorator.func, ast.Attribute)
+            and isinstance(decorator.func.value, ast.Name)
+            and decorator.func.value.id == "app"
             and decorator.func.attr == "cls"
         )
         gpu = next(keyword for keyword in modal_decorator.keywords if keyword.arg == "gpu")
