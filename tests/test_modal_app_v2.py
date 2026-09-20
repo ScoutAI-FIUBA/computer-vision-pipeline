@@ -583,6 +583,113 @@ def test_track_video_propagates_session_id_and_closes_in_lifecycle_order(tmp_pat
     assert predictor.calls[3]["session_id"] == "session-17"
 
 
+def test_track_video_normalizes_official_nested_output_envelope(tmp_path: Path):
+    from modal_app_v2 import _track_video
+
+    class FakeModel:
+        def init_state(self, **_kwargs):
+            return None
+
+    class FakePredictor:
+        model = FakeModel()
+
+        def handle_request(self, request):
+            if request["type"] == "start_session":
+                return {"session_id": "session-17"}
+            return None
+
+        def handle_stream_request(self, _request):
+            return iter(
+                [
+                    {
+                        "frame_index": 42,
+                        "outputs": {
+                            "out_obj_ids": [7],
+                            "out_boxes_xywh": [[1, 2, 3, 4]],
+                            "out_probs": [0.8],
+                        },
+                    }
+                ]
+            )
+
+    rows, masks = _track_video(FakePredictor(), tmp_path / "clip.mp4", "person", 42, 42)
+
+    assert rows[0]["frame_index"] == 42
+    assert rows[0]["raw_track_id"] == 7
+    assert rows[0]["bbox_xyxy"] == [1.0, 2.0, 4.0, 6.0]
+    assert rows[0]["probability"] == 0.8
+    assert masks == {}
+
+
+def test_track_video_normalizes_empty_nested_outputs(tmp_path: Path):
+    from modal_app_v2 import _track_video
+
+    class FakeModel:
+        def init_state(self, **_kwargs):
+            return None
+
+    class FakePredictor:
+        model = FakeModel()
+
+        def handle_request(self, request):
+            if request["type"] == "start_session":
+                return {"session_id": "session-17"}
+            return None
+
+        def handle_stream_request(self, _request):
+            return iter([{"frame_index": 42, "outputs": {}}])
+
+    assert _track_video(FakePredictor(), tmp_path / "clip.mp4", "person", 42, 42) == ([], {})
+
+
+def test_track_video_rejects_malformed_non_empty_nested_outputs(tmp_path: Path):
+    from modal_app_v2 import _track_video
+
+    class FakeModel:
+        def init_state(self, **_kwargs):
+            return None
+
+    class FakePredictor:
+        model = FakeModel()
+
+        def handle_request(self, request):
+            if request["type"] == "start_session":
+                return {"session_id": "session-17"}
+            return None
+
+        def handle_stream_request(self, _request):
+            return iter(
+                [
+                    {
+                        "frame_index": 42,
+                        "outputs": {
+                            "out_obj_ids": [7, 8],
+                            "out_boxes_xywh": [[1, 2, 3, 4]],
+                        },
+                    }
+                ]
+            )
+
+    with pytest.raises(RuntimeError, match="object ids and boxes"):
+        _track_video(FakePredictor(), tmp_path / "clip.mp4", "person", 42, 42)
+
+
+def test_session_objects_keeps_direct_output_compatibility():
+    from modal_app_v2 import _session_objects
+
+    assert _session_objects(
+        {"out_obj_ids": [7], "out_boxes_xywh": [[1, 2, 3, 4]], "out_probs": [0.8]}
+    ) == [
+        {
+            "object_id": 7,
+            "bbox": [1, 2, 3, 4],
+            "bbox_format": "xywh",
+            "probability": 0.8,
+            "mask": None,
+        }
+    ]
+
+
 def test_track_video_propagates_genuine_start_exception_unchanged(tmp_path: Path):
     from modal_app_v2 import _track_video
 

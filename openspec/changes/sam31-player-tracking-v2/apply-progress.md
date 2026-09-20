@@ -28,6 +28,7 @@
 - [x] `sam31-session-compat`: added `_start_session` in `modal_app_v2.py`, which inspects the predictor model's actual `init_state` signature and removes only unsupported optional session kwargs before normal `handle_request` registration; `_track_video` uses the helper and retains add/propagate/close lifecycle.
 - [x] `sam31-session-compat` test strengthening: added focused `_track_video` lifecycle/session-ID assertions and unchanged genuine start-session exception propagation coverage; production code unchanged.
 - [x] `sam31-session-compat-fix`: temporarily wraps model `init_state` methods whenever SAM3 `handle_request` rebuilds any unsupported keyword, filters every rebuilt keyword against the original bound signature, restores the bound original method on success/failure, and preserves the original resource path/session ID.
+- [x] `sam31-output-envelope`: `_track_video` now passes `output.get("outputs", output)` to `_session_objects`, preserving the outer `frame_index`; empty output mappings normalize to zero objects while non-empty cardinality errors remain explicit; direct output compatibility is covered.
 
 ## TDD Cycle Evidence
 
@@ -73,6 +74,7 @@
 | `sam31-session-compat` | `tests/test_modal_app_v2.py` | Unit | ✅ 38/38 | ✅ Import failed before `_start_session` existed | ✅ 40 Modal tests passed | ✅ `init_state` accepting and rejecting `offload_state_to_cpu`; session id and registration kwargs verified | ✅ Small signature filter; official builder and predictor lifecycle unchanged |
 | `sam31-session-compat` test strengthening | `tests/test_modal_app_v2.py` | Unit | ✅ 40/40 | ✅ New lifecycle/error assertions added against the active implementation | ✅ 42 Modal tests passed | ✅ Session ID propagation, ordered cleanup, and unchanged start exception | ✅ Tests-only; no production change required |
 | `sam31-session-compat-fix` | `tests/test_modal_app_v2.py` | Unit | ✅ 44/44 | ✅ Intermediate signature passed unsupported kwarg before generalized wrapper | ✅ 45 Modal tests passed | ✅ Supported/unsupported/intermediate signatures plus success/failure restoration and session ID | ✅ Every request kwarg is checked; bound original captured once; wrapper removed in `finally`; exceptions propagate |
+| `sam31-output-envelope` | `tests/test_modal_app_v2.py` | Unit | ✅ 47/47 existing tests | ✅ Nested envelope, empty output, and malformed cardinality cases failed before implementation | ✅ 50 Modal tests passed | ✅ Official envelope, empty frame, malformed non-empty response, and direct-output compatibility | ✅ Minimal fallback plus `_sequence_is_empty`; upstream and legacy boundaries untouched |
 
 ## Verification
 
@@ -105,6 +107,8 @@
 - `sam31-import-smoke` review-fix focused command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py -q` — `37 passed`.
 - `sam31-import-smoke` review-fix relevant command: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest tests/test_modal_app_v2.py tests/test_dependency_compatibility.py -q` — `41 passed, 1 skipped`.
 - Full suite after review fixes: `PYTHONPATH=. uv run --with pytest==8.3.5 pytest -q` — `350 passed, 1 skipped`.
+- `sam31-output-envelope` focused command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `50 passed`.
+- `sam31-output-envelope` full suite: `.venv/bin/python -m pytest -q` — `363 passed, 1 skipped`.
 - CI configuration: no repository CI workflow/configuration was found; none was added.
 - Full suite was executed for `sam31-import-smoke`; final renderer/rollback verification remains deferred.
 
@@ -118,6 +122,7 @@
 - [x] `sam31-import-smoke` review fixes added runtime wrapper failure/success coverage and documented `modal run modal_app_v2.py::sam31_dependency_smoke_test` in `SETUP.md`.
 - [x] `sam31-session-compat` added signature-compatible session registration coverage for both official-model signature variants.
 - [x] `sam31-session-compat-fix` corrected compatibility for SAM3 base `handle_request` request rebuilding, generalized per-keyword filtering, and added intermediate-signature coverage.
+- [x] `sam31-output-envelope` corrected official nested propagation output handling and empty-frame normalization without changing SAM3.1 upstream code.
 - [ ] 3.1–3.3 Local renderer, validation, and final rollback/full-suite verification.
 
 ## Task 2.5 TDD Cycle Evidence
@@ -136,3 +141,4 @@
 - `sam31-session-compat` made no upstream or vendored package changes; only `modal_app_v2.py` and its focused fake-predictor tests changed.
 - `sam31-session-compat` test strengthening changed tests and cumulative progress only; the production helper required no modification.
 - `sam31-session-compat-fix` changed only `modal_app_v2.py`, its focused fake-predictor tests, and this progress record; no upstream/legacy/R2/renderer/game files were touched.
+- `sam31-output-envelope` changed only `modal_app_v2.py`, `tests/test_modal_app_v2.py`, this progress record, and the task checkbox; no upstream/legacy/R2/renderer/game files were touched.

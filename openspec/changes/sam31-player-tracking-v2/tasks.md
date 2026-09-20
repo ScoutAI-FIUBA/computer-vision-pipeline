@@ -38,6 +38,7 @@ Chain strategy: feature-branch-chain
 - [x] 2.4 Implement `modal_app_v2.py` using ephemeral container output and `artifacts: {relative_path: bytes}` for `modal run --video-path --output-dir`; use Modal Volumes only for model, checkpoint, and cache data, and never return `debug.mp4`.
 - [x] 2.5 Test direct-return completeness, local output writing, short-clip/size-limit failure without silent truncation, image boundaries, acceptance gating, and no R2 dependency in `tests/test_runner_v2.py` and `tests/test_modal_app_v2.py`.
 - [x] 2.6 Add the active `sam31-session-compat` helper to filter unsupported SAM 3.1 session-init kwargs without modifying the official builder or vendored package; cover both `init_state` signatures.
+- [x] `sam31-output-envelope` pass official nested SAM3.1 outputs to `_session_objects`, preserve outer `frame_index`, normalize empty frames, and retain direct-output compatibility with strict-TDD coverage.
 
 ## Phase 3: Local Debug and Validation
 
@@ -47,4 +48,4 @@ Chain strategy: feature-branch-chain
 
 ## Status
 
-Phase 1 and Phase 2 work through task 2.6 are complete; Phase 3 remains pending.
+Phase 1 and Phase 2 work through task 2.6 plus `sam31-output-envelope` are complete; Phase 3 remains pending.

@@ -204,6 +204,10 @@ def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
     boxes = output.get("out_boxes_xywh")
     probabilities = output.get("out_probs")
     masks = output.get("out_binary_masks")
+    if ids is None and boxes is None:
+        values = (probabilities, masks)
+        if all(value is None or _sequence_is_empty(value) for value in values):
+            return []
     if ids is None or boxes is None:
         raise RuntimeError("SAM3.1 propagation response lacks object ids or boxes")
     try:
@@ -231,6 +235,13 @@ def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
         }
         for index, (object_id, box) in enumerate(zip(ids, boxes))
     ]
+
+
+def _sequence_is_empty(value: Any) -> bool:
+    try:
+        return len(value) == 0
+    except TypeError:
+        return False
 
 
 def _start_session(predictor: Any, video_path: Path) -> dict[str, Any]:
@@ -276,7 +287,7 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
             frame_index = int(output.get("frame_index", output.get("frame_idx", -1)))
             if not frame_start <= frame_index <= frame_end:
                 continue
-            objects = _session_objects(output)
+            objects = _session_objects(output.get("outputs", output))
             frame_rows = normalize_multiplex_output(frame_index, 0.0, objects)
             rows.extend(frame_rows)
             for row, obj in zip(frame_rows, objects):
