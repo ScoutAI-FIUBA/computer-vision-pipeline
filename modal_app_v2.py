@@ -234,25 +234,30 @@ def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _start_session(predictor: Any, video_path: Path) -> dict[str, Any]:
-    init_state = inspect.signature(predictor.model.init_state)
-    accepts_kwargs = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in init_state.parameters.values()
-    )
+    model = predictor.model
+    original_init_state = model.init_state
+    init_state = inspect.signature(original_init_state)
+    accepts_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in init_state.parameters.values())
     request = {
         "type": "start_session",
         "resource_path": str(video_path),
         "offload_state_to_cpu": True,
         "async_loading_frames": False,
     }
-    if not accepts_kwargs:
-        supported = set(init_state.parameters)
-        request = {
-            key: value
-            for key, value in request.items()
-            if key in {"type", "resource_path"} or key in supported
-        }
-    return predictor.handle_request(request)
+    supports_offload = accepts_kwargs or "offload_state_to_cpu" in init_state.parameters
+    if supports_offload:
+        return predictor.handle_request(request)
+
+    supported = set(init_state.parameters)
+
+    def compatible_init_state(**kwargs: Any):
+        return original_init_state(**{key: value for key, value in kwargs.items() if key in supported})
+
+    model.init_state = compatible_init_state
+    try:
+        return predictor.handle_request(request)
+    finally:
+        model.init_state = original_init_state
 
 
 def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int, frame_end: int):

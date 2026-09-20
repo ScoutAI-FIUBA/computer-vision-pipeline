@@ -399,7 +399,7 @@ def test_legacy_modal_file_is_not_imported_by_v2():
 
 
 @pytest.mark.parametrize("accepts_offload", [True, False])
-def test_track_video_registers_session_with_signature_compatible_init_state(
+def test_start_session_filters_rebuilt_init_state_kwargs_and_returns_session_id(
     accepts_offload: bool, tmp_path: Path
 ):
     from modal_app_v2 import _start_session
@@ -423,6 +423,7 @@ def test_track_video_registers_session_with_signature_compatible_init_state(
         def handle_request(self, request):
             self.requests.append(request)
             if request["type"] == "start_session":
+                assert "offload_state_to_cpu" in request
                 self.model.init_state(**{key: value for key, value in request.items() if key != "type"})
                 self.session_id = "compatible-session"
                 return {"session_id": self.session_id}
@@ -439,7 +440,55 @@ def test_track_video_registers_session_with_signature_compatible_init_state(
     start_request = predictor.requests[0]
     assert start_request["resource_path"] == str(tmp_path / "clip.mp4")
     assert start_request["async_loading_frames"] is False
-    assert ("offload_state_to_cpu" in start_request) is accepts_offload
+    assert start_request["offload_state_to_cpu"] is True
+
+
+def test_start_session_restores_unsupported_init_state_after_success(tmp_path: Path):
+    from modal_app_v2 import _start_session
+
+    class FakeModel:
+        def init_state(self, resource_path, async_loading_frames):
+            return resource_path, async_loading_frames
+
+    class FakePredictor:
+        def __init__(self):
+            self.model = FakeModel()
+
+        def handle_request(self, request):
+            self.model.init_state(**{key: value for key, value in request.items() if key != "type"})
+            return {"session_id": "restored-success"}
+
+    predictor = FakePredictor()
+    original = predictor.model.init_state
+
+    assert _start_session(predictor, tmp_path / "clip.mp4")["session_id"] == "restored-success"
+    assert predictor.model.init_state.__func__ is FakeModel.init_state
+    assert predictor.model.init_state.__self__ is original.__self__
+
+
+def test_start_session_restores_unsupported_init_state_after_failure(tmp_path: Path):
+    from modal_app_v2 import _start_session
+
+    expected = RuntimeError("session failed")
+
+    class FakeModel:
+        def init_state(self, resource_path, async_loading_frames):
+            raise expected
+
+    class FakePredictor:
+        def __init__(self):
+            self.model = FakeModel()
+
+        def handle_request(self, request):
+            self.model.init_state(**{key: value for key, value in request.items() if key != "type"})
+
+    predictor = FakePredictor()
+
+    with pytest.raises(RuntimeError) as error:
+        _start_session(predictor, tmp_path / "clip.mp4")
+
+    assert error.value is expected
+    assert predictor.model.init_state.__func__ is FakeModel.init_state
 
 
 def test_track_video_propagates_session_id_and_closes_in_lifecycle_order(tmp_path: Path):
