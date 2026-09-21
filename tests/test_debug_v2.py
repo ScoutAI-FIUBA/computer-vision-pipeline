@@ -162,6 +162,25 @@ def test_render_frame_treats_mixed_coordinates_as_pixel_style(tmp_path: Path):
     assert np.array_equal(rendered, expected)
 
 
+def test_render_frame_supports_normalized_and_pixel_boxes_in_one_frame(tmp_path: Path):
+    frame = np.zeros((80, 100, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    rows = [
+        {"raw_track_id": 7, "bbox_xyxy": [0.1, 0.2, 0.3, 0.4]},
+        {"raw_track_id": 8, "bbox_xyxy": [60, 30, 80, 50]},
+    ]
+
+    rendered = render_frame(frame, rows, root)
+
+    expected = frame.copy()
+    cv2.rectangle(expected, (10, 16), (30, 32), debug_v2.color_for_track(7), 1)
+    cv2.putText(expected, "RAW: 7", (10, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(7), 1, cv2.LINE_AA)
+    cv2.rectangle(expected, (60, 30), (80, 50), debug_v2.color_for_track(8), 1)
+    cv2.putText(expected, "RAW: 8", (60, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(8), 1, cv2.LINE_AA)
+    assert np.array_equal(rendered, expected)
+
+
 def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):
     video = tmp_path / "input.mp4"
     artifacts = tmp_path / "artifacts"
