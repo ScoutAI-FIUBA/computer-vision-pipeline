@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import pytest
+import numpy as np
 
-from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
+from pipeline.runner_v2 import MaskAppearanceAdapter, RunnerV2, RunnerV2Seams
 from pipeline.team_embedder import TeamFeatures
 
 
@@ -19,6 +20,65 @@ def row(frame_index=60, raw_track_id=3, stable_player_id=None):
 
 def resolve(rows):
     return {item["observation_key"]: f"player-{item['raw_track_id']}" for item in rows}
+
+
+def test_mask_adapter_returns_masked_roi_and_deterministic_metadata():
+    frame = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+    mask = np.zeros((4, 5), dtype=np.uint8)
+    mask[1:3, 2:4] = 1
+
+    crop = MaskAppearanceAdapter().crop(frame, [1, 0, 5, 4], mask)
+
+    assert crop is not None
+    assert crop.bbox_xyxy == (1, 0, 5, 4)
+    assert crop.image.shape == (4, 4, 3)
+    assert crop.mask.tolist() == [
+        [False] * 4,
+        [False, True, True, False],
+        [False, True, True, False],
+        [False] * 4,
+    ]
+    assert crop.metadata == {
+        "source_shape": (4, 5),
+        "roi_xyxy": (1, 0, 5, 4),
+        "crop_shape": (4, 4),
+        "mask_pixel_count": 4,
+    }
+
+
+def test_mask_adapter_zeros_every_pixel_outside_mask():
+    frame = np.full((3, 3, 3), 7, dtype=np.uint8)
+    mask = np.zeros((3, 3), dtype=bool)
+    mask[1, 1] = True
+
+    crop = MaskAppearanceAdapter().crop(frame, [0, 0, 3, 3], mask)
+
+    assert crop is not None
+    assert np.array_equal(crop.image[1, 1], [7, 7, 7])
+    assert int(np.count_nonzero(crop.image)) == 3
+
+
+def test_mask_adapter_clips_roi_to_frame_bounds():
+    frame = np.ones((4, 5, 3), dtype=np.uint8)
+    mask = np.zeros((4, 5), dtype=np.uint8)
+    mask[0, 0] = 1
+
+    crop = MaskAppearanceAdapter().crop(frame, [-2, -1, 2, 3], mask)
+
+    assert crop is not None
+    assert crop.bbox_xyxy == (0, 0, 2, 3)
+    assert crop.image.shape == (3, 2, 3)
+    assert crop.metadata["mask_pixel_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [None, np.zeros((3, 3), dtype=np.uint8), np.zeros((3, 3, 1), dtype=np.uint8), np.zeros((2, 3), dtype=np.uint8), [["bad"]]],
+)
+def test_mask_adapter_rejects_invalid_masks_without_bbox_fallback(mask):
+    frame = np.full((3, 3, 3), 9, dtype=np.uint8)
+
+    assert MaskAppearanceAdapter().crop(frame, [0, 0, 3, 3], mask) is None
 
 
 def test_empty_input_is_rejected_without_statistics():

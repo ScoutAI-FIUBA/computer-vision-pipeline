@@ -226,6 +226,32 @@
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
 
+## Current Apply Batch: Task 3.1
+
+- [x] 3.1 Added `MaskAppearanceAdapter` at the Runner V2 boundary.
+
+The adapter accepts a full-frame image, full-frame mask, and bbox ROI. It rejects
+missing, empty, malformed, non-finite, shape-mismatched, and ROI-empty masks;
+clips the ROI to frame bounds; zeroes pixels outside the mask; and returns
+deterministic crop metadata. No bbox-only fallback is performed.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| 3.1 | `tests/test_runner_v2.py` | Unit | ✅ 14/14 | ✅ Import failure before implementation | ✅ 22/22 | ✅ Valid crop, zeroing, clipping, and five invalid-mask cases | ✅ Deterministic `MaskAppearanceCrop` result and metadata |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py` — 22 passed.
+- Full command: `.venv/bin/python -m pytest` — 410 passed, 1 skipped.
+
+### Remaining
+
+- [ ] 3.2 Reuse ReID with masked frames and ROI boxes.
+- [ ] 3.3 Add conservative stable identity resolution.
+- [ ] 3.4 Run stable-first team identification and conflict handling.
+
 ## `sam31-gpu80` Work Unit
 
 - Boundary: Move only the V2 Modal `PipelineV2` class from `A100-40GB` to `A100-80GB`; retain the legacy `modal_app.py` `L4` binding and all model, checkpoint, offload, renderer, R2, and game behavior.

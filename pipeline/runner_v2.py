@@ -13,6 +13,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from pipeline.reid import Embedder
 from pipeline.team_embedder import TeamEmbedder, TeamEmbeddingSample
 from pipeline.team_id import KMeansTeamClusterer, TeamClusterer, TeamObservation, identify_teams
@@ -20,6 +22,69 @@ from pipeline.team_id import KMeansTeamClusterer, TeamClusterer, TeamObservation
 
 IdentityResolver = Callable[[list[dict[str, Any]]], Mapping[str, str]]
 _DERIVED_OBSERVATION_FIELDS = frozenset({"stable_player_id", "reid_embedding", "team_id"})
+
+
+@dataclass(frozen=True)
+class MaskAppearanceCrop:
+    """Deterministic, mask-gated evidence for one full-frame observation."""
+
+    image: np.ndarray
+    mask: np.ndarray
+    bbox_xyxy: tuple[int, int, int, int]
+    metadata: dict[str, Any]
+
+
+class MaskAppearanceAdapter:
+    """Create appearance crops where the full-frame mask is authoritative."""
+
+    def crop(self, frame: Any, bbox_xyxy: Any, full_mask: Any) -> MaskAppearanceCrop | None:
+        """Return a zeroed ROI, or ``None`` when mask evidence is unusable."""
+
+        try:
+            image = np.asarray(frame)
+            mask = np.asarray(full_mask)
+        except (TypeError, ValueError):
+            return None
+
+        if image.ndim < 2 or image.size == 0 or mask.ndim != 2:
+            return None
+        height, width = image.shape[:2]
+        if mask.shape != (height, width) or not np.issubdtype(mask.dtype, np.number) and mask.dtype != np.bool_:
+            return None
+        try:
+            if not np.isfinite(mask).all():
+                return None
+        except TypeError:
+            return None
+        full_mask_bool = mask.astype(bool, copy=False)
+        if not full_mask_bool.any():
+            return None
+
+        try:
+            coordinates = tuple(float(value) for value in bbox_xyxy)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if len(coordinates) != 4 or not all(np.isfinite(value) for value in coordinates):
+            return None
+        x1, y1, x2, y2 = (int(round(value)) for value in coordinates)
+        x1, x2 = max(0, min(width, x1)), max(0, min(width, x2))
+        y1, y2 = max(0, min(height, y1)), max(0, min(height, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        crop_mask = full_mask_bool[y1:y2, x1:x2].copy()
+        if not crop_mask.any():
+            return None
+        crop_image = image[y1:y2, x1:x2].copy()
+        crop_image[~crop_mask] = 0
+        roi = (x1, y1, x2, y2)
+        metadata = {
+            "source_shape": (height, width),
+            "roi_xyxy": roi,
+            "crop_shape": crop_mask.shape,
+            "mask_pixel_count": int(crop_mask.sum()),
+        }
+        return MaskAppearanceCrop(crop_image, crop_mask, roi, metadata)
 
 
 @dataclass(frozen=True)
