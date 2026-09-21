@@ -261,6 +261,25 @@
 - Relevant V2/isolation command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_team_id.py tests/test_modal_app_v2.py -q` — `132 passed`.
 - `git diff --check` passed.
 
+## Task 3.4 Review Follow-up
+
+- Strengthened the Runner → TeamEmbedder regression to assert exact zeroed crop
+  pixels, local `(0, 0, width, height)` ROI coordinates, and crop-local mask data.
+- Reconciled the task status summary so task 3.4 is complete; only tasks 4.1–4.3,
+  5.2, and 5.3/game validation remain pending.
+- No production behavior changed; the existing implementation passed the stronger
+  mask-authority assertions.
+
+### TDD Cycle Evidence
+
+| Scope | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| Task 3.4 review follow-up | `tests/test_runner_v2.py` | Unit | ✅ 54/54 | ✅ Stronger crop/ROI assertions written | ✅ 54 focused tests passed | ✅ Exact masked pixels, local ROI, and crop-local mask across stable fragments | ➖ No production refactor; existing behavior was correct |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `54 passed`.
+
 ## Task 3.3 Review Fix Work Unit
 
 - Boundary: correct conservative identity authority and input-integrity findings from review of `df1fde8`; Team ID task 3.4 followed in the dedicated work unit below.

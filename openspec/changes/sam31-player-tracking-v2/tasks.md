@@ -58,4 +58,4 @@ Chain strategy: feature-branch-chain
 
 ## Status
 
-Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.3, including V2 frame/mask runtime wiring and conservative stable identity, are complete. Tasks 3.4, 4.1–4.3, 5.2, and 5.3 (focused validation and `game_03`) remain pending; completed commits and no-PR policy are preserved.
+Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.4, including V2 frame/mask runtime wiring, conservative stable identity, and stable-first Team ID, are complete. Tasks 4.1–4.3, 5.2, and 5.3 (focused validation and `game_03`) remain pending; completed commits and no-PR policy are preserved.

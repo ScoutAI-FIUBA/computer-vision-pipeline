@@ -441,12 +441,14 @@ def test_same_stable_player_with_consistent_team_assignments_is_retained():
 
 def test_team_id_runs_after_identity_and_groups_fragments_by_stable_player():
     calls = []
+    team_calls = []
 
     class FakeTeamEmbedder:
         name = "fake-team"
 
         def embed(self, frame, samples):
             calls.append([(sample.track_id, sample.player_mask.shape) for sample in samples])
+            team_calls.append((np.array(frame, copy=True), samples))
             return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
 
     class RecordingClusterer:
@@ -456,9 +458,9 @@ def test_team_id_runs_after_identity_and_groups_fragments_by_stable_player():
             return [0, 0, 1]
 
     observations = [
-        row(frame_index=60, raw_track_id=3),
-        row(frame_index=61, raw_track_id=4),
-        row(frame_index=62, raw_track_id=5),
+        {**row(frame_index=60, raw_track_id=3), "bbox_xyxy": [1, 1, 5, 5]},
+        {**row(frame_index=61, raw_track_id=4), "bbox_xyxy": [1, 1, 5, 5]},
+        {**row(frame_index=62, raw_track_id=5), "bbox_xyxy": [1, 1, 5, 5]},
     ]
     events = []
 
@@ -483,15 +485,32 @@ def test_team_id_runs_after_identity_and_groups_fragments_by_stable_player():
         )
     ).run(
         observations,
-        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in (60, 61, 62)},
+        frames_by_index={
+            index: np.arange(5 * 6 * 3, dtype=np.uint8).reshape(5, 6, 3)
+            for index in (60, 61, 62)
+        },
         masks_by_observation={
-            item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations
+            item["observation_key"]: np.pad(
+                np.ones((2, 2), dtype=bool), ((2, 1), (2, 2))
+            )
+            for item in observations
         },
     )
 
     assert events[0] == "identity"
     assert events[1:] == ["team", "team", "team"]
-    assert calls == [[(1, (20, 10))], [(1, (20, 10))], [(2, (20, 10))]]
+    assert calls == [[(1, (4, 4))], [(1, (4, 4))], [(2, (4, 4))]]
+    expected_frame = np.arange(5 * 6 * 3, dtype=np.uint8).reshape(5, 6, 3)[1:5, 1:5].copy()
+    expected_mask = np.zeros((4, 4), dtype=bool)
+    expected_mask[1:3, 1:3] = True
+    expected_frame[~expected_mask] = 0
+    assert all(np.array_equal(frame, expected_frame) for frame, _ in team_calls)
+    assert all(
+        sample.xyxy == (0.0, 0.0, 4.0, 4.0)
+        and np.array_equal(sample.player_mask, expected_mask)
+        for _, samples in team_calls
+        for sample in samples
+    )
     assert result.downstream["team_assignments"] == {"player-7": 0, "player-8": 1}
 
 
