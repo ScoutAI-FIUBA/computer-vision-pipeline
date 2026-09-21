@@ -14,6 +14,8 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 
+MAX_DRAW_COORDINATE = int(np.iinfo(np.int32).max) - 1
+
 
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
     """Group JSONL observations by source frame index."""
@@ -63,6 +65,8 @@ def _bbox_xyxy_in_pixels(raw_bbox: Any, shape: tuple[int, int]) -> list[int]:
         raise ValueError("bbox_xyxy must contain four values")
     if not all(math.isfinite(value) for value in values):
         raise ValueError("bbox_xyxy values must be finite")
+    if any(abs(value) > MAX_DRAW_COORDINATE for value in values):
+        raise ValueError("bbox_xyxy values exceed OpenCV coordinate limits")
     if all(0.0 <= value <= 1.0 for value in values):
         height, width = shape
         values = [values[0] * width, values[1] * height, values[2] * width, values[3] * height]

@@ -108,12 +108,37 @@ def test_render_frame_skips_non_finite_bbox_coordinates(tmp_path: Path, index: i
     assert np.array_equal(rendered, frame)
 
 
+@pytest.mark.parametrize("index", range(4))
+def test_render_frame_skips_extreme_finite_bbox_coordinates(tmp_path: Path, index: int):
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    bbox = [0.25, 0.25, 0.5, 0.75]
+    bbox[index] = 1e308
+
+    rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": bbox}], root)
+
+    assert np.array_equal(rendered, frame)
+
+
 def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):
     video = tmp_path / "input.mp4"
     artifacts = tmp_path / "artifacts"
     output = tmp_path / "debug.mp4"
     _write_video(video)
     _write_artifacts(artifacts)
+
+    frame_for_missing_mask = np.zeros((24, 80, 3), dtype=np.uint8)
+    rendered = render_frame(frame_for_missing_mask, [{
+        "raw_track_id": 8,
+        "bbox_xyxy": [15, 5, 22, 14],
+        "mask_ref": "masks/missing.png",
+    }], artifacts)
+    expected = frame_for_missing_mask.copy()
+    color = debug_v2.color_for_track(8)
+    cv2.rectangle(expected, (15, 5), (22, 14), color, 1)
+    cv2.putText(expected, "RAW: 8", (15, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    assert np.array_equal(rendered[0:15, 15:75], expected[0:15, 15:75])
 
     stats = render_debug_video(video, artifacts / "tracks.jsonl", artifacts, output)
 
