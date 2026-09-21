@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
+from scripts.tracking import debug_v2
 from scripts.tracking.debug_v2 import render_debug_video, render_frame, validate_artifacts
 
 
@@ -201,3 +203,56 @@ def test_valid_empty_package_renders_empty_frames(tmp_path: Path):
     stats = render_debug_video(video, artifacts / "tracks.jsonl", artifacts, output)
 
     assert stats["frames_written"] == 2
+
+
+@pytest.mark.parametrize("field", ["complete", "truncated"])
+@pytest.mark.parametrize("value", ["false", 0, 1, None])
+def test_manifest_status_fields_require_real_booleans(tmp_path: Path, field, value):
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts)
+    manifest = json.loads((artifacts / "manifest.json").read_text())
+    manifest[field] = value
+    (artifacts / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match=f"{field} must be a boolean"):
+        validate_artifacts(artifacts / "tracks.jsonl", artifacts)
+
+
+def test_malformed_nested_manifest_fields_have_controlled_errors(tmp_path: Path):
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts)
+    manifest = json.loads((artifacts / "manifest.json").read_text())
+    manifest["transfer_errors"] = "timed out"
+    (artifacts / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="transfer_errors must be a list"):
+        validate_artifacts(artifacts / "tracks.jsonl", artifacts)
+
+
+def test_cli_passes_allow_incomplete_to_render_flow(tmp_path: Path, monkeypatch):
+    captured: dict = {}
+
+    def fake_render(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"frames_written": 0}
+
+    monkeypatch.setattr(debug_v2, "render_debug_video", fake_render)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debug_v2.py",
+            "--video-path",
+            str(tmp_path / "input.mp4"),
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--output",
+            str(tmp_path / "debug.mp4"),
+            "--allow-incomplete",
+        ],
+    )
+
+    debug_v2.main()
+
+    assert captured["kwargs"]["allow_incomplete"] is True

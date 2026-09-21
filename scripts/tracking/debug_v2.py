@@ -79,17 +79,27 @@ def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete:
         raise ValueError("invalid artifact manifest structure: artifacts must be an object")
     if not isinstance(artifacts.get("tracks"), dict) or not isinstance(artifacts.get("masks"), dict):
         raise ValueError("invalid artifact manifest structure: tracks and masks are required")
+    for name in ("tracks", "masks"):
+        if not isinstance(artifacts[name].get("key"), str):
+            raise ValueError(f"invalid artifact manifest structure: artifacts.{name}.key must be a string")
+
+    for name in ("complete", "truncated"):
+        if type(manifest.get(name)) is not bool:
+            raise ValueError(f"invalid artifact manifest structure: {name} must be a boolean")
+    transfer_errors = manifest.get("transfer_errors")
+    if not isinstance(transfer_errors, list) or any(not isinstance(error, str) for error in transfer_errors):
+        raise ValueError("invalid artifact manifest structure: transfer_errors must be a list of strings")
 
     reasons: list[str] = []
-    if manifest.get("complete") is False:
+    if not manifest["complete"]:
         reasons.append("incomplete")
-    if manifest.get("truncated") is True:
+    if manifest["truncated"]:
         reasons.append("truncated")
-    if manifest.get("transfer_errors"):
+    if transfer_errors:
         reasons.append("transfer errors")
     missing = artifacts["masks"].get("missing", [])
-    if not isinstance(missing, list):
-        raise ValueError("invalid artifact manifest structure: masks.missing must be a list")
+    if not isinstance(missing, list) or any(not isinstance(item, str) for item in missing):
+        raise ValueError("invalid artifact manifest structure: masks.missing must be a list of strings")
     if missing:
         reasons.append("missing required artifacts")
     if reasons and not allow_incomplete:
