@@ -53,6 +53,7 @@ image = (
         "scipy==1.14.1",
         "umap-learn==0.5.9.post2",
         "boxmot==22.0.0",
+        "open_clip_torch==2.32.0",
         "timm==1.0.22",
         "python-dotenv==1.2.2",
     )
@@ -318,6 +319,24 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
 
 @app.cls(image=image, gpu="A100-80GB", volumes={CACHE_DIR: model_cache}, secrets=[hf_secret], timeout=1800)
 class PipelineV2:
+    @modal.enter()
+    def load_models(self) -> None:
+        """Warm SAM, ReID, and team models once per Modal container."""
+        from pipeline.reid import build_embedder
+        from pipeline.runner_v2 import ConservativeStableIdentityResolver, RunnerV2Seams
+        from pipeline.team_embedder import build_team_embedder
+
+        self._ensure_predictor()
+        reid_backend = os.getenv("REID_BACKEND", "osnet")
+        team_backend = os.getenv("TEAM_EMBEDDER_BACKEND", "siglip")
+        team_model_id = os.getenv("TEAM_EMBEDDER_MODEL_ID", "Marqo/marqo-fashionSigLIP")
+        self.seams = RunnerV2Seams(
+            identity=ConservativeStableIdentityResolver(),
+            reid=build_embedder(reid_backend, weights=f"{CACHE_DIR}/reid/osnet_x1_0_msmt17.pt"),
+            team_embedder=build_team_embedder(team_backend, model_id=team_model_id),
+        )
+        model_cache.commit()
+
     def _ensure_predictor(self) -> Any:
         if hasattr(self, "predictor"):
             return self.predictor
@@ -354,28 +373,34 @@ class PipelineV2:
             output_dir = root / "artifacts"
             video_path.write_bytes(video_bytes)
             started = time.perf_counter()
-            rows, masks = _track_video(
-                self._ensure_predictor(), video_path, prompt, frame_start, frame_end
-            )
-            _add_mask_references(rows, masks)
-            frames = _load_video_frames(video_path, frame_start, frame_end)
-            result = run_v2(
-                rows,
-                frames_by_index=frames,
-                masks_by_observation=masks,
-            )
-            package_artifacts(
-                output_dir,
-                result.observations,
-                masks,
-                input_fingerprint=_file_fingerprint(video_path),
-                video_metadata=_video_metadata(video_path),
-                frame_bounds=[frame_start, frame_end],
-                prompts=[prompt],
-                config={"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end},
-                benchmark={"wall_seconds": time.perf_counter() - started},
-                acceptance=result.acceptance,
-            )
+            print("[v2] progress=0")
+            try:
+                rows, masks = _track_video(
+                    self._ensure_predictor(), video_path, prompt, frame_start, frame_end
+                )
+                _add_mask_references(rows, masks)
+                frames = _load_video_frames(video_path, frame_start, frame_end)
+                runner_kwargs = {"frames_by_index": frames, "masks_by_observation": masks}
+                if hasattr(self, "seams"):
+                    runner_kwargs["seams"] = self.seams
+                result = run_v2(rows, **runner_kwargs)
+                package_artifacts(
+                    output_dir,
+                    result.observations,
+                    masks,
+                    input_fingerprint=_file_fingerprint(video_path),
+                    video_metadata=_video_metadata(video_path),
+                    frame_bounds=[frame_start, frame_end],
+                    prompts=[prompt],
+                    config={"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end},
+                    benchmark={"wall_seconds": time.perf_counter() - started},
+                    acceptance=result.acceptance,
+                    acceptance_reasons=result.acceptance_reasons,
+                )
+            except Exception as error:
+                print(f"[v2] error={type(error).__name__}: {error}")
+                raise
+            print("[v2] progress=100")
             payload = {"acceptance": result.acceptance}
             if return_artifacts:
                 payload["artifacts"] = collect_artifacts(output_dir, max_bytes=max_artifact_bytes)

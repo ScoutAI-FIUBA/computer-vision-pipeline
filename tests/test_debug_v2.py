@@ -61,6 +61,59 @@ def test_render_frame_draws_mask_bbox_and_raw_label(tmp_path: Path):
     assert rendered.shape == frame.shape
 
 
+def test_render_frame_draws_stable_team_and_rejection_labels(tmp_path: Path):
+    frame = np.zeros((80, 120, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+
+    rendered = render_frame(
+        frame,
+        [{
+            "raw_track_id": 7,
+            "stable_player_id": "player-007",
+            "team_id": 1,
+            "rejection_state": "rejected",
+            "bbox_xyxy": [10, 20, 60, 70],
+        }],
+        root,
+    )
+
+    assert not np.array_equal(rendered, frame)
+    assert rendered[20, 10].any()
+
+
+def test_render_frame_uses_artifact_fields_for_all_debug_labels(tmp_path: Path, monkeypatch):
+    calls = []
+    original_put_text = cv2.putText
+
+    def recording_put_text(image, text, *args, **kwargs):
+        calls.append(text)
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", recording_put_text)
+    render_frame(
+        np.zeros((80, 120, 3), dtype=np.uint8),
+        [{
+            "raw_track_id": 7,
+            "stable_player_id": "player-007",
+            "team_id": 1,
+            "rejection_state": "rejected",
+            "bbox_xyxy": [10, 20, 60, 70],
+        }],
+        tmp_path,
+    )
+
+    assert calls == ["RAW: 7", "PLAYER: player-007", "TEAM: 1", "STATE: rejected"]
+
+
+def test_load_observations_marks_manifest_rejection_without_inference(tmp_path: Path):
+    tracks = tmp_path / "tracks.jsonl"
+    tracks.write_text(json.dumps({"frame_index": 1, "raw_track_id": 7}) + "\n")
+    (tmp_path / "manifest.json").write_text(json.dumps({"acceptance": {"tracking_identity": "rejected"}}))
+
+    assert debug_v2.load_observations(tracks)[1][0]["rejection_state"] == "rejected"
+
+
 def test_render_frame_scales_normalized_bbox_before_drawing_mask_and_label(tmp_path: Path):
     root = tmp_path / "artifacts"
     _write_artifacts(root)

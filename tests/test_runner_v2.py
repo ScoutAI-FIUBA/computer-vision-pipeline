@@ -364,6 +364,39 @@ def test_team_embedder_and_team_id_use_production_contracts_then_map_to_stable_i
     assert result.acceptance["tracking_identity"] == "unvalidated"
 
 
+def test_team_assignments_are_serialized_on_each_stable_observation():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[float(sample.track_id)], embedding=None) for sample in samples]
+
+    class FakeClusterer:
+        name = "fake-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [1]
+
+    result = RunnerV2(
+        RunnerV2Seams(identity=resolve, team_embedder=FakeTeamEmbedder(), team_clusterer=FakeClusterer())
+    ).run(
+        [row()],
+        frames_by_index={60: np.ones((24, 12, 3), dtype=np.uint8)},
+        masks_by_observation={"60:3": np.ones((24, 12), dtype=bool)},
+    )
+
+    assert result.observations[0]["raw_track_id"] == 3
+    assert result.observations[0]["stable_player_id"] == "player-3"
+    assert result.observations[0]["team_id"] == 1
+
+
+def test_rejected_runner_result_keeps_explicit_rejection_state():
+    result = RunnerV2(RunnerV2Seams(identity=lambda _rows: {})).run([row()])
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == ["missing_stable_player_id:60:3"]
+
+
 def test_same_stable_player_with_conflicting_team_assignments_is_rejected():
     class FakeTeamEmbedder:
         name = "fake-team"

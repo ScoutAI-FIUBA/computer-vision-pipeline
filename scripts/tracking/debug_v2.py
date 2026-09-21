@@ -9,7 +9,7 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import cv2
 import numpy as np
@@ -20,10 +20,19 @@ MAX_DRAW_COORDINATE = int(np.iinfo(np.int32).max) - 1
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
     """Group JSONL observations by source frame index."""
     by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    manifest_path = tracks_jsonl.parent / "manifest.json"
+    rejection_state = None
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        acceptance = manifest.get("acceptance", {})
+        if acceptance.get("tracking_identity") == "rejected":
+            rejection_state = "rejected"
     with tracks_jsonl.open(encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
                 row = json.loads(line)
+                if rejection_state is not None:
+                    row.setdefault("rejection_state", rejection_state)
                 by_frame[int(row["frame_index"])].append(row)
     return dict(by_frame)
 
@@ -126,7 +135,7 @@ def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete:
 
 
 def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: Path) -> np.ndarray:
-    """Draw masks, boxes, and raw IDs without mutating the source frame."""
+    """Draw masks and provenance labels without running identity logic."""
     rendered = frame.copy()
     for row in rows:
         try:
@@ -154,6 +163,24 @@ def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: P
             2,
             cv2.LINE_AA,
         )
+        labels = []
+        if row.get("stable_player_id"):
+            labels.append(f"PLAYER: {row['stable_player_id']}")
+        if row.get("team_id") is not None:
+            labels.append(f"TEAM: {row['team_id']}")
+        if row.get("rejection_state"):
+            labels.append(f"STATE: {row['rejection_state']}")
+        for offset, label in enumerate(labels, start=1):
+            cv2.putText(
+                rendered,
+                label,
+                (x1, max(12, y1 - 4 - 16 * offset)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
     return rendered
 
 

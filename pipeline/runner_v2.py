@@ -477,6 +477,10 @@ class RunnerV2:
                 reasons.extend(team_reasons)
                 if not team_reasons:
                     downstream["team_assignments"] = team_assignments
+                    for row in rows:
+                        stable_id = row.get("stable_player_id")
+                        if stable_id in team_assignments:
+                            row["team_id"] = team_assignments[stable_id]
 
         structurally_valid = not reasons
         if not structurally_valid:

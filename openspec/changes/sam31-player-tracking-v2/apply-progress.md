@@ -287,7 +287,33 @@
   `tests/test_results_artifacts.py`, and `tests/test_debug_v2.py`.
 - [x] Recorded the existing passing focused/full test evidence from the completed
   Team ID work; no implementation or production files were changed.
-- [ ] Tasks 4.1–4.3 and 5.3 (`game_03` validation) remain pending.
+- [ ] Task 5.3 (`game_03` validation) remains pending.
+
+## Phase 4 Runtime/Debug Integration Work Unit
+
+- Boundary: tasks 4.1–4.3 only; V2 runtime seams, stable/team artifact fields, and local debug labels.
+- Delivery: one local conventional commit on the active native attempt; no PR, push, or additional acquisition.
+- Scope guard: `modal_app.py`, statistics, shots, legacy, R2, and `game_03` GPU validation remain untouched/out of scope.
+
+### Completed
+
+- [x] 4.1 Added V2 container lifecycle model warming for SAM/ReID/team seams, passed real frames/masks and seams into `run_v2`, preserved temporary local bytes/artifact return, and added progress/error logging.
+- [x] 4.2 Preserved legacy isolation; `modal_app.py` is unchanged and V2-only dependencies remain in `modal_app_v2.py`.
+- [x] 4.3 Serialized stable/team fields on accepted rows, preserved acceptance reasons in manifests, and rendered RAW/PLAYER/TEAM/STATE labels without ReID or Team logic in the renderer.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 4.1 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Unit/runtime seam | ✅ 150 focused tests | ✅ Runtime seam and team-field tests failed | ✅ Focused V2 suite passed | ✅ Real frame/mask path, injected seams, stable/team fields, rejection reasons | ✅ Optional seam kwarg preserves existing compatibility |
+| 4.2 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Static/unit boundary | ✅ Legacy isolation coverage | ✅ Isolation contract retained | ✅ Full suite passed | ✅ V2-only dependency/source checks and legacy hash check | ✅ No legacy edits |
+| 4.3 | `tests/test_results_artifacts.py`, `tests/test_debug_v2.py` | Unit/artifact rendering | ✅ Existing artifact/renderer coverage | ✅ Artifact reason/label tests failed | ✅ Focused V2 suite passed | ✅ Accepted labels, rejection manifest propagation, missing-mask-safe rendering | ✅ Renderer remains an artifact consumer |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py tests/test_results_artifacts.py tests/test_debug_v2.py -q` — `157 passed`.
+- Full command: `.venv/bin/python -m pytest -q` — `450 passed, 1 skipped`.
+- `modal_app.py` unchanged; no GPU or `game_03` validation performed.
 
 ## Task 3.3 Review Fix Work Unit
 

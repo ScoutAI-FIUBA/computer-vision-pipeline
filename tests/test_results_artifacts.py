@@ -60,6 +60,18 @@ def test_package_writes_manifest_tracks_and_lossless_mask(tmp_path: Path):
     np.testing.assert_array_equal(written, mask)
 
 
+def test_package_preserves_acceptance_reasons_for_debug_review(tmp_path: Path):
+    manifest = package_artifacts(
+        tmp_path,
+        _observations(),
+        {"60:3": np.ones((2, 2), dtype=np.uint8)},
+        acceptance={"tracking_identity": "rejected"},
+        acceptance_reasons=["missing_stable_player_id:60:3"],
+    )
+
+    assert manifest["acceptance_reasons"] == ["missing_stable_player_id:60:3"]
+
+
 def test_manifest_integrity_hash_excludes_its_own_hash(tmp_path: Path):
     manifest = package_artifacts(tmp_path, _observations(), {"60:3": np.ones((2, 2), dtype=np.uint8)})
     manifest_ref = manifest["artifacts"]["manifest"]

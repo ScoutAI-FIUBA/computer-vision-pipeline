@@ -153,6 +153,7 @@ def package_artifacts(
     config: Mapping[str, Any] | None = None,
     benchmark: Mapping[str, Any] | None = None,
     acceptance: Mapping[str, Any] | None = None,
+    acceptance_reasons: Iterable[str] = (),
     output_prefix: str = "",
     transfer_errors: Iterable[str] = (),
     truncated: bool = False,
@@ -205,6 +206,7 @@ def package_artifacts(
         "config": dict(config or {}),
         "benchmark": dict(benchmark or {}),
         "acceptance": dict(acceptance or {}),
+        "acceptance_reasons": list(acceptance_reasons),
         "observation_count": len(rows),
         "mask_encoding": "PNG uint8 lossless",
         "artifacts": {

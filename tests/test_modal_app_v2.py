@@ -884,6 +884,30 @@ def test_process_passes_tracked_frames_and_masks_to_v2_runner(monkeypatch):
     assert np.array_equal(captured["masks_by_observation"]["60:3"], mask)
 
 
+def test_process_passes_runtime_seams_to_v2_runner(monkeypatch):
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result, RunnerV2Seams
+
+    captured = {}
+    seams = RunnerV2Seams(identity=lambda rows: {row["observation_key"]: "player-3" for row in rows})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda rows, **kwargs: captured.update(kwargs) or RunnerV2Result(rows))
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: type("Predictor", (), {
+        "model": type("Model", (), {"init_state": lambda _self, **_kwargs: None})(),
+        "handle_request": lambda _self, request: {"session_id": "fake"} if request["type"] == "start_session" else None,
+        "handle_stream_request": lambda _self, _request: iter(()),
+    })())
+    instance = cls()
+    instance.seams = seams
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    process(instance, video_bytes=b"fake-video", frame_start=60, frame_end=60)
+
+    assert captured["seams"] is seams
+
+
 def test_process_rejects_missing_identity_and_defers_statistics(monkeypatch):
     import modal_app_v2
     from pipeline.runner_v2 import RunnerV2, RunnerV2Seams

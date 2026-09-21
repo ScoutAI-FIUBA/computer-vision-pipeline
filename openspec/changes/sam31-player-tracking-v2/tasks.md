@@ -45,9 +45,9 @@ Chain strategy: feature-branch-chain
 
 ## Phase 4: V2 Runtime and Debug Integration
 
-- [ ] 4.1 Extend `modal_app_v2.py`/`RunnerV2` using real `modal_app.py` patterns: class lifecycle/model reuse, local video bytes, `TemporaryDirectory`, direct `artifacts: {relative_path: bytes}`, local writes, progress, and error handling.
-- [ ] 4.2 Keep legacy isolation: `modal_app.py` MUST NOT change; V2 dependencies and paths stay in V2 files.
-- [ ] 4.3 Preserve fields in `pipeline/results.py`; render raw/stable/team labels, masks, and rejection state in `scripts/tracking/debug_v2.py`.
+- [x] 4.1 Extend `modal_app_v2.py`/`RunnerV2` using real `modal_app.py` patterns: class lifecycle/model reuse, local video bytes, `TemporaryDirectory`, direct `artifacts: {relative_path: bytes}`, local writes, progress, and error handling.
+- [x] 4.2 Keep legacy isolation: `modal_app.py` MUST NOT change; V2 dependencies and paths stay in V2 files.
+- [x] 4.3 Preserve fields in `pipeline/results.py`; render raw/stable/team labels, masks, and rejection state in `scripts/tracking/debug_v2.py`.
 
 ## Phase 5: Local Debug and Validation
 
@@ -58,4 +58,4 @@ Chain strategy: feature-branch-chain
 
 ## Status
 
-Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.4, including V2 frame/mask runtime wiring, conservative stable identity, and stable-first Team ID, plus task 5.2 focused coverage, are complete. Tasks 4.1–4.3 and 5.3 (`game_03` validation) remain pending; completed commits and no-PR policy are preserved.
+Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.4, including V2 frame/mask runtime wiring, conservative stable identity, and stable-first Team ID, plus tasks 4.1–4.3 and 5.2 focused coverage, are complete. Task 5.3 (`game_03` validation) remains pending; completed commits and no-PR policy are preserved.
