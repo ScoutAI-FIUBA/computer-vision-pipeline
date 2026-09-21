@@ -266,9 +266,38 @@ deterministic crop metadata. No bbox-only fallback is performed.
 
 ### Remaining
 
-- [ ] 3.2 Reuse ReID with masked frames and ROI boxes.
+- [x] 3.2 Reuse ReID with masked frames and ROI boxes.
 - [ ] 3.3 Add conservative stable identity resolution.
 - [ ] 3.4 Run stable-first team identification and conflict handling.
+
+## Task 3.2 Work Unit
+
+- Boundary: V2 runner ReID adapter only; reuse `Embedder.embed(frame, boxes)` with
+  `MaskAppearanceAdapter` crops and local ROI boxes. Legacy `modal_app.py` remains
+  untouched; stable identity and full team clustering remain deferred to tasks 3.3–3.4.
+- Delivery: One local conventional commit on the active native attempt; no PR and no
+  branch reset/acquisition.
+- Rollback: Revert the task 3.2 commit; task 3.1 mask adapter and legacy runner remain
+  available.
+
+### Completed
+
+- [x] 3.2 Added V2-only masked ReID invocation through the existing embedder contract.
+- [x] 3.2 Invalid, missing, empty, malformed, or mismatched masks now skip ReID and
+  team calls, retain one observation per raw track, and record explicit invalid evidence.
+- [x] 3.2 ReID vectors are normalized at the runner boundary for contract-compatible
+  downstream use; valid rows retain `raw_track_id` and `reid_embedding`.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 3.2 | `tests/test_runner_v2.py` | Unit | ✅ 31/31 | ✅ New adapter-call tests failed before API wiring | ✅ 36 focused tests passed | ✅ Mask isolation, three invalid-mask forms, normalization, raw-ID/result cardinality | ✅ Reused `MaskAppearanceAdapter`; no ReID model rewrite |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `36 passed`.
+- Legacy `modal_app.py` was not modified.
 
 ## `sam31-gpu80` Work Unit
 

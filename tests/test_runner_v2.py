@@ -182,13 +182,15 @@ def test_reid_uses_the_repository_embedder_contract_and_stable_rows():
             calls.append((frame, boxes))
             return [[0.25, 0.75] for _ in boxes]
 
-    result = RunnerV2(
-        RunnerV2Seams(identity=resolve, reid=FakeEmbedder())
-    ).run([row()], frames_by_index={60: "frame-60"})
+    frame = np.ones((24, 12, 3), dtype=np.uint8)
+    result = RunnerV2(RunnerV2Seams(identity=resolve, reid=FakeEmbedder())).run(
+        [row()], frames_by_index={60: frame}, masks_by_observation={"60:3": np.ones((24, 12), dtype=bool)}
+    )
 
-    assert calls == [("frame-60", [[1, 2, 11, 22]])]
+    assert calls[0][0].shape == (20, 10, 3)
+    assert calls[0][1] == [[0.0, 0.0, 10.0, 20.0]]
     assert result.observations[0]["stable_player_id"] == "player-3"
-    assert result.observations[0]["reid_embedding"] == [0.25, 0.75]
+    assert result.observations[0]["reid_embedding"] == pytest.approx([0.25 / 0.7905694, 0.75 / 0.7905694])
     assert result.acceptance["tracking_identity"] == "unvalidated"
 
 
@@ -312,3 +314,73 @@ def test_conflicting_team_validation_discards_reid_output_atomically():
     assert result.downstream == {}
     derived_fields = {"stable_player_id", "reid_embedding", "team_id"}
     assert all(not derived_fields.intersection(observation) for observation in result.observations)
+
+
+def test_reid_backend_receives_only_masked_roi_pixels_and_local_box():
+    calls = []
+
+    class FakeEmbedder:
+        def embed(self, frame, boxes):
+            calls.append((np.array(frame, copy=True), boxes))
+            return [[3.0, 4.0] for _ in boxes]
+
+    frame = np.full((4, 5, 3), 9, dtype=np.uint8)
+    mask = np.zeros((4, 5), dtype=bool)
+    mask[1:3, 2:4] = True
+    masked_row = {**row(), "bbox_xyxy": [1, 0, 5, 4]}
+    result = RunnerV2(RunnerV2Seams(identity=resolve, reid=FakeEmbedder())).run(
+        [masked_row], frames_by_index={60: frame}, masks_by_observation={"60:3": mask}
+    )
+
+    assert len(calls) == 1
+    received_frame, received_boxes = calls[0]
+    assert received_frame.shape == (4, 4, 3)
+    assert np.array_equal(received_frame[1:3, 1:3], np.full((2, 2, 3), 9, dtype=np.uint8))
+    assert int(np.count_nonzero(received_frame[:1])) == 0
+    assert received_boxes == [[0.0, 0.0, 4.0, 4.0]]
+    assert result.observations[0]["reid_embedding"] == pytest.approx([0.6, 0.8])
+    assert result.observations[0]["reid_evidence"] == {"status": "valid"}
+
+
+@pytest.mark.parametrize("mask", [None, np.zeros((4, 5), dtype=bool), np.zeros((3, 5), dtype=bool)])
+def test_invalid_masks_skip_reid_and_team_evidence(mask):
+    reid_calls = []
+    team_calls = []
+
+    class FakeEmbedder:
+        def embed(self, frame, boxes):
+            reid_calls.append((frame, boxes))
+            return [[1.0, 0.0] for _ in boxes]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            team_calls.append((frame, samples))
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    result = RunnerV2(
+        RunnerV2Seams(identity=resolve, reid=FakeEmbedder(), team_embedder=FakeTeamEmbedder())
+    ).run([row()], frames_by_index={60: np.ones((4, 5, 3), dtype=np.uint8)}, masks_by_observation={"60:3": mask})
+
+    assert reid_calls == []
+    assert team_calls == []
+    assert result.observations == [{**row(), "stable_player_id": "player-3", "reid_evidence": {"status": "invalid", "reason": "invalid_mask"}}]
+    assert "reid_embedding" not in result.observations[0]
+    assert "team_id" not in result.observations[0]
+
+
+def test_reid_embedding_contract_is_normalized_and_one_result_preserves_raw_track_id():
+    class FakeEmbedder:
+        def embed(self, frame, boxes):
+            return [[10.0, 0.0] for _ in boxes]
+
+    frame = np.ones((4, 5, 3), dtype=np.uint8)
+    masks = {"60:3": np.ones((4, 5), dtype=bool)}
+    result = RunnerV2(RunnerV2Seams(identity=resolve, reid=FakeEmbedder())).run(
+        [row()], frames_by_index={60: frame}, masks_by_observation=masks
+    )
+
+    assert len(result.observations) == 1
+    assert result.observations[0]["raw_track_id"] == 3
+    assert result.observations[0]["reid_embedding"] == [1.0, 0.0]

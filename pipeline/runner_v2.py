@@ -21,7 +21,9 @@ from pipeline.team_id import KMeansTeamClusterer, TeamClusterer, TeamObservation
 
 
 IdentityResolver = Callable[[list[dict[str, Any]]], Mapping[str, str]]
-_DERIVED_OBSERVATION_FIELDS = frozenset({"stable_player_id", "reid_embedding", "team_id"})
+_DERIVED_OBSERVATION_FIELDS = frozenset(
+    {"stable_player_id", "reid_embedding", "reid_evidence", "team_id"}
+)
 
 
 @dataclass(frozen=True)
@@ -169,18 +171,51 @@ def _scrub_derived_observations(rows: list[dict[str, Any]]) -> list[dict[str, An
     ]
 
 
-def _run_reid(rows: list[dict[str, Any]], embedder: Embedder, frames_by_index: Mapping[int, Any]) -> int:
+def _normalize_embedding(embedding: Any) -> list[float] | None:
+    if embedding is None:
+        return None
+    try:
+        vector = np.asarray(embedding, dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+    except (TypeError, ValueError):
+        return None
+    if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all() or norm <= 1e-12:
+        return None
+    return (vector / norm).tolist()
+
+
+def _run_reid(
+    rows: list[dict[str, Any]],
+    embedder: Embedder,
+    frames_by_index: Mapping[int, Any],
+    masks_by_observation: Mapping[str, Any] | None,
+) -> tuple[int, dict[str, MaskAppearanceCrop]]:
+    adapter = MaskAppearanceAdapter()
+    prepared: dict[str, MaskAppearanceCrop] = {}
     count = 0
-    for frame_index, frame_rows in _group_by_frame(rows).items():
-        if frame_index not in frames_by_index:
-            raise ValueError(f"missing frame for ReID: {frame_index}")
-        embeddings = embedder.embed(frames_by_index[frame_index], [row["bbox_xyxy"] for row in frame_rows])
-        if len(embeddings) != len(frame_rows):
+    for row in rows:
+        key = str(row.get("observation_key", ""))
+        frame_index = int(row["frame_index"])
+        crop = None
+        if frame_index in frames_by_index and masks_by_observation is not None:
+            crop = adapter.crop(frames_by_index[frame_index], row["bbox_xyxy"], masks_by_observation.get(key))
+        if crop is None:
+            row["reid_evidence"] = {"status": "invalid", "reason": "invalid_mask"}
+            continue
+
+        height, width = crop.image.shape[:2]
+        embeddings = embedder.embed(crop.image, [[0.0, 0.0, float(width), float(height)]])
+        if len(embeddings) != 1:
             raise ValueError("ReID returned a different number of embeddings")
-        for row, embedding in zip(frame_rows, embeddings):
-            row["reid_embedding"] = embedding
-            count += 1
-    return count
+        embedding = _normalize_embedding(embeddings[0])
+        if embedding is None:
+            row["reid_evidence"] = {"status": "invalid", "reason": "invalid_embedding"}
+            continue
+        row["reid_embedding"] = embedding
+        row["reid_evidence"] = {"status": "valid"}
+        prepared[key] = crop
+        count += 1
+    return count, prepared
 
 
 def _run_team_id(
@@ -189,24 +224,32 @@ def _run_team_id(
     clusterer: TeamClusterer,
     team_count: int,
     frames_by_index: Mapping[int, Any],
+    crops_by_observation: Mapping[str, MaskAppearanceCrop] | None = None,
 ) -> tuple[dict[str, int], list[str]]:
     observations: list[TeamObservation] = []
     next_detection_id = 1
     for frame_index, frame_rows in _group_by_frame(rows).items():
         if frame_index not in frames_by_index:
             raise ValueError(f"missing frame for team embedding: {frame_index}")
-        samples = [
-            TeamEmbeddingSample(
-                detection_id=index,
-                track_id=row["raw_track_id"],
-                xyxy=tuple(float(value) for value in row["bbox_xyxy"]),
+        for row in frame_rows:
+            crop = None if crops_by_observation is None else crops_by_observation.get(str(row["observation_key"]))
+            frame = frames_by_index[frame_index] if crop is None else crop.image
+            box = tuple(float(value) for value in row["bbox_xyxy"]) if crop is None else (
+                0.0,
+                0.0,
+                float(crop.image.shape[1]),
+                float(crop.image.shape[0]),
             )
-            for index, row in enumerate(frame_rows, start=next_detection_id)
-        ]
-        features = team_embedder.embed(frames_by_index[frame_index], samples)
-        if len(features) != len(samples):
-            raise ValueError("team embedder returned a different number of features")
-        for sample, feature in zip(samples, features):
+            sample = TeamEmbeddingSample(
+                detection_id=next_detection_id,
+                track_id=row["raw_track_id"],
+                xyxy=box,
+                player_mask=None if crop is None else crop.mask,
+            )
+            features = team_embedder.embed(frame, [sample])
+            if len(features) != 1:
+                raise ValueError("team embedder returned a different number of features")
+            feature = features[0]
             observations.append(
                 TeamObservation(
                     detection_id=sample.detection_id,
@@ -215,7 +258,7 @@ def _run_team_id(
                     embedding=feature.embedding,
                 )
             )
-        next_detection_id += len(samples)
+            next_detection_id += 1
 
     result = identify_teams(
         observations,
@@ -260,6 +303,7 @@ class RunnerV2:
         observations: Iterable[Mapping[str, Any]],
         *,
         frames_by_index: Mapping[int, Any] | None = None,
+        masks_by_observation: Mapping[str, Any] | None = None,
     ) -> RunnerV2Result:
         rows = _copy_observations(observations)
         reasons = _resolve_identity(rows, self.seams.identity)
@@ -267,15 +311,24 @@ class RunnerV2:
         frames = frames_by_index or {}
         downstream: dict[str, Any] = {}
 
+        prepared_crops: dict[str, MaskAppearanceCrop] = {}
         if structurally_valid and self.seams.reid is not None:
-            downstream["reid_records"] = _run_reid(rows, self.seams.reid, frames)
+            downstream["reid_records"], prepared_crops = _run_reid(
+                rows, self.seams.reid, frames, masks_by_observation
+            )
         if structurally_valid and self.seams.team_embedder is not None:
+            team_rows = rows
+            if masks_by_observation is not None:
+                team_rows = [row for row in rows if str(row.get("observation_key", "")) in prepared_crops]
+            if not team_rows:
+                team_rows = []
             team_assignments, team_reasons = _run_team_id(
-                rows,
+                team_rows,
                 self.seams.team_embedder,
                 self.seams.team_clusterer or KMeansTeamClusterer(),
                 self.seams.team_count,
                 frames,
+                prepared_crops if masks_by_observation is not None else None,
             )
             reasons.extend(team_reasons)
             if not team_reasons:
@@ -300,5 +353,10 @@ def run_v2(
     *,
     seams: RunnerV2Seams | None = None,
     frames_by_index: Mapping[int, Any] | None = None,
+    masks_by_observation: Mapping[str, Any] | None = None,
 ) -> RunnerV2Result:
-    return RunnerV2(seams).run(observations, frames_by_index=frames_by_index)
+    return RunnerV2(seams).run(
+        observations,
+        frames_by_index=frames_by_index,
+        masks_by_observation=masks_by_observation,
+    )
