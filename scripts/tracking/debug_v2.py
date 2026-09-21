@@ -55,6 +55,36 @@ def _load_mask(row: dict[str, Any], masks_dir: Path, shape: tuple[int, int]) -> 
     return mask > 0
 
 
+def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete: bool = False) -> None:
+    """Reject unavailable or explicitly incomplete returned packages."""
+    if not tracks_jsonl.is_file():
+        raise ValueError(f"required artifact is missing: {tracks_jsonl}")
+    if not masks_dir.is_dir():
+        raise ValueError(f"required artifact directory is missing: {masks_dir}")
+
+    manifest_path = tracks_jsonl.parent / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read artifact manifest: {manifest_path}") from error
+
+    reasons: list[str] = []
+    if manifest.get("complete") is False:
+        reasons.append("incomplete")
+    if manifest.get("truncated") is True:
+        reasons.append("truncated")
+    if manifest.get("transfer_errors"):
+        reasons.append("transfer errors")
+    missing = manifest.get("artifacts", {}).get("masks", {}).get("missing", [])
+    if missing:
+        reasons.append("missing required artifacts")
+    if reasons and not allow_incomplete:
+        detail = ", ".join(reasons)
+        raise ValueError(f"artifact package is {detail}; pass --allow-incomplete to override")
+
+
 def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: Path) -> np.ndarray:
     """Draw masks, boxes, and raw IDs without mutating the source frame."""
     rendered = frame.copy()
@@ -97,6 +127,7 @@ def render_debug_video(
     *,
     start_frame: int | None = None,
     end_frame: int | None = None,
+    allow_incomplete: bool = False,
 ) -> dict[str, int | None]:
     """Render the selected inclusive source-frame range to an MP4."""
     if start_frame is not None and start_frame < 0:
@@ -106,6 +137,7 @@ def render_debug_video(
     if start_frame is not None and end_frame is not None and end_frame < start_frame:
         raise ValueError("end_frame must be greater than or equal to start_frame")
 
+    validate_artifacts(tracks_jsonl, masks_dir, allow_incomplete=allow_incomplete)
     observations = load_observations(tracks_jsonl)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -153,6 +185,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--start-frame", type=int)
     parser.add_argument("--end-frame", type=int)
+    parser.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="Render despite an incomplete/truncated manifest (unsafe; default rejects it)",
+    )
     args = parser.parse_args()
 
     artifact_dir = args.artifact_dir
@@ -167,6 +204,7 @@ def main() -> None:
         args.output,
         start_frame=args.start_frame,
         end_frame=args.end_frame,
+        allow_incomplete=args.allow_incomplete,
     )
     print(f"Wrote {stats['frames_written']} frames to {args.output}")
 
