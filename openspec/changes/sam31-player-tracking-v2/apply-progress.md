@@ -280,6 +280,15 @@
 
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `54 passed`.
 
+## Task 5.2 Status Reconciliation
+
+- [x] Marked task 5.2 complete: focused pytest coverage exists in
+  `tests/test_runner_v2.py`, `tests/test_modal_app_v2.py`,
+  `tests/test_results_artifacts.py`, and `tests/test_debug_v2.py`.
+- [x] Recorded the existing passing focused/full test evidence from the completed
+  Team ID work; no implementation or production files were changed.
+- [ ] Tasks 4.1–4.3 and 5.3 (`game_03` validation) remain pending.
+
 ## Task 3.3 Review Fix Work Unit
 
 - Boundary: correct conservative identity authority and input-integrity findings from review of `df1fde8`; Team ID task 3.4 followed in the dedicated work unit below.

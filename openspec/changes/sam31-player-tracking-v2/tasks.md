@@ -52,10 +52,10 @@ Chain strategy: feature-branch-chain
 ## Phase 5: Local Debug and Validation
 
 - [x] 5.1 Implement local retrieval/writing in `scripts/tracking/debug_v2.py` for tracks, masks, manifest, config, and benchmark metadata.
-- [ ] 5.2 Add focused pytest coverage in `tests/test_runner_v2.py`, `tests/test_modal_app_v2.py`, `tests/test_results_artifacts.py`, and `tests/test_debug_v2.py`.
+- [x] 5.2 Add focused pytest coverage in `tests/test_runner_v2.py`, `tests/test_modal_app_v2.py`, `tests/test_results_artifacts.py`, and `tests/test_debug_v2.py`.
 - [ ] 5.3 Validate `game_03`, approved prompts, frames 60–130, complete artifacts, deterministic masks, identity-first acceptance, and local labels.
 - [x] 5.4 Record ordered conventional commits, verify unchanged `modal_app.py`, run `.venv/bin/python -m pytest`, and create no PRs.
 
 ## Status
 
-Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.4, including V2 frame/mask runtime wiring, conservative stable identity, and stable-first Team ID, are complete. Tasks 4.1–4.3, 5.2, and 5.3 (focused validation and `game_03`) remain pending; completed commits and no-PR policy are preserved.
+Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.4, including V2 frame/mask runtime wiring, conservative stable identity, and stable-first Team ID, plus task 5.2 focused coverage, are complete. Tasks 4.1–4.3 and 5.3 (`game_03` validation) remain pending; completed commits and no-PR policy are preserved.
