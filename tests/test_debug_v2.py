@@ -74,8 +74,19 @@ def test_render_frame_scales_normalized_bbox_before_drawing_mask_and_label(tmp_p
     }], root)
 
     color = np.array(debug_v2.color_for_track(7), dtype=np.uint8)
+    expected_label = np.zeros_like(frame)
+    cv2.putText(
+        expected_label,
+        "RAW: 7",
+        (8, 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        tuple(int(channel) for channel in color),
+        1,
+        cv2.LINE_AA,
+    )
     assert np.array_equal(rendered[6, 8], color)
-    assert rendered[12:17, 10:30].any(axis=2).any()
+    assert np.array_equal(rendered[12:18, 10:16], expected_label[12:18, 10:16])
     assert rendered[7, 7].any()
 
 
