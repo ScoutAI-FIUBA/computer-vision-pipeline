@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -60,6 +61,8 @@ def _bbox_xyxy_in_pixels(raw_bbox: Any, shape: tuple[int, int]) -> list[int]:
     values = [float(value) for value in raw_bbox]
     if len(values) != 4:
         raise ValueError("bbox_xyxy must contain four values")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("bbox_xyxy values must be finite")
     if all(0.0 <= value <= 1.0 for value in values):
         height, width = shape
         values = [values[0] * width, values[1] * height, values[2] * width, values[3] * height]

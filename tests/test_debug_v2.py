@@ -74,20 +74,38 @@ def test_render_frame_scales_normalized_bbox_before_drawing_mask_and_label(tmp_p
     }], root)
 
     color = np.array(debug_v2.color_for_track(7), dtype=np.uint8)
-    expected_label = np.zeros_like(frame)
-    cv2.putText(
-        expected_label,
-        "RAW: 7",
-        (8, 12),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        tuple(int(channel) for channel in color),
-        1,
-        cv2.LINE_AA,
-    )
     assert np.array_equal(rendered[6, 8], color)
-    assert np.array_equal(rendered[12:18, 10:16], expected_label[12:18, 10:16])
     assert rendered[7, 7].any()
+
+
+def test_render_frame_scales_all_bbox_corners_and_full_raw_label(tmp_path: Path):
+    frame = np.zeros((80, 100, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    color = debug_v2.color_for_track(7)
+    row = {"raw_track_id": 7, "bbox_xyxy": [0.2, 0.25, 0.6, 0.75]}
+
+    rendered = render_frame(frame, [row], root)
+
+    expected = frame.copy()
+    cv2.rectangle(expected, (20, 20), (60, 60), color, 1)
+    cv2.putText(expected, "RAW: 7", (20, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    assert np.array_equal(rendered[5:21, 20:70], expected[5:21, 20:70])
+    for x, y in ((20, 20), (60, 20), (20, 60), (60, 60)):
+        assert np.array_equal(rendered[y, x], color)
+
+
+@pytest.mark.parametrize(("index", "value"), [(0, float("inf")), (1, float("nan")), (2, float("inf")), (3, float("nan"))])
+def test_render_frame_skips_non_finite_bbox_coordinates(tmp_path: Path, index: int, value: float):
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    bbox = [0.25, 0.25, 0.5, 0.75]
+    bbox[index] = value
+
+    rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": bbox}], root)
+
+    assert np.array_equal(rendered, frame)
 
 
 def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):

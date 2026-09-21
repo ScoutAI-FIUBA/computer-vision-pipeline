@@ -142,7 +142,7 @@
 
 | Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
 |---|---|---|---|---|---|---|---|
-| `renderer-normalized-bboxes` | `tests/test_debug_v2.py` | Unit with synthetic frame/artifacts | ✅ 21/21 | ✅ Normalized bbox placement test failed before conversion | ✅ Focused renderer suite passed | ✅ Normalized mask/box plus deterministic `RAW: 7` label ROI and existing pixel-coordinate case | ✅ Small pure conversion helper with explicit detection contract |
+| `renderer-normalized-bboxes` | `tests/test_debug_v2.py` | Unit with synthetic frame/artifacts | ✅ 21/21 | ✅ Full-label/corner and non-finite regression tests written; inf cases failed before guard | ✅ Focused renderer suite passed | ✅ All four corners, full `RAW: 7` label including digit, mask overlay, pixel boxes, inf, and NaN | ✅ Finite-value guard reuses existing skip-observation behavior |
 
 ## Task 2.5 TDD Cycle Evidence
 
@@ -163,7 +163,8 @@
 - Task 3.1 final-boundary focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `10 passed`.
 - Task 3.1 strict-type/CLI focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `20 passed`.
 - `renderer-normalized-bboxes` focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `21 passed`.
-- `renderer-normalized-bboxes` label assertion: deterministic OpenCV-rendered `RAW: 7` ROI comparison verifies exact label glyph placement without broad non-zero-pixel matching.
+- `renderer-normalized-bboxes` review-fix focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `26 passed`.
+- `renderer-normalized-bboxes` label assertion: deterministic OpenCV-rendered ROI comparison now covers the full `RAW: 7` label including its digit/ID, alongside all four normalized bbox corners.
 - Task 3.1 remains local-only; no Modal deployment, GPU inference, `game_03` validation, ReID/Team ID/statistics, or `modal_app.py` modification was performed.
 - `sam31-import-smoke` also made no real Modal deployment or model download; the smoke function only imports dependencies and validates builder callability.
 - `sam31-session-compat` made no upstream or vendored package changes; only `modal_app_v2.py` and its focused fake-predictor tests changed.
