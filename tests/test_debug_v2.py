@@ -61,6 +61,24 @@ def test_render_frame_draws_mask_bbox_and_raw_label(tmp_path: Path):
     assert rendered.shape == frame.shape
 
 
+def test_render_frame_scales_normalized_bbox_before_drawing_mask_and_label(tmp_path: Path):
+    root = tmp_path / "artifacts"
+    _write_artifacts(root)
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+
+    rendered = render_frame(frame, [{
+        "frame_index": 1,
+        "raw_track_id": 7,
+        "bbox_xyxy": [0.25, 0.25, 0.5, 0.75],
+        "mask_ref": "masks/one.png",
+    }], root)
+
+    color = np.array(debug_v2.color_for_track(7), dtype=np.uint8)
+    assert np.array_equal(rendered[6, 8], color)
+    assert rendered[12:17, 10:30].any(axis=2).any()
+    assert rendered[7, 7].any()
+
+
 def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):
     video = tmp_path / "input.mp4"
     artifacts = tmp_path / "artifacts"

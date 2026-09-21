@@ -33,6 +33,7 @@
 - [x] 3.1 review fixes: the renderer now reads `manifest.json` when present and rejects incomplete/truncated packages, transfer errors, or manifest-listed missing artifacts by default; `--allow-incomplete` is an explicit unsafe override. Synthetic tests use distinct source-frame content and behavioral pixel assertions for masks, labels, and inclusive frame selection.
 - [x] 3.1 final boundary fixes: `manifest.json` is now required by default, with `--allow-incomplete` as the only bypass; missing tracks, masks directories, malformed manifests, and valid empty packages have controlled validation coverage. Tasks 3.2 and 3.3 remain pending.
 - [x] 3.1 final review fixes: manifest `complete`/`truncated` fields now require real booleans; nested artifact keys, transfer errors, and missing lists require controlled types; CLI coverage proves `--allow-incomplete` reaches the render flow.
+- [x] `renderer-normalized-bboxes`: normalized `bbox_xyxy` values whose four coordinates are all in `[0, 1]` are scaled by the current frame width/height before drawing; any coordinate outside that range retains pixel-coordinate behavior. Mask overlays and raw labels remain rendered.
 
 ## TDD Cycle Evidence
 
@@ -137,6 +138,12 @@
 |---|---|---|---|---|---|---|---|
 | 3.1 | `tests/test_debug_v2.py` | Unit with synthetic video/artifacts | ✅ 10/10 baseline | ✅ Boolean/nested-type and CLI regressions | ✅ 20 focused tests passed | ✅ Real booleans, malformed nested fields, CLI override forwarding, plus prior rendering/empty/error paths | ✅ Centralized strict validation; no pipeline changes |
 
+## `renderer-normalized-bboxes` TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `renderer-normalized-bboxes` | `tests/test_debug_v2.py` | Unit with synthetic frame/artifacts | ✅ 20/20 | ✅ Normalized bbox placement test failed before conversion | ✅ Focused renderer suite passed | ✅ Normalized mask/box/label plus existing pixel-coordinate case | ✅ Small pure conversion helper with explicit detection contract |
+
 ## Task 2.5 TDD Cycle Evidence
 
 | Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
@@ -155,6 +162,7 @@
 - Task 3.1 review-fix focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `6 passed`.
 - Task 3.1 final-boundary focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `10 passed`.
 - Task 3.1 strict-type/CLI focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `20 passed`.
+- `renderer-normalized-bboxes` focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `21 passed`.
 - Task 3.1 remains local-only; no Modal deployment, GPU inference, `game_03` validation, ReID/Team ID/statistics, or `modal_app.py` modification was performed.
 - `sam31-import-smoke` also made no real Modal deployment or model download; the smoke function only imports dependencies and validates builder callability.
 - `sam31-session-compat` made no upstream or vendored package changes; only `modal_app_v2.py` and its focused fake-predictor tests changed.

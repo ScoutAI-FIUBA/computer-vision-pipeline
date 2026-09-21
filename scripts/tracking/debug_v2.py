@@ -55,6 +55,17 @@ def _load_mask(row: dict[str, Any], masks_dir: Path, shape: tuple[int, int]) -> 
     return mask > 0
 
 
+def _bbox_xyxy_in_pixels(raw_bbox: Any, shape: tuple[int, int]) -> list[int]:
+    """Convert an all-[0, 1] bbox to pixels; otherwise preserve pixel input."""
+    values = [float(value) for value in raw_bbox]
+    if len(values) != 4:
+        raise ValueError("bbox_xyxy must contain four values")
+    if all(0.0 <= value <= 1.0 for value in values):
+        height, width = shape
+        values = [values[0] * width, values[1] * height, values[2] * width, values[3] * height]
+    return [int(round(value)) for value in values]
+
+
 def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete: bool = False) -> None:
     """Reject unavailable or explicitly incomplete returned packages."""
     if not tracks_jsonl.is_file():
@@ -113,9 +124,7 @@ def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: P
     for row in rows:
         try:
             raw_id = int(row["raw_track_id"])
-            box = [int(round(float(value))) for value in row["bbox_xyxy"]]
-            if len(box) != 4:
-                continue
+            box = _bbox_xyxy_in_pixels(row["bbox_xyxy"], rendered.shape[:2])
         except (KeyError, TypeError, ValueError):
             continue
 
