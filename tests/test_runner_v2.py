@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 import numpy as np
 
-from pipeline.runner_v2 import MaskAppearanceAdapter, RunnerV2, RunnerV2Seams
+from pipeline.runner_v2 import (
+    ConservativeStableIdentityResolver,
+    MaskAppearanceAdapter,
+    RunnerV2,
+    RunnerV2Seams,
+)
 from pipeline.team_embedder import TeamFeatures
 
 
@@ -20,6 +25,81 @@ def row(frame_index=60, raw_track_id=3, stable_player_id=None):
 
 def resolve(rows):
     return {item["observation_key"]: f"player-{item['raw_track_id']}" for item in rows}
+
+
+def identity_row(frame_index, raw_track_id, embedding, stable_player_id=None):
+    return {
+        **row(frame_index=frame_index, raw_track_id=raw_track_id, stable_player_id=stable_player_id),
+        "reid_embedding": embedding,
+        "reid_evidence": {"status": "valid"},
+    }
+
+
+def test_conservative_identity_merges_high_similarity_fragments_within_gap():
+    observations = [
+        identity_row(10, 3, [1.0, 0.0]),
+        identity_row(12, 8, [0.99, 0.01]),
+    ]
+
+    resolved = ConservativeStableIdentityResolver(similarity_threshold=0.98, max_frame_gap=2)(
+        observations
+    )
+
+    assert [resolved[item["observation_key"]] for item in observations] == [
+        "player-001",
+        "player-001",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("second_frame", "second_embedding"),
+    [(12, [0.7, 0.3]), (20, [1.0, 0.0])],
+)
+def test_conservative_identity_fragments_weak_or_long_gap_evidence(second_frame, second_embedding):
+    observations = [
+        identity_row(10, 3, [1.0, 0.0]),
+        identity_row(second_frame, 8, second_embedding),
+    ]
+
+    resolved = ConservativeStableIdentityResolver(similarity_threshold=0.98, max_frame_gap=2)(
+        observations
+    )
+
+    assert resolved["10:3"] == "player-001"
+    assert resolved[f"{second_frame}:8"] == "player-002"
+
+
+def test_conservative_identity_does_not_merge_same_frame_fragments():
+    observations = [
+        identity_row(10, 3, [1.0, 0.0]),
+        identity_row(10, 8, [1.0, 0.0]),
+    ]
+
+    resolved = ConservativeStableIdentityResolver()(observations)
+
+    assert resolved == {"10:3": "player-001", "10:8": "player-002"}
+
+
+def test_conservative_identity_order_is_deterministic_independent_of_input_order():
+    observations = [
+        identity_row(20, 8, [1.0, 0.0]),
+        identity_row(10, 3, [0.0, 1.0]),
+    ]
+
+    resolved = ConservativeStableIdentityResolver()(list(reversed(observations)))
+
+    assert resolved == {"10:3": "player-001", "20:8": "player-002"}
+
+
+def test_rejected_conservative_identity_run_scrubs_derived_fields_atomically():
+    observations = [identity_row(10, 3, [1.0, 0.0], stable_player_id="wrong")]
+
+    result = RunnerV2(RunnerV2Seams(identity=ConservativeStableIdentityResolver())).run(observations)
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.downstream == {}
+    assert result.observations == [{key: value for key, value in observations[0].items()
+                                    if key not in {"stable_player_id", "reid_embedding", "reid_evidence", "team_id"}}]
 
 
 def test_mask_adapter_returns_masked_roi_and_deterministic_metadata():

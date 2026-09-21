@@ -226,6 +226,30 @@
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
 
+## Task 3.3 Work Unit
+
+- Boundary: conservative stable-player identity behind the existing `RunnerV2Seams.identity` seam; task 3.4 Team ID and later runtime/validation work remain deferred.
+- Delivery: one local conventional commit on the active native attempt; no PR and no branch reset/acquisition.
+- Scope guard: `raw_track_id` remains unchanged; `modal_app.py`, Team ID, statistics, and legacy paths remain untouched.
+
+### Completed
+
+- [x] Added `ConservativeStableIdentityResolver` with deterministic `player-NNN` IDs, raw-fragment grouping, normalized prototype cosine matching, and a bounded frame-gap gate.
+- [x] Kept weak similarity, long gaps, missing embeddings, same-frame evidence, and ambiguous candidate ties fragmented.
+- [x] Reordered V2 ReID/identity stages so normalized task 3.2 embeddings feed the resolver before any later team stage.
+- [x] Added strict-TDD coverage for merge, weak/long-gap no-merge, same-frame conflict, deterministic ordering, and atomic rejected-output scrubbing.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 3.3 | `tests/test_runner_v2.py` | Unit | ✅ 38/38 | ✅ Import failure for missing resolver | ✅ 44 focused tests passed | ✅ Merge, weak/long-gap fragmentation, same-frame conflict, ordering, scrubbing | ✅ Small resolver with explicit fragment/prototype helpers; existing seam preserved |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `44 passed`.
+- Legacy `modal_app.py` was not modified; task 3.4 and later tasks remain pending.
+
 ## Review Follow-up: Adapter Edge Cases
 
 This batch added focused regression tests only; no production wiring or task

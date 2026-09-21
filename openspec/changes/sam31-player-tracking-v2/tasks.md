@@ -40,7 +40,7 @@ Chain strategy: feature-branch-chain
 
 - [x] 3.1 **RED/GREEN:** Add `MaskAppearanceAdapter` in `pipeline/runner_v2.py`: require full-frame non-empty matching masks, use bbox only as ROI, zero outside-mask pixels, and never fall back.
 - [x] 3.2 Reuse `pipeline/reid.py::Embedder.embed(frame, boxes)` with masked frames/ROI boxes; V2 passes tracked frames/masks at runtime, and invalid masks yield no ReID or team evidence.
-- [ ] 3.3 Add conservative `RunnerV2Seams.identity`: merge only on high cosine similarity plus bounded gap; preserve `raw_track_id` and fragment ambiguity.
+- [x] 3.3 Add conservative `RunnerV2Seams.identity`: merge only on high cosine similarity plus bounded gap; preserve `raw_track_id` and fragment ambiguity.
 - [ ] 3.4 Run stable-first through `pipeline/team_embedder.py`/`pipeline/team_id.py`, pass `player_mask`, aggregate by stable ID, and atomically reject conflicts.
 
 ## Phase 4: V2 Runtime and Debug Integration
@@ -58,4 +58,4 @@ Chain strategy: feature-branch-chain
 
 ## Status
 
-Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1 and 3.2, including V2 frame/mask runtime wiring, are complete. Tasks 3.3, 3.4, 4.1–4.3, 5.2, and 5.3 (focused validation and `game_03`) remain pending; completed commits and no-PR policy are preserved.
+Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.3, including V2 frame/mask runtime wiring and conservative stable identity, are complete. Tasks 3.4, 4.1–4.3, 5.2, and 5.3 (focused validation and `game_03`) remain pending; completed commits and no-PR policy are preserved.

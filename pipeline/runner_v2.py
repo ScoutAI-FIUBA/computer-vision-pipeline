@@ -108,6 +108,97 @@ class RunnerV2Result:
     acceptance_reasons: list[str] = field(default_factory=list)
 
 
+@dataclass
+class _IdentityFragment:
+    first_frame: int
+    last_frame: int
+    raw_track_id: int
+    rows: list[dict[str, Any]]
+    embeddings: list[np.ndarray]
+
+    @property
+    def prototype(self) -> np.ndarray | None:
+        if not self.embeddings:
+            return None
+        vector = np.mean(self.embeddings, axis=0)
+        norm = float(np.linalg.norm(vector))
+        return None if norm <= 1e-12 else vector / norm
+
+
+class ConservativeStableIdentityResolver:
+    """Resolve raw fragments with a high-evidence, fragmentation-first policy."""
+
+    def __init__(self, similarity_threshold: float = 0.90, max_frame_gap: int = 5) -> None:
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between 0 and 1")
+        if max_frame_gap < 0:
+            raise ValueError("max_frame_gap must be non-negative")
+        self.similarity_threshold = similarity_threshold
+        self.max_frame_gap = max_frame_gap
+
+    def __call__(self, rows: list[dict[str, Any]]) -> Mapping[str, str]:
+        fragments = self._fragments(rows)
+        identities: list[_IdentityFragment] = []
+        resolved: dict[str, str] = {}
+        for fragment in fragments:
+            candidates: list[tuple[float, int]] = []
+            for index, identity in enumerate(identities):
+                if self._eligible(fragment, identity):
+                    candidates.append((self._similarity(fragment, identity), index))
+            candidates = [candidate for candidate in candidates if candidate[0] >= self.similarity_threshold]
+            if candidates:
+                candidates.sort(key=lambda candidate: (-candidate[0], candidate[1]))
+                best_score, best_index = candidates[0]
+                tied = len(candidates) > 1 and np.isclose(best_score, candidates[1][0], atol=1e-12)
+                if not tied:
+                    identity = identities[best_index]
+                    identity.rows.extend(fragment.rows)
+                    identity.embeddings.extend(fragment.embeddings)
+                    identity.last_frame = fragment.last_frame
+                    stable_id = f"player-{best_index + 1:03d}"
+                    for row in fragment.rows:
+                        resolved[str(row.get("observation_key", ""))] = stable_id
+                    continue
+
+            identities.append(fragment)
+            stable_id = f"player-{len(identities):03d}"
+            for row in fragment.rows:
+                resolved[str(row.get("observation_key", ""))] = stable_id
+        return resolved
+
+    def _fragments(self, rows: list[dict[str, Any]]) -> list[_IdentityFragment]:
+        grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            grouped[int(row["raw_track_id"])].append(row)
+        fragments = []
+        for raw_track_id, fragment_rows in grouped.items():
+            fragment_rows.sort(key=lambda row: (int(row["frame_index"]), str(row.get("observation_key", ""))))
+            embeddings = []
+            for row in fragment_rows:
+                embedding = _normalize_embedding(row.get("reid_embedding"))
+                if embedding is not None:
+                    embeddings.append(np.asarray(embedding, dtype=np.float32))
+            frames = [int(row["frame_index"]) for row in fragment_rows]
+            fragments.append(_IdentityFragment(min(frames), max(frames), raw_track_id, fragment_rows, embeddings))
+        return sorted(fragments, key=lambda fragment: (fragment.first_frame, fragment.raw_track_id))
+
+    def _eligible(self, fragment: _IdentityFragment, identity: _IdentityFragment) -> bool:
+        if fragment.first_frame <= identity.last_frame:
+            return False
+        if fragment.first_frame - identity.last_frame - 1 > self.max_frame_gap:
+            return False
+        return not any(
+            int(row["frame_index"]) == fragment.first_frame for row in identity.rows
+        )
+
+    @staticmethod
+    def _similarity(fragment: _IdentityFragment, identity: _IdentityFragment) -> float:
+        first, second = fragment.prototype, identity.prototype
+        if first is None or second is None or first.shape != second.shape:
+            return -1.0
+        return float(np.dot(first, second))
+
+
 def _copy_observations(observations: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for observation in observations:
@@ -320,8 +411,8 @@ class RunnerV2:
         masks_by_observation: Mapping[str, Any] | None = None,
     ) -> RunnerV2Result:
         rows = _copy_observations(observations)
-        reasons = _resolve_identity(rows, self.seams.identity)
-        structurally_valid = not reasons
+        reasons: list[str] = []
+        structurally_valid = True
         frames = frames_by_index or {}
         downstream: dict[str, Any] = {}
 
@@ -339,6 +430,11 @@ class RunnerV2:
             )
         elif structurally_valid and self.seams.team_embedder is not None and masks_by_observation is not None:
             prepared_crops = _prepare_masked_crops(rows, frames, masks_by_observation)
+
+        if structurally_valid:
+            reasons.extend(_resolve_identity(rows, self.seams.identity or ConservativeStableIdentityResolver()))
+            structurally_valid = not reasons
+
         if structurally_valid and self.seams.team_embedder is not None:
             team_rows = rows
             if masks_by_observation is not None:
