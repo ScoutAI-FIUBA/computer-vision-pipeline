@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import pytest
 
-from scripts.tracking.debug_v2 import render_debug_video, render_frame
+from scripts.tracking.debug_v2 import render_debug_video, render_frame, validate_artifacts
 
 
 def _write_video(path: Path, count: int = 4) -> None:
@@ -19,7 +19,7 @@ def _write_video(path: Path, count: int = 4) -> None:
 
 
 def _write_artifacts(root: Path) -> None:
-    (root / "masks").mkdir(parents=True)
+    (root / "masks").mkdir(parents=True, exist_ok=True)
     mask = np.zeros((24, 32), dtype=np.uint8)
     mask[4:12, 5:13] = 255
     cv2.imwrite(str(root / "masks" / "one.png"), mask)
@@ -146,3 +146,58 @@ def test_manifest_missing_required_artifacts_is_rejected(tmp_path: Path):
 
     with pytest.raises(ValueError, match="missing required artifacts"):
         render_debug_video(video, artifacts / "tracks.jsonl", artifacts, tmp_path / "debug.mp4")
+
+
+def test_manifest_is_required_unless_incomplete_override_is_explicit(tmp_path: Path):
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts)
+    (artifacts / "manifest.json").unlink()
+
+    with pytest.raises(ValueError, match="manifest"):
+        validate_artifacts(artifacts / "tracks.jsonl", artifacts)
+    validate_artifacts(artifacts / "tracks.jsonl", artifacts, allow_incomplete=True)
+
+
+def test_missing_required_files_have_controlled_errors(tmp_path: Path):
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts)
+
+    (artifacts / "tracks.jsonl").unlink()
+    with pytest.raises(ValueError, match="tracks.jsonl"):
+        validate_artifacts(artifacts / "tracks.jsonl", artifacts)
+
+    _write_artifacts(artifacts)
+    for path in (artifacts / "masks").iterdir():
+        path.unlink()
+    (artifacts / "masks").rmdir()
+    with pytest.raises(ValueError, match="directory"):
+        validate_artifacts(artifacts / "tracks.jsonl", artifacts / "masks")
+
+
+def test_malformed_manifest_has_a_controlled_error(tmp_path: Path):
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts)
+    (artifacts / "manifest.json").write_text("[]")
+
+    with pytest.raises(ValueError, match="manifest structure"):
+        validate_artifacts(artifacts / "tracks.jsonl", artifacts)
+
+
+def test_valid_empty_package_renders_empty_frames(tmp_path: Path):
+    video = tmp_path / "input.mp4"
+    artifacts = tmp_path / "artifacts"
+    output = tmp_path / "debug.mp4"
+    _write_video(video, count=2)
+    (artifacts / "masks").mkdir(parents=True)
+    (artifacts / "tracks.jsonl").write_text("")
+    (artifacts / "manifest.json").write_text(json.dumps({
+        "complete": True,
+        "truncated": False,
+        "transfer_errors": [],
+        "artifacts": {"tracks": {"key": "tracks.jsonl"}, "masks": {"key": "masks/", "missing": []}},
+    }))
+
+    validate_artifacts(artifacts / "tracks.jsonl", artifacts)
+    stats = render_debug_video(video, artifacts / "tracks.jsonl", artifacts, output)
+
+    assert stats["frames_written"] == 2

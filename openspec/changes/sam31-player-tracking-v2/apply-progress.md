@@ -31,6 +31,7 @@
 - [x] `sam31-output-envelope`: `_track_video` now passes `output.get("outputs", output)` to `_session_objects`, preserving the outer `frame_index`; empty output mappings normalize to zero objects while non-empty cardinality errors remain explicit; direct output compatibility is covered.
 - [x] 3.1 Added the local-only `scripts/tracking/debug_v2.py` renderer and synthetic artifact/video tests. It reads raw `tracks.jsonl` observations, resolves lossless mask references, renders deterministic raw-track colors, `RAW: <id>` labels, boxes, and masks, preserves empty frames, handles missing masks, and supports inclusive source frame bounds. No Modal, remote execution, ReID, Team ID, or statistics code was added.
 - [x] 3.1 review fixes: the renderer now reads `manifest.json` when present and rejects incomplete/truncated packages, transfer errors, or manifest-listed missing artifacts by default; `--allow-incomplete` is an explicit unsafe override. Synthetic tests use distinct source-frame content and behavioral pixel assertions for masks, labels, and inclusive frame selection.
+- [x] 3.1 final boundary fixes: `manifest.json` is now required by default, with `--allow-incomplete` as the only bypass; missing tracks, masks directories, malformed manifests, and valid empty packages have controlled validation coverage. Tasks 3.2 and 3.3 remain pending.
 
 ## TDD Cycle Evidence
 
@@ -133,7 +134,7 @@
 
 | Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
 |---|---|---|---|---|---|---|---|
-| 3.1 | `tests/test_debug_v2.py` | Unit with synthetic video/artifacts | ✅ 3/3 baseline | ✅ Manifest and behavioral review regressions | ✅ 6 focused tests passed | ✅ Valid/incomplete manifests, missing artifact rejection/override, distinct frame pixels and rendering output | ✅ Centralized manifest validation; no pipeline changes |
+| 3.1 | `tests/test_debug_v2.py` | Unit with synthetic video/artifacts | ✅ 6/6 baseline | ✅ Missing-manifest and malformed-structure regressions | ✅ 10 focused tests passed | ✅ Missing core files, valid empty package, required manifest, explicit override, and rendering behavior | ✅ Centralized validation; no pipeline changes |
 
 ## Task 2.5 TDD Cycle Evidence
 
@@ -151,6 +152,7 @@
 - Task 3.1 relevant command: `.venv/bin/python -m pytest tests/test_debug_v2.py tests/test_results_artifacts.py -q` — `9 passed`.
 - Repository suite after task 3.1: `.venv/bin/python -m pytest -q` — `367 passed, 1 skipped`.
 - Task 3.1 review-fix focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `6 passed`.
+- Task 3.1 final-boundary focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `10 passed`.
 - Task 3.1 remains local-only; no Modal deployment, GPU inference, `game_03` validation, ReID/Team ID/statistics, or `modal_app.py` modification was performed.
 - `sam31-import-smoke` also made no real Modal deployment or model download; the smoke function only imports dependencies and validates builder callability.
 - `sam31-session-compat` made no upstream or vendored package changes; only `modal_app_v2.py` and its focused fake-predictor tests changed.

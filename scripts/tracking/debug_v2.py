@@ -64,11 +64,21 @@ def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete:
 
     manifest_path = tracks_jsonl.parent / "manifest.json"
     if not manifest_path.is_file():
-        return
+        if allow_incomplete:
+            return
+        raise ValueError(f"artifact manifest is missing: {manifest_path}")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"could not read artifact manifest: {manifest_path}") from error
+    if not isinstance(manifest, dict):
+        raise ValueError("invalid artifact manifest structure: expected an object")
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("invalid artifact manifest structure: artifacts must be an object")
+    if not isinstance(artifacts.get("tracks"), dict) or not isinstance(artifacts.get("masks"), dict):
+        raise ValueError("invalid artifact manifest structure: tracks and masks are required")
 
     reasons: list[str] = []
     if manifest.get("complete") is False:
@@ -77,7 +87,9 @@ def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete:
         reasons.append("truncated")
     if manifest.get("transfer_errors"):
         reasons.append("transfer errors")
-    missing = manifest.get("artifacts", {}).get("masks", {}).get("missing", [])
+    missing = artifacts["masks"].get("missing", [])
+    if not isinstance(missing, list):
+        raise ValueError("invalid artifact manifest structure: masks.missing must be a list")
     if missing:
         reasons.append("missing required artifacts")
     if reasons and not allow_incomplete:
