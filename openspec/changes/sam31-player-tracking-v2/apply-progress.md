@@ -305,7 +305,7 @@
 
 | Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
 |---|---|---|---|---|---|---|---|
-| 4.1 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Unit/runtime seam | ✅ 150 focused tests | ✅ Runtime seam and team-field tests failed | ✅ Focused V2 suite passed | ✅ Real frame/mask path, injected seams, stable/team fields, rejection reasons | ✅ Optional seam kwarg preserves existing compatibility |
+| 4.1 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Unit/runtime seam | ✅ 157 focused tests | ✅ Runtime seam and team-field tests failed | ✅ Focused V2 suite passed | ✅ Real frame/mask path, injected seams, stable/team fields, rejection reasons | ✅ Optional seam kwarg preserves existing compatibility |
 | 4.2 | `tests/test_modal_app_v2.py`, `tests/test_runner_v2.py` | Static/unit boundary | ✅ Legacy isolation coverage | ✅ Isolation contract retained | ✅ Full suite passed | ✅ V2-only dependency/source checks and legacy hash check | ✅ No legacy edits |
 | 4.3 | `tests/test_results_artifacts.py`, `tests/test_debug_v2.py` | Unit/artifact rendering | ✅ Existing artifact/renderer coverage | ✅ Artifact reason/label tests failed | ✅ Focused V2 suite passed | ✅ Accepted labels, rejection manifest propagation, missing-mask-safe rendering | ✅ Renderer remains an artifact consumer |
 
@@ -314,6 +314,30 @@
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py tests/test_results_artifacts.py tests/test_debug_v2.py -q` — `157 passed`.
 - Full command: `.venv/bin/python -m pytest -q` — `450 passed, 1 skipped`.
 - `modal_app.py` unchanged; no GPU or `game_03` validation performed.
+
+## Review Follow-up: Cold-Container Lifecycle Coverage
+
+- Boundary: controlled unit coverage for the existing `PipelineV2.load_models()` lifecycle; no production behavior change.
+- Delivery: one local conventional test/docs commit on the active native attempt; no PR, push, or additional acquisition.
+- Scope guard: legacy, R2, statistics, shots, and `game_03` validation remain untouched/out of scope.
+
+### Completed
+
+- [x] Added a fake-only cold-container test covering SAM predictor construction, environment-selected ReID/team backend paths, cache commits, and `RunnerV2Seams` assignment without weights or GPU.
+- [x] Corrected the cumulative Phase 4 safety-net count from 150 to the actual 157 focused tests.
+- [ ] Task 5.3 (`game_03` validation) remains pending.
+
+### TDD Cycle Evidence
+
+| Scope | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| Cold-container lifecycle review | `tests/test_modal_app_v2.py` | Unit with fake runtime seams | ✅ 157/157 | ✅ New lifecycle assertion added before commit | ✅ Focused test passed | ✅ Fake SAM/ReID/team paths, env overrides, cache initialization, seam assignment | ➖ Test/docs-only; existing lifecycle unchanged |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py tests/test_results_artifacts.py tests/test_debug_v2.py -q` — `158 passed` (157-test baseline plus this regression test).
+- Full command: `.venv/bin/python -m pytest -q` — `451 passed, 1 skipped`.
+- No real weights, GPU, legacy, R2, statistics, shots, or `game_03` execution used.
 
 ## Task 3.3 Review Fix Work Unit
 

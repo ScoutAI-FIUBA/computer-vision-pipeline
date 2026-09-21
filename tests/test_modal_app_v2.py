@@ -293,6 +293,68 @@ def test_v2_predictor_initialization_disables_optional_flashattention3(monkeypat
     ]
 
 
+def test_v2_load_models_warms_cold_container_and_assigns_runtime_seams(monkeypatch):
+    import modal_app_v2
+    import pipeline.reid
+    import pipeline.team_embedder
+
+    predictor_calls = []
+    cache_commits = []
+    reid_calls = []
+    team_calls = []
+    fake_predictor = object()
+    fake_reid = object()
+    fake_team = object()
+
+    def fake_sam_builder(**kwargs):
+        predictor_calls.append(kwargs)
+        return fake_predictor
+
+    fake_model_builder = types.ModuleType("sam3.model_builder")
+    fake_model_builder.build_sam3_multiplex_video_predictor = fake_sam_builder
+    fake_sam3 = types.ModuleType("sam3")
+    fake_sam3.model_builder = fake_model_builder
+    monkeypatch.setitem(sys.modules, "sam3", fake_sam3)
+    monkeypatch.setitem(sys.modules, "sam3.model_builder", fake_model_builder)
+    monkeypatch.setattr(
+        modal_app_v2,
+        "model_cache",
+        types.SimpleNamespace(commit=lambda: cache_commits.append(True)),
+    )
+    monkeypatch.setenv("REID_BACKEND", "fake-reid")
+    monkeypatch.setenv("TEAM_EMBEDDER_BACKEND", "fake-team")
+    monkeypatch.setenv("TEAM_EMBEDDER_MODEL_ID", "fake-team-model")
+    monkeypatch.setattr(
+        pipeline.reid,
+        "build_embedder",
+        lambda backend, weights: reid_calls.append((backend, weights)) or fake_reid,
+    )
+    monkeypatch.setattr(
+        pipeline.team_embedder,
+        "build_team_embedder",
+        lambda backend, model_id: team_calls.append((backend, model_id)) or fake_team,
+    )
+
+    pipeline_cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original")
+    )._user_cls
+    load_models = pipeline_cls.load_models.__dict__[
+        next(key for key in pipeline_cls.load_models.__dict__ if key.startswith("_sync_original"))
+    ].raw_f
+
+    pipeline = pipeline_cls()
+    load_models(pipeline)
+
+    assert pipeline.predictor is fake_predictor
+    assert predictor_calls == [{"max_num_objects": 16, "multiplex_count": 16, "use_fa3": False}]
+    assert reid_calls == [("fake-reid", "/cache/reid/osnet_x1_0_msmt17.pt")]
+    assert team_calls == [("fake-team", "fake-team-model")]
+    assert pipeline.seams.identity is not None
+    assert pipeline.seams.reid is fake_reid
+    assert pipeline.seams.team_embedder is fake_team
+    assert len(cache_commits) == 2
+
+
 def test_entrypoint_accepts_nonempty_video_and_validates_public_values():
     from modal_app_v2 import validate_entrypoint_args
 

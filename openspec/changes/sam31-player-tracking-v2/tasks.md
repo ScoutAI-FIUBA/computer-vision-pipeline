@@ -59,3 +59,5 @@ Chain strategy: feature-branch-chain
 ## Status
 
 Phase 1 and Phase 2 through 2.6 plus `sam31-output-envelope` are complete. Tasks 3.1–3.4, including V2 frame/mask runtime wiring, conservative stable identity, and stable-first Team ID, plus tasks 4.1–4.3 and 5.2 focused coverage, are complete. Task 5.3 (`game_03` validation) remains pending; completed commits and no-PR policy are preserved.
+
+Review follow-up: `PipelineV2.load_models()` now has controlled fake-backend cold-container coverage; no production or legacy behavior changed. The focused V2 baseline is 157 tests, and task 5.3 remains pending.
