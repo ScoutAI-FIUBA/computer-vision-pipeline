@@ -226,6 +226,31 @@
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
 
+## Task 3.3 Review Fix Work Unit
+
+- Boundary: correct conservative identity authority and input-integrity findings from review of `df1fde8`; Team ID task 3.4 remains pending.
+- Delivery: one new local conventional fix/test/docs commit on the active native attempt; no PR and no branch reset/acquisition.
+- Scope guard: no synthetic resolver is used when `RunnerV2Seams.identity` is absent; `modal_app.py` and legacy paths remain untouched.
+
+### Completed
+
+- [x] Removed implicit `ConservativeStableIdentityResolver` construction from `RunnerV2`; missing identity authority remains rejected/unvalidated under the existing contract.
+- [x] Added duplicate `observation_key` rejection before identity authority invocation with atomic derived-field scrubbing.
+- [x] Documented exact resolver defaults: `similarity_threshold=0.90`, `max_frame_gap=5`, stable IDs `player-NNN`.
+- [x] Added exact similarity/gap boundary tests and negative-gap configuration validation.
+
+### TDD Cycle Evidence
+
+| Scope | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| Task 3.3 review fixes | `tests/test_runner_v2.py` | Unit | ✅ 44/44 | ✅ No-authority and duplicate-key regressions failed | ✅ 50 focused tests passed | ✅ Exact threshold/gap boundaries and invalid negative gap | ✅ Central duplicate-key preflight; explicit seam authority preserved |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `50 passed`.
+- Relevant command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_sam31_tracking.py tests/test_results_artifacts.py tests/test_reid_backends.py tests/test_team_id.py -q` — `98 passed`.
+- Full command: `.venv/bin/python -m pytest -q` — `439 passed, 1 skipped`.
+
 ## Task 3.3 Work Unit
 
 - Boundary: conservative stable-player identity behind the existing `RunnerV2Seams.identity` seam; task 3.4 Team ID and later runtime/validation work remain deferred.

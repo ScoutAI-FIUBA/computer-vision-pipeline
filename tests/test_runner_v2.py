@@ -102,6 +102,57 @@ def test_rejected_conservative_identity_run_scrubs_derived_fields_atomically():
                                     if key not in {"stable_player_id", "reid_embedding", "reid_evidence", "team_id"}}]
 
 
+def test_runner_without_identity_authority_remains_rejected_without_synthetic_ids():
+    result = RunnerV2().run([row()])
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == ["missing_stable_player_id:60:3"]
+    assert "stable_player_id" not in result.observations[0]
+
+
+def test_duplicate_observation_keys_are_rejected_before_identity_authority_runs():
+    def should_not_run(_rows):
+        raise AssertionError("identity authority must not receive duplicate keys")
+
+    observations = [row(raw_track_id=3), {**row(raw_track_id=4), "observation_key": "60:3"}]
+    result = RunnerV2(RunnerV2Seams(identity=should_not_run)).run(observations)
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == ["duplicate_observation_key:60:3"]
+    assert all("stable_player_id" not in observation for observation in result.observations)
+
+
+def test_conservative_identity_accepts_exact_similarity_threshold_boundary():
+    observations = [
+        identity_row(10, 3, [1.0, 0.0]),
+        identity_row(11, 8, [0.9, np.sqrt(1.0 - 0.9**2)]),
+    ]
+
+    resolved = ConservativeStableIdentityResolver()(observations)
+
+    assert resolved["10:3"] == resolved["11:8"] == "player-001"
+
+
+@pytest.mark.parametrize(
+    ("second_frame", "expected_same_identity"),
+    [(16, True), (17, False)],
+)
+def test_conservative_identity_enforces_exact_default_gap_boundary(second_frame, expected_same_identity):
+    observations = [
+        identity_row(10, 3, [1.0, 0.0]),
+        identity_row(second_frame, 8, [1.0, 0.0]),
+    ]
+
+    resolved = ConservativeStableIdentityResolver()(observations)
+
+    assert (resolved["10:3"] == resolved[f"{second_frame}:8"]) is expected_same_identity
+
+
+def test_conservative_identity_rejects_negative_gap_configuration():
+    with pytest.raises(ValueError, match="max_frame_gap must be non-negative"):
+        ConservativeStableIdentityResolver(max_frame_gap=-1)
+
+
 def test_mask_adapter_returns_masked_roi_and_deterministic_metadata():
     frame = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
     mask = np.zeros((4, 5), dtype=np.uint8)

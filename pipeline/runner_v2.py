@@ -211,6 +211,17 @@ def _copy_observations(observations: Iterable[Mapping[str, Any]]) -> list[dict[s
     return rows
 
 
+def _duplicate_observation_key_reasons(rows: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for row in rows:
+        key = str(row.get("observation_key", ""))
+        if key in seen and key not in duplicates:
+            duplicates.append(key)
+        seen.add(key)
+    return [f"duplicate_observation_key:{key}" for key in duplicates]
+
+
 def _resolve_identity(
     rows: list[dict[str, Any]], resolver: IdentityResolver | None
 ) -> list[str]:
@@ -411,8 +422,8 @@ class RunnerV2:
         masks_by_observation: Mapping[str, Any] | None = None,
     ) -> RunnerV2Result:
         rows = _copy_observations(observations)
-        reasons: list[str] = []
-        structurally_valid = True
+        reasons = _duplicate_observation_key_reasons(rows)
+        structurally_valid = not reasons
         frames = frames_by_index or {}
         downstream: dict[str, Any] = {}
 
@@ -432,7 +443,7 @@ class RunnerV2:
             prepared_crops = _prepare_masked_crops(rows, frames, masks_by_observation)
 
         if structurally_valid:
-            reasons.extend(_resolve_identity(rows, self.seams.identity or ConservativeStableIdentityResolver()))
+            reasons.extend(_resolve_identity(rows, self.seams.identity))
             structurally_valid = not reasons
 
         if structurally_valid and self.seams.team_embedder is not None:
