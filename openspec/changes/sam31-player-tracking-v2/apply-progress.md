@@ -242,7 +242,7 @@ fully out-of-frame ROIs, and deterministic repeated inputs/outputs.
 ### Verification
 
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — 31 passed.
-- Tasks 3.2 and 3.4 remain pending; ReID and Team ID were not wired.
+- Historical checkpoint before task 3.2; subsequent task 3.2 work records the ReID/runtime wiring below. Stable identity and stable-first Team ID remain pending.
 
 ## Current Apply Batch: Task 3.1
 
@@ -321,6 +321,28 @@ deterministic crop metadata. No bbox-only fallback is performed.
 
 - Focused V2 command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py -q` — `90 passed`.
 - Full repository command: `.venv/bin/python -m pytest -q` — `426 passed, 1 skipped`.
+
+### Task 3.2 No-Mask Fail-Closed Remediation
+
+- [x] Public `RunnerV2.run()` now rejects any ReID/Team request when
+  `masks_by_observation` is omitted, before either backend can receive full-frame
+  or bbox evidence.
+- [x] Rejection includes one explicit `missing_masks_by_observation:<key>` reason per
+  observation and preserves the atomic derived-field scrub behavior.
+- [x] Valid mask-aware Team ID preparation remains available; missing/invalid crops
+  are skipped without a Team backend call or fallback evidence.
+
+### No-Mask Remediation TDD Cycle Evidence
+
+| Scope | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| Omitted-mask public API gate | `tests/test_runner_v2.py` | Unit | ✅ 37/37 | ✅ Team/ReID fallback regression failed | ✅ 38 runner tests passed | ✅ Omitted masks plus supplied valid/invalid mask modes | ✅ Central pre-stage gate preserves atomic rejection |
+
+### No-Mask Remediation Verification
+
+- Focused V2 command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py -q` — `91 passed`.
+- Full repository command: `.venv/bin/python -m pytest -q` — `427 passed, 1 skipped`.
+- Pending by design: tasks 3.3, 3.4, 4.1–4.3, 5.2, 5.3, focused validation, and `game_03`.
 
 ## `sam31-gpu80` Work Unit
 

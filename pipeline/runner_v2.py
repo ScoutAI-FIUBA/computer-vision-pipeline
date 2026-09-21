@@ -184,21 +184,35 @@ def _normalize_embedding(embedding: Any) -> list[float] | None:
     return (vector / norm).tolist()
 
 
+def _prepare_masked_crops(
+    rows: list[dict[str, Any]],
+    frames_by_index: Mapping[int, Any],
+    masks_by_observation: Mapping[str, Any],
+) -> dict[str, MaskAppearanceCrop]:
+    adapter = MaskAppearanceAdapter()
+    prepared: dict[str, MaskAppearanceCrop] = {}
+    for row in rows:
+        key = str(row.get("observation_key", ""))
+        frame_index = int(row["frame_index"])
+        if frame_index not in frames_by_index:
+            continue
+        crop = adapter.crop(frames_by_index[frame_index], row["bbox_xyxy"], masks_by_observation.get(key))
+        if crop is not None:
+            prepared[key] = crop
+    return prepared
+
+
 def _run_reid(
     rows: list[dict[str, Any]],
     embedder: Embedder,
     frames_by_index: Mapping[int, Any],
     masks_by_observation: Mapping[str, Any] | None,
 ) -> tuple[int, dict[str, MaskAppearanceCrop]]:
-    adapter = MaskAppearanceAdapter()
-    prepared: dict[str, MaskAppearanceCrop] = {}
+    prepared = _prepare_masked_crops(rows, frames_by_index, masks_by_observation) if masks_by_observation is not None else {}
     count = 0
     for row in rows:
         key = str(row.get("observation_key", ""))
-        frame_index = int(row["frame_index"])
-        crop = None
-        if frame_index in frames_by_index and masks_by_observation is not None:
-            crop = adapter.crop(frames_by_index[frame_index], row["bbox_xyxy"], masks_by_observation.get(key))
+        crop = prepared.get(key)
         if crop is None:
             row["reid_evidence"] = {"status": "invalid", "reason": "invalid_mask"}
             continue
@@ -311,11 +325,20 @@ class RunnerV2:
         frames = frames_by_index or {}
         downstream: dict[str, Any] = {}
 
+        appearance_requested = self.seams.reid is not None or self.seams.team_embedder is not None
+        if structurally_valid and appearance_requested and masks_by_observation is None:
+            reasons.extend(
+                f"missing_masks_by_observation:{row.get('observation_key', '')}" for row in rows
+            )
+            structurally_valid = False
+
         prepared_crops: dict[str, MaskAppearanceCrop] = {}
         if structurally_valid and self.seams.reid is not None:
             downstream["reid_records"], prepared_crops = _run_reid(
                 rows, self.seams.reid, frames, masks_by_observation
             )
+        elif structurally_valid and self.seams.team_embedder is not None and masks_by_observation is not None:
+            prepared_crops = _prepare_masked_crops(rows, frames, masks_by_observation)
         if structurally_valid and self.seams.team_embedder is not None:
             team_rows = rows
             if masks_by_observation is not None:

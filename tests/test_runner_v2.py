@@ -217,7 +217,11 @@ def test_team_embedder_and_team_id_use_production_contracts_then_map_to_stable_i
             team_embedder=FakeTeamEmbedder(),
             team_clusterer=FakeClusterer(),
         )
-    ).run(observations, frames_by_index={60: "frame-60"})
+    ).run(
+        observations,
+        frames_by_index={60: np.ones((24, 12, 3), dtype=np.uint8)},
+        masks_by_observation={key: np.ones((24, 12), dtype=bool) for key in ("60:3", "60:4")},
+    )
 
     assert result.downstream["team_assignments"] == {
         "player-3": 0,
@@ -246,7 +250,17 @@ def test_same_stable_player_with_conflicting_team_assignments_is_rejected():
             team_embedder=FakeTeamEmbedder(),
             team_clusterer=ConflictingClusterer(),
         )
-    ).run(observations, frames_by_index={60: "frame-60", 61: "frame-61"})
+    ).run(
+        observations,
+        frames_by_index={
+            60: np.ones((24, 12, 3), dtype=np.uint8),
+            61: np.ones((24, 12, 3), dtype=np.uint8),
+        },
+        masks_by_observation={
+            "60:3": np.ones((24, 12), dtype=bool),
+            "61:4": np.ones((24, 12), dtype=bool),
+        },
+    )
 
     assert "team_assignments" not in result.downstream
     assert result.acceptance["tracking_identity"] == "rejected"
@@ -275,7 +289,17 @@ def test_same_stable_player_with_consistent_team_assignments_is_retained():
             team_embedder=FakeTeamEmbedder(),
             team_clusterer=ConsistentClusterer(),
         )
-    ).run(observations, frames_by_index={60: "frame-60", 61: "frame-61"})
+    ).run(
+        observations,
+        frames_by_index={
+            60: np.ones((24, 12, 3), dtype=np.uint8),
+            61: np.ones((24, 12, 3), dtype=np.uint8),
+        },
+        masks_by_observation={
+            "60:3": np.ones((24, 12), dtype=bool),
+            "61:4": np.ones((24, 12), dtype=bool),
+        },
+    )
 
     assert result.downstream["team_assignments"] == {"player-7": 1}
     assert result.acceptance["tracking_identity"] == "unvalidated"
@@ -389,6 +413,33 @@ def test_mask_aware_team_mode_never_falls_back_to_full_frame_bbox():
     assert team_calls == []
     assert result.downstream == {}
     assert result.observations[0]["raw_track_id"] == 3
+
+
+def test_omitted_masks_fail_closed_before_reid_or_team_evidence():
+    reid_calls = []
+    team_calls = []
+
+    class FakeEmbedder:
+        def embed(self, frame, boxes):
+            reid_calls.append((frame, boxes))
+            return [[1.0, 0.0] for _ in boxes]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            team_calls.append((frame, samples))
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    result = RunnerV2(
+        RunnerV2Seams(identity=resolve, reid=FakeEmbedder(), team_embedder=FakeTeamEmbedder())
+    ).run([row()], frames_by_index={60: np.ones((4, 5, 3), dtype=np.uint8)})
+
+    assert reid_calls == []
+    assert team_calls == []
+    assert result.downstream == {}
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == ["missing_masks_by_observation:60:3"]
 
 
 def test_reid_embedding_contract_is_normalized_and_one_result_preserves_raw_track_id():
