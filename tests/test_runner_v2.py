@@ -81,6 +81,50 @@ def test_mask_adapter_rejects_invalid_masks_without_bbox_fallback(mask):
     assert MaskAppearanceAdapter().crop(frame, [0, 0, 3, 3], mask) is None
 
 
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_mask_adapter_rejects_non_finite_mask_values(value):
+    frame = np.ones((2, 2, 3), dtype=np.uint8)
+    mask = np.ones((2, 2), dtype=float)
+    mask[0, 0] = value
+
+    assert MaskAppearanceAdapter().crop(frame, [0, 0, 2, 2], mask) is None
+
+
+def test_mask_adapter_rejects_non_empty_mask_outside_roi():
+    frame = np.full((4, 4, 3), 5, dtype=np.uint8)
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[3, 3] = True
+
+    assert MaskAppearanceAdapter().crop(frame, [0, 0, 2, 2], mask) is None
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    [[1, 1, 1, 3], [3, 3, 1, 1], [-5, -5, -1, -1], [5, 5, 8, 8]],
+)
+def test_mask_adapter_rejects_degenerate_inverted_or_out_of_frame_rois(bbox):
+    frame = np.ones((4, 4, 3), dtype=np.uint8)
+    mask = np.ones((4, 4), dtype=bool)
+
+    assert MaskAppearanceAdapter().crop(frame, bbox, mask) is None
+
+
+def test_mask_adapter_is_deterministic_for_identical_inputs():
+    frame = np.arange(5 * 6 * 3, dtype=np.uint8).reshape(5, 6, 3)
+    mask = np.zeros((5, 6), dtype=bool)
+    mask[1:4, 2:5] = True
+    adapter = MaskAppearanceAdapter()
+
+    first = adapter.crop(frame, [1, 0, 6, 5], mask)
+    second = adapter.crop(frame, [1, 0, 6, 5], mask)
+
+    assert first is not None and second is not None
+    assert first.metadata == second.metadata
+    assert first.bbox_xyxy == second.bbox_xyxy
+    assert np.array_equal(first.image, second.image)
+    assert np.array_equal(first.mask, second.mask)
+
+
 def test_empty_input_is_rejected_without_statistics():
     result = RunnerV2(RunnerV2Seams(identity=resolve)).run([])
 

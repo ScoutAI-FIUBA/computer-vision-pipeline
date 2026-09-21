@@ -226,6 +226,24 @@
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
 
+## Review Follow-up: Adapter Edge Cases
+
+This batch added focused regression tests only; no production wiring or task
+checkboxes changed. The adapter now has explicit coverage for non-finite mask
+values, non-empty masks with an empty ROI intersection, degenerate/inverted and
+fully out-of-frame ROIs, and deterministic repeated inputs/outputs.
+
+### TDD Cycle Evidence
+
+| Scope | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| Adapter review edge cases | `tests/test_runner_v2.py` | Unit | ✅ 22/22 | ➖ Existing implementation already satisfied the new regression contracts | ✅ 31/31 | ✅ NaN/±Inf, empty intersection, four invalid ROI forms, and repeated inputs | ➖ Tests-only follow-up |
+
+### Verification
+
+- Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — 31 passed.
+- Tasks 3.2 and 3.4 remain pending; ReID and Team ID were not wired.
+
 ## Current Apply Batch: Task 3.1
 
 - [x] 3.1 Added `MaskAppearanceAdapter` at the Runner V2 boundary.
