@@ -299,6 +299,29 @@ deterministic crop metadata. No bbox-only fallback is performed.
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `36 passed`.
 - Legacy `modal_app.py` was not modified.
 
+### Task 3.2 Review Blocker Remediation
+
+- [x] Team ID now remains mask-authoritative whenever `masks_by_observation` is
+  supplied: observations without a prepared valid crop are excluded before the team
+  backend, with no full-frame/bbox fallback and no empty team assignment output.
+- [x] `modal_app_v2.py` now loads the requested OpenCV frame range from the local
+  temporary video and passes both `frames_by_index` and tracked `masks_by_observation`
+  into `run_v2`; direct artifact packaging remains unchanged.
+- [x] Added strict-TDD coverage for Modal frame/mask wiring and team-only invalid-mask
+  suppression; legacy, R2, statistics, renderer, and game paths remain untouched.
+
+### Review Remediation TDD Cycle Evidence
+
+| Scope | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| Mask-authoritative team gate | `tests/test_runner_v2.py` | Unit | ✅ 36/36 | ✅ Team-only fallback regression failed | ✅ Focused suite passed | ✅ ReID+team invalid masks and team-only missing mask | ✅ Reused prepared crop gate |
+| V2 runtime frame/mask wiring | `tests/test_modal_app_v2.py` | Unit | ✅ 88/88 | ✅ Missing loader/API wiring failed | ✅ Focused suite passed | ✅ Captured frame mapping, mask mapping, and existing artifact/rejection paths | ✅ Small OpenCV range loader; no legacy changes |
+
+### Review Remediation Verification
+
+- Focused V2 command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py -q` — `90 passed`.
+- Full repository command: `.venv/bin/python -m pytest -q` — `426 passed, 1 skipped`.
+
 ## `sam31-gpu80` Work Unit
 
 - Boundary: Move only the V2 Modal `PipelineV2` class from `A100-40GB` to `A100-80GB`; retain the legacy `modal_app.py` `L4` binding and all model, checkpoint, offload, renderer, R2, and game behavior.

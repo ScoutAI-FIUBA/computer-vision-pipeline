@@ -199,6 +199,23 @@ def _video_metadata(path: Path) -> dict[str, Any]:
         capture.release()
 
 
+def _load_video_frames(path: Path, frame_start: int, frame_end: int) -> dict[int, Any]:
+    import cv2
+
+    capture = cv2.VideoCapture(str(path))
+    try:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
+        frames: dict[int, Any] = {}
+        for frame_index in range(frame_start, frame_end + 1):
+            ok, frame = capture.read()
+            if not ok:
+                raise RuntimeError(f"could not read video frame: {frame_index}")
+            frames[frame_index] = frame.copy()
+        return frames
+    finally:
+        capture.release()
+
+
 def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
     ids = output.get("out_obj_ids")
     boxes = output.get("out_boxes_xywh")
@@ -341,7 +358,12 @@ class PipelineV2:
                 self._ensure_predictor(), video_path, prompt, frame_start, frame_end
             )
             _add_mask_references(rows, masks)
-            result = run_v2(rows)
+            frames = _load_video_frames(video_path, frame_start, frame_end)
+            result = run_v2(
+                rows,
+                frames_by_index=frames,
+                masks_by_observation=masks,
+            )
             package_artifacts(
                 output_dir,
                 result.observations,

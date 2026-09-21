@@ -799,10 +799,11 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
             }
 
     monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {"fps": 30.0})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
     monkeypatch.setattr(
         modal_app_v2,
         "run_v2",
-        lambda rows: RunnerV2(RunnerV2Seams(identity=lambda items: {item["observation_key"]: "player-3" for item in items})).run(rows),
+        lambda rows, **kwargs: RunnerV2(RunnerV2Seams(identity=lambda items: {item["observation_key"]: "player-3" for item in items})).run(rows, **kwargs),
     )
     cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
     process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
@@ -843,16 +844,57 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     assert np.array_equal(decoded_mask, mask)
 
 
+def test_process_passes_tracked_frames_and_masks_to_v2_runner(monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result
+
+    captured = {}
+    frame = np.full((4, 5, 3), 7, dtype=np.uint8)
+    mask = np.ones((4, 5), dtype=np.uint8)
+
+    class FakePredictor:
+        class Model:
+            def init_state(self, **_kwargs):
+                return None
+
+        model = Model()
+
+        def handle_request(self, request):
+            return {"session_id": "fake-session"} if request["type"] == "start_session" else None
+
+        def handle_stream_request(self, _request):
+            yield {
+                "frame_index": 60,
+                "out_obj_ids": [3],
+                "out_boxes_xywh": [[1, 0, 4, 4]],
+                "out_binary_masks": [mask],
+            }
+
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {60: frame})
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda rows, **kwargs: captured.update(kwargs) or RunnerV2Result(rows))
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: FakePredictor())
+
+    process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60)
+
+    assert captured["frames_by_index"] == {60: frame}
+    assert np.array_equal(captured["masks_by_observation"]["60:3"], mask)
+
+
 def test_process_rejects_missing_identity_and_defers_statistics(monkeypatch):
     import modal_app_v2
     from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
 
     cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
     monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
     monkeypatch.setattr(
         modal_app_v2,
         "run_v2",
-        lambda rows: RunnerV2(RunnerV2Seams(identity=lambda _items: {})).run(rows),
+        lambda rows, **kwargs: RunnerV2(RunnerV2Seams(identity=lambda _items: {})).run(rows, **kwargs),
     )
     monkeypatch.setattr(
         cls,
@@ -888,6 +930,7 @@ def test_process_size_limit_fails_before_returning_partial_artifacts(monkeypatch
 
     monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args: ([], {}))
     monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
     cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
     process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
     monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())

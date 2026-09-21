@@ -320,19 +320,18 @@ class RunnerV2:
             team_rows = rows
             if masks_by_observation is not None:
                 team_rows = [row for row in rows if str(row.get("observation_key", "")) in prepared_crops]
-            if not team_rows:
-                team_rows = []
-            team_assignments, team_reasons = _run_team_id(
-                team_rows,
-                self.seams.team_embedder,
-                self.seams.team_clusterer or KMeansTeamClusterer(),
-                self.seams.team_count,
-                frames,
-                prepared_crops if masks_by_observation is not None else None,
-            )
-            reasons.extend(team_reasons)
-            if not team_reasons:
-                downstream["team_assignments"] = team_assignments
+            if team_rows:
+                team_assignments, team_reasons = _run_team_id(
+                    team_rows,
+                    self.seams.team_embedder,
+                    self.seams.team_clusterer or KMeansTeamClusterer(),
+                    self.seams.team_count,
+                    frames,
+                    prepared_crops if masks_by_observation is not None else None,
+                )
+                reasons.extend(team_reasons)
+                if not team_reasons:
+                    downstream["team_assignments"] = team_assignments
 
         structurally_valid = not reasons
         if not structurally_valid:

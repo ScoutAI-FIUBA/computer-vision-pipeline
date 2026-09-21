@@ -370,6 +370,27 @@ def test_invalid_masks_skip_reid_and_team_evidence(mask):
     assert "team_id" not in result.observations[0]
 
 
+def test_mask_aware_team_mode_never_falls_back_to_full_frame_bbox():
+    team_calls = []
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            team_calls.append((frame, samples))
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    result = RunnerV2(RunnerV2Seams(identity=resolve, team_embedder=FakeTeamEmbedder())).run(
+        [row()],
+        frames_by_index={60: np.full((4, 5, 3), 7, dtype=np.uint8)},
+        masks_by_observation={"60:3": None},
+    )
+
+    assert team_calls == []
+    assert result.downstream == {}
+    assert result.observations[0]["raw_track_id"] == 3
+
+
 def test_reid_embedding_contract_is_normalized_and_one_result_preserves_raw_track_id():
     class FakeEmbedder:
         def embed(self, frame, boxes):
