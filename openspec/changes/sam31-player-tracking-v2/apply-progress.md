@@ -29,6 +29,7 @@
 - [x] `sam31-session-compat` test strengthening: added focused `_track_video` lifecycle/session-ID assertions and unchanged genuine start-session exception propagation coverage; production code unchanged.
 - [x] `sam31-session-compat-fix`: temporarily wraps model `init_state` methods whenever SAM3 `handle_request` rebuilds any unsupported keyword, filters every rebuilt keyword against the original bound signature, restores the bound original method on success/failure, and preserves the original resource path/session ID.
 - [x] `sam31-output-envelope`: `_track_video` now passes `output.get("outputs", output)` to `_session_objects`, preserving the outer `frame_index`; empty output mappings normalize to zero objects while non-empty cardinality errors remain explicit; direct output compatibility is covered.
+- [x] 3.1 Added the local-only `scripts/tracking/debug_v2.py` renderer and synthetic artifact/video tests. It reads raw `tracks.jsonl` observations, resolves lossless mask references, renders deterministic raw-track colors, `RAW: <id>` labels, boxes, and masks, preserves empty frames, handles missing masks, and supports inclusive source frame bounds. No Modal, remote execution, ReID, Team ID, or statistics code was added.
 
 ## TDD Cycle Evidence
 
@@ -123,7 +124,15 @@
 - [x] `sam31-session-compat` added signature-compatible session registration coverage for both official-model signature variants.
 - [x] `sam31-session-compat-fix` corrected compatibility for SAM3 base `handle_request` request rebuilding, generalized per-keyword filtering, and added intermediate-signature coverage.
 - [x] `sam31-output-envelope` corrected official nested propagation output handling and empty-frame normalization without changing SAM3.1 upstream code.
-- [ ] 3.1–3.3 Local renderer, validation, and final rollback/full-suite verification.
+- [x] 3.1 Local renderer and focused synthetic artifact/video coverage.
+- [ ] 3.2 Validate `game_03`, approved prompts, and frames 60–130 with complete returned artifacts and identity-first acceptance.
+- [ ] 3.3 Record ordered conventional commits, verify unchanged `modal_app.py` rollback, and run `.venv/bin/python -m pytest`; create no PRs.
+
+## Phase 3 Task 3.1 TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 3.1 | `tests/test_debug_v2.py` | Unit with synthetic video/artifacts | N/A (new files) | ✅ Missing renderer module | ✅ 3 focused tests passed | ✅ Mask/box/label, missing mask/frame preservation, inclusive bounds | ✅ Pure grouping/color/path helpers; local writer cleanup |
 
 ## Task 2.5 TDD Cycle Evidence
 
@@ -136,7 +145,11 @@
 
 - Task 2.5 baseline command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `40 passed` (26 Modal, 14 runner).
 - Task 2.5 final command: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py` — `41 passed` (27 Modal, 14 runner).
-- No real Modal deployment, GPU inference, `game_03` validation, renderer, Phase 3 work, or `modal_app.py` modification was performed.
+- No real Modal deployment, GPU inference, or `game_03` validation was performed; `modal_app.py` remains unchanged.
+- Task 3.1 focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `3 passed`.
+- Task 3.1 relevant command: `.venv/bin/python -m pytest tests/test_debug_v2.py tests/test_results_artifacts.py -q` — `9 passed`.
+- Repository suite after task 3.1: `.venv/bin/python -m pytest -q` — `367 passed, 1 skipped`.
+- Task 3.1 remains local-only; no Modal deployment, GPU inference, `game_03` validation, ReID/Team ID/statistics, or `modal_app.py` modification was performed.
 - `sam31-import-smoke` also made no real Modal deployment or model download; the smoke function only imports dependencies and validates builder callability.
 - `sam31-session-compat` made no upstream or vendored package changes; only `modal_app_v2.py` and its focused fake-predictor tests changed.
 - `sam31-session-compat` test strengthening changed tests and cumulative progress only; the production helper required no modification.
