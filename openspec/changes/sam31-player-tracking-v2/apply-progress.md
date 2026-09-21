@@ -142,7 +142,7 @@
 
 | Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
 |---|---|---|---|---|---|---|---|
-| `renderer-normalized-bboxes` | `tests/test_debug_v2.py` | Unit with synthetic frame/artifacts | ✅ 26/26 | ✅ Extreme-coordinate and missing-mask regressions written; 1e308 cases failed before guard | ✅ Focused renderer suite passed | ✅ All four corners, full `RAW: 7`/`RAW: 8` labels, mask overlay, pixel boxes, inf/NaN, and 1e308 | ✅ Finite/OpenCV-limit guards reuse existing skip-observation behavior |
+| `renderer-normalized-bboxes` | `tests/test_debug_v2.py` | Unit with synthetic frame/artifacts | ✅ 30/30 | ✅ Huge-integer and boundary-compatibility regressions written; huge ints failed before overflow catch | ✅ Focused renderer suite passed | ✅ Exact 0/1 normalized boundaries, mixed pixel-style boxes, all four corners, full labels, masks, inf/NaN, 1e308, and huge ints | ✅ Overflow handling extends existing skip-observation behavior |
 
 ## Task 2.5 TDD Cycle Evidence
 
@@ -167,6 +167,8 @@
 - `renderer-normalized-bboxes` label assertion: deterministic OpenCV-rendered ROI comparison now covers the full `RAW: 7` label including its digit/ID, alongside all four normalized bbox corners.
 - `renderer-normalized-bboxes` extreme/missing-mask focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `30 passed`.
 - `renderer-normalized-bboxes` missing-mask assertion: absent mask files still produce the complete `RAW: 8` label and bbox in a deterministic reference ROI.
+- `renderer-normalized-bboxes` integer/boundary focused command: `.venv/bin/python -m pytest tests/test_debug_v2.py -q` — `36 passed`.
+- `renderer-normalized-bboxes` compatibility coverage: exact normalized 0/1 boundaries and mixed pixel-style coordinates render deterministically; huge integer coordinates are skipped safely.
 - Task 3.1 remains local-only; no Modal deployment, GPU inference, `game_03` validation, ReID/Team ID/statistics, or `modal_app.py` modification was performed.
 - `sam31-import-smoke` also made no real Modal deployment or model download; the smoke function only imports dependencies and validates builder callability.
 - `sam31-session-compat` made no upstream or vendored package changes; only `modal_app_v2.py` and its focused fake-predictor tests changed.

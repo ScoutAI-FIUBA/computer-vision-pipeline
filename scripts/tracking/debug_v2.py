@@ -132,7 +132,7 @@ def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: P
         try:
             raw_id = int(row["raw_track_id"])
             box = _bbox_xyxy_in_pixels(row["bbox_xyxy"], rendered.shape[:2])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
 
         color = color_for_track(raw_id)

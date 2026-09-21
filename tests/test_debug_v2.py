@@ -121,6 +121,47 @@ def test_render_frame_skips_extreme_finite_bbox_coordinates(tmp_path: Path, inde
     assert np.array_equal(rendered, frame)
 
 
+@pytest.mark.parametrize("index", range(4))
+def test_render_frame_skips_huge_integer_bbox_coordinates(tmp_path: Path, index: int):
+    frame = np.zeros((24, 32, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    bbox = [0, 0, 10, 10]
+    bbox[index] = 10**1000
+
+    rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": bbox}], root)
+
+    assert np.array_equal(rendered, frame)
+
+
+def test_render_frame_treats_exact_normalized_boundaries_as_normalized(tmp_path: Path):
+    frame = np.zeros((40, 60, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    color = debug_v2.color_for_track(7)
+
+    rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": [0, 0, 1, 1]}], root)
+
+    expected = frame.copy()
+    cv2.rectangle(expected, (0, 0), (60, 40), color, 1)
+    cv2.putText(expected, "RAW: 7", (0, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    assert np.array_equal(rendered, expected)
+
+
+def test_render_frame_treats_mixed_coordinates_as_pixel_style(tmp_path: Path):
+    frame = np.zeros((40, 60, 3), dtype=np.uint8)
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    color = debug_v2.color_for_track(7)
+
+    rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": [5, 6, 20, 18]}], root)
+
+    expected = frame.copy()
+    cv2.rectangle(expected, (5, 6), (20, 18), color, 1)
+    cv2.putText(expected, "RAW: 7", (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    assert np.array_equal(rendered, expected)
+
+
 def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):
     video = tmp_path / "input.mp4"
     artifacts = tmp_path / "artifacts"
