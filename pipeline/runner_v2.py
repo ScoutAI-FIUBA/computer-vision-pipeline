@@ -344,10 +344,21 @@ def _run_team_id(
 ) -> tuple[dict[str, int], list[str]]:
     observations: list[TeamObservation] = []
     next_detection_id = 1
+    stable_ids = sorted(
+        {
+            str(row["stable_player_id"])
+            for row in rows
+            if isinstance(row.get("stable_player_id"), str) and row["stable_player_id"].strip()
+        }
+    )
+    stable_to_track = {stable_id: index for index, stable_id in enumerate(stable_ids, start=1)}
     for frame_index, frame_rows in _group_by_frame(rows).items():
         if frame_index not in frames_by_index:
             raise ValueError(f"missing frame for team embedding: {frame_index}")
         for row in frame_rows:
+            stable_id = row.get("stable_player_id")
+            if not isinstance(stable_id, str) or not stable_id.strip():
+                continue
             crop = None if crops_by_observation is None else crops_by_observation.get(str(row["observation_key"]))
             frame = frames_by_index[frame_index] if crop is None else crop.image
             box = tuple(float(value) for value in row["bbox_xyxy"]) if crop is None else (
@@ -358,7 +369,8 @@ def _run_team_id(
             )
             sample = TeamEmbeddingSample(
                 detection_id=next_detection_id,
-                track_id=row["raw_track_id"],
+                # team_id aggregates by stable identity; raw_track_id remains row provenance.
+                track_id=stable_to_track[stable_id],
                 xyxy=box,
                 player_mask=None if crop is None else crop.mask,
             )
@@ -383,22 +395,19 @@ def _run_team_id(
         backend=team_embedder.name,
         minimum_samples=1,
     )
-    raw_to_stable = {row["raw_track_id"]: row["stable_player_id"] for row in rows}
-    team_ids_by_stable: dict[str, set[int]] = defaultdict(set)
-    for assignment in result.assignments:
-        if assignment.track_id is None or assignment.team_id is None:
-            continue
-        team_ids_by_stable[raw_to_stable[assignment.track_id]].add(int(assignment.team_id))
+    conflicts = []
+    for stable_id in stable_ids:
+        diagnostics = result.track_diagnostics.get(stable_to_track[stable_id], {})
+        if len(diagnostics.get("cluster_votes", {})) > 1:
+            conflicts.append(f"conflicting_team_assignment:stable_player_id={stable_id}")
 
-    conflicts = [
-        f"conflicting_team_assignment:stable_player_id={stable_id}"
-        for stable_id, team_ids in sorted(team_ids_by_stable.items())
-        if len(team_ids) > 1
-    ]
     assignments = {
-        stable_id: next(iter(team_ids))
-        for stable_id, team_ids in team_ids_by_stable.items()
-        if len(team_ids) == 1
+        stable_id: int(assignment.team_id)
+        for assignment in result.assignments
+        if assignment.track_id in stable_to_track.values()
+        and assignment.team_id is not None
+        for stable_id, track_id in stable_to_track.items()
+        if track_id == assignment.track_id
     }
     return assignments, conflicts
 
@@ -449,7 +458,13 @@ class RunnerV2:
         if structurally_valid and self.seams.team_embedder is not None:
             team_rows = rows
             if masks_by_observation is not None:
-                team_rows = [row for row in rows if str(row.get("observation_key", "")) in prepared_crops]
+                team_rows = [
+                    row
+                    for row in rows
+                    if str(row.get("observation_key", "")) in prepared_crops
+                    and isinstance(row.get("stable_player_id"), str)
+                    and row["stable_player_id"].strip()
+                ]
             if team_rows:
                 team_assignments, team_reasons = _run_team_id(
                     team_rows,

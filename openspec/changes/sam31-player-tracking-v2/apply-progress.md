@@ -226,9 +226,44 @@
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
 
+## Task 3.4 Work Unit
+
+- Boundary: stable-first Team ID only; valid mask-authoritative crops flow through
+  the existing `TeamEmbedder` and `identify_teams` contracts, with stable-player
+  aggregation and atomic conflict rejection. Statistics, shots, game validation,
+  renderer, and legacy paths remain untouched.
+- Delivery: one local conventional commit on the active native attempt; no reset,
+  additional acquisition, PR, or push.
+- Rollback: revert this task 3.4 commit; task 3.3 identity and mask-authoritative
+  Team ID inputs remain available.
+
+### Completed
+
+- [x] 3.4 Runs Team ID only after stable identity resolution and valid mask crops;
+  `TeamEmbeddingSample.player_mask` remains populated from the authoritative crop.
+- [x] 3.4 Uses deterministic stable identity tokens for `team_id` aggregation while
+  preserving raw track IDs in observation rows and rejecting missing stable identity.
+- [x] 3.4 Detects any multiple cluster labels for one stable player and rejects the
+  whole derived transaction without silently retaining a label.
+- [x] 3.4 Added strict-TDD coverage for ordering, fragment grouping, consistent and
+  conflicting labels, missing stable identity/masks, atomic scrubbing, and legacy
+  entrypoint isolation.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 3.4 | `tests/test_runner_v2.py` | Unit | ✅ 50/50 | ✅ Stable aggregation and majority-conflict tests failed before implementation | ✅ 54 focused tests passed | ✅ Ordering, same-stable fragments, consistent/conflicting labels, missing identity/masks, atomic rejection, legacy isolation | ✅ Stable-token aggregation and diagnostic conflict check kept inside V2 runner |
+
+### Verification
+
+- Focused Team ID command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `54 passed`.
+- Relevant V2/isolation command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_team_id.py tests/test_modal_app_v2.py -q` — `132 passed`.
+- `git diff --check` passed.
+
 ## Task 3.3 Review Fix Work Unit
 
-- Boundary: correct conservative identity authority and input-integrity findings from review of `df1fde8`; Team ID task 3.4 remains pending.
+- Boundary: correct conservative identity authority and input-integrity findings from review of `df1fde8`; Team ID task 3.4 followed in the dedicated work unit below.
 - Delivery: one new local conventional fix/test/docs commit on the active native attempt; no PR and no branch reset/acquisition.
 - Scope guard: no synthetic resolver is used when `RunnerV2Seams.identity` is absent; `modal_app.py` and legacy paths remain untouched.
 
@@ -253,7 +288,7 @@
 
 ## Task 3.3 Work Unit
 
-- Boundary: conservative stable-player identity behind the existing `RunnerV2Seams.identity` seam; task 3.4 Team ID and later runtime/validation work remain deferred.
+- Boundary: conservative stable-player identity behind the existing `RunnerV2Seams.identity` seam; later runtime and validation work remain deferred.
 - Delivery: one local conventional commit on the active native attempt; no PR and no branch reset/acquisition.
 - Scope guard: `raw_track_id` remains unchanged; `modal_app.py`, Team ID, statistics, and legacy paths remain untouched.
 
@@ -273,7 +308,7 @@
 ### Verification
 
 - Focused command: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `44 passed`.
-- Legacy `modal_app.py` was not modified; task 3.4 and later tasks remain pending.
+- Legacy `modal_app.py` was not modified; later runtime and validation tasks remain pending.
 
 ## Review Follow-up: Adapter Edge Cases
 
@@ -317,13 +352,13 @@ deterministic crop metadata. No bbox-only fallback is performed.
 
 - [x] 3.2 Reuse ReID with masked frames and ROI boxes.
 - [ ] 3.3 Add conservative stable identity resolution.
-- [ ] 3.4 Run stable-first team identification and conflict handling.
+- [x] 3.4 Run stable-first team identification and conflict handling.
 
 ## Task 3.2 Work Unit
 
 - Boundary: V2 runner ReID adapter only; reuse `Embedder.embed(frame, boxes)` with
   `MaskAppearanceAdapter` crops and local ROI boxes. Legacy `modal_app.py` remains
-  untouched; stable identity and full team clustering remain deferred to tasks 3.3–3.4.
+  untouched; stable identity and full team clustering were completed in later work units.
 - Delivery: One local conventional commit on the active native attempt; no PR and no
   branch reset/acquisition.
 - Rollback: Revert the task 3.2 commit; task 3.1 mask adapter and legacy runner remain
@@ -391,7 +426,7 @@ deterministic crop metadata. No bbox-only fallback is performed.
 
 - Focused V2 command: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py -q` — `91 passed`.
 - Full repository command: `.venv/bin/python -m pytest -q` — `427 passed, 1 skipped`.
-- Pending by design: tasks 3.3, 3.4, 4.1–4.3, 5.2, 5.3, focused validation, and `game_03`.
+- Pending by design: tasks 4.1–4.3, 5.2, 5.3, focused validation, and `game_03`.
 
 ## `sam31-gpu80` Work Unit
 

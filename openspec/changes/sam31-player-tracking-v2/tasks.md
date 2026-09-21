@@ -41,7 +41,7 @@ Chain strategy: feature-branch-chain
 - [x] 3.1 **RED/GREEN:** Add `MaskAppearanceAdapter` in `pipeline/runner_v2.py`: require full-frame non-empty matching masks, use bbox only as ROI, zero outside-mask pixels, and never fall back.
 - [x] 3.2 Reuse `pipeline/reid.py::Embedder.embed(frame, boxes)` with masked frames/ROI boxes; V2 passes tracked frames/masks at runtime, and invalid masks yield no ReID or team evidence.
 - [x] 3.3 Add conservative `RunnerV2Seams.identity`: merge only at/above `similarity_threshold=0.90` and within `max_frame_gap=5`; preserve `raw_track_id`, reject duplicate observation keys, and fragment ambiguity when authority is absent or evidence is weak.
-- [ ] 3.4 Run stable-first through `pipeline/team_embedder.py`/`pipeline/team_id.py`, pass `player_mask`, aggregate by stable ID, and atomically reject conflicts.
+- [x] 3.4 Run stable-first through `pipeline/team_embedder.py`/`pipeline/team_id.py`, pass `player_mask`, aggregate by stable ID, and atomically reject conflicts.
 
 ## Phase 4: V2 Runtime and Debug Integration
 

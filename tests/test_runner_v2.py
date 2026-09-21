@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+import subprocess
+
 import pytest
 import numpy as np
 
@@ -434,6 +437,140 @@ def test_same_stable_player_with_consistent_team_assignments_is_retained():
 
     assert result.downstream["team_assignments"] == {"player-7": 1}
     assert result.acceptance["tracking_identity"] == "unvalidated"
+
+
+def test_team_id_runs_after_identity_and_groups_fragments_by_stable_player():
+    calls = []
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            calls.append([(sample.track_id, sample.player_mask.shape) for sample in samples])
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class RecordingClusterer:
+        name = "recording-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0, 0, 1]
+
+    observations = [
+        row(frame_index=60, raw_track_id=3),
+        row(frame_index=61, raw_track_id=4),
+        row(frame_index=62, raw_track_id=5),
+    ]
+    events = []
+
+    def identity(rows):
+        events.append("identity")
+        return {
+            "60:3": "player-7",
+            "61:4": "player-7",
+            "62:5": "player-8",
+        }
+
+    class OrderedTeamEmbedder(FakeTeamEmbedder):
+        def embed(self, frame, samples):
+            events.append("team")
+            return super().embed(frame, samples)
+
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=identity,
+            team_embedder=OrderedTeamEmbedder(),
+            team_clusterer=RecordingClusterer(),
+        )
+    ).run(
+        observations,
+        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in (60, 61, 62)},
+        masks_by_observation={
+            item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations
+        },
+    )
+
+    assert events[0] == "identity"
+    assert events[1:] == ["team", "team", "team"]
+    assert calls == [[(1, (20, 10))], [(1, (20, 10))], [(2, (20, 10))]]
+    assert result.downstream["team_assignments"] == {"player-7": 0, "player-8": 1}
+
+
+def test_team_id_rejects_conflicting_labels_after_stable_aggregation_even_with_raw_majority():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class ConflictingClusterer:
+        name = "conflicting-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            # The first raw fragment has a local tie; stable aggregation must
+            # still reject the stable player instead of keeping the other raw fragment's label.
+            return [0, 1, 0]
+
+    observations = [
+        row(frame_index=60, raw_track_id=3),
+        row(frame_index=61, raw_track_id=3),
+        row(frame_index=62, raw_track_id=4),
+    ]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=ConflictingClusterer(),
+        )
+    ).run(
+        observations,
+        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in (60, 61, 62)},
+        masks_by_observation={
+            item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations
+        },
+    )
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.downstream == {}
+    assert result.acceptance_reasons == [
+        "conflicting_team_assignment:stable_player_id=player-7"
+    ]
+    assert all(
+        not {"stable_player_id", "team_id"}.intersection(observation)
+        for observation in result.observations
+    )
+
+
+def test_team_id_leaves_fragments_without_stable_identity_unassigned():
+    team_calls = []
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            team_calls.append(samples)
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {"60:3": "player-7"},
+            team_embedder=FakeTeamEmbedder(),
+        )
+    ).run(
+        [row(frame_index=60, raw_track_id=3), row(frame_index=61, raw_track_id=4)],
+        frames_by_index={60: np.ones((24, 12, 3), dtype=np.uint8), 61: np.ones((24, 12, 3), dtype=np.uint8)},
+        masks_by_observation={"60:3": np.ones((24, 12), dtype=bool), "61:4": np.ones((24, 12), dtype=bool)},
+    )
+
+    assert team_calls == []
+    assert result.downstream == {}
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == ["missing_stable_player_id:61:4"]
+
+
+def test_v2_team_changes_do_not_modify_legacy_entrypoint():
+    assert Path("modal_app.py").read_text() == subprocess.check_output(
+        ["git", "show", "HEAD:modal_app.py"], text=True
+    )
 
 
 def test_conflicting_team_validation_discards_reid_output_atomically():
