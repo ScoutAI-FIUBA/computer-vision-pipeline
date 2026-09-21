@@ -44,8 +44,8 @@ Chain strategy: feature-branch-chain
 
 - [x] 3.1 Implement local retrieval/writing in `scripts/tracking/debug_v2.py`; read returned raw tracks, lossless masks, manifest, config, and benchmark metadata beside the original video to render debug output locally.
 - [ ] 3.2 Validate `game_03`, approved prompts, and frames 60–130 with complete returned artifacts and identity-first acceptance.
-- [ ] 3.3 Record ordered conventional commits, verify unchanged `modal_app.py` rollback, and run `.venv/bin/python -m pytest`; create no PRs.
+- [x] 3.3 Record ordered conventional commits, verify unchanged `modal_app.py` rollback, and run `.venv/bin/python -m pytest`; create no PRs.
 
 ## Status
 
-Phase 1 and Phase 2 work through task 2.6 plus `sam31-output-envelope` are complete; Phase 3 remains pending.
+Phase 1 and Phase 2 work through task 2.6 plus `sam31-output-envelope` are complete; Phase 3 task 3.2 remains pending.

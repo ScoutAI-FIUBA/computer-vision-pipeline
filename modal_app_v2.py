@@ -319,7 +319,7 @@ class PipelineV2:
         self,
         *,
         video_bytes: bytes,
-        prompt: str = "basketball player",
+        prompt: str = "basketball player on the court",
         frame_start: int = 60,
         frame_end: int = 130,
         return_artifacts: bool = False,
@@ -364,7 +364,7 @@ class PipelineV2:
 def main(
     video_path: str = "",
     output_dir: str = "",
-    prompt: str = "basketball player",
+    prompt: str = "basketball player on the court",
     frame_start: int = 60,
     frame_end: int = 130,
     max_artifact_bytes: int = 0,

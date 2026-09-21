@@ -143,7 +143,7 @@ def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: P
             rendered = cv2.addWeighted(overlay, 0.35, rendered, 0.65, 0)
 
         x1, y1, x2, y2 = box
-        cv2.rectangle(rendered, (x1, y1), (x2, y2), color, 1)
+        cv2.rectangle(rendered, (x1, y1), (x2, y2), color, 3)
         cv2.putText(
             rendered,
             f"RAW: {raw_id}",
@@ -151,7 +151,7 @@ def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: P
             cv2.FONT_HERSHEY_SIMPLEX,
             0.4,
             color,
-            1,
+            2,
             cv2.LINE_AA,
         )
     return rendered

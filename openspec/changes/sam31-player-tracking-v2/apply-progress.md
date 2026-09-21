@@ -31,7 +31,7 @@
 - [x] `sam31-output-envelope`: `_track_video` now passes `output.get("outputs", output)` to `_session_objects`, preserving the outer `frame_index`; empty output mappings normalize to zero objects while non-empty cardinality errors remain explicit; direct output compatibility is covered.
 - [x] 3.1 Added the local-only `scripts/tracking/debug_v2.py` renderer and synthetic artifact/video tests. It reads raw `tracks.jsonl` observations, resolves lossless mask references, renders deterministic raw-track colors, `RAW: <id>` labels, boxes, and masks, preserves empty frames, handles missing masks, and supports inclusive source frame bounds. No Modal, remote execution, ReID, Team ID, or statistics code was added.
 - [x] 3.1 review fixes: the renderer now reads `manifest.json` when present and rejects incomplete/truncated packages, transfer errors, or manifest-listed missing artifacts by default; `--allow-incomplete` is an explicit unsafe override. Synthetic tests use distinct source-frame content and behavioral pixel assertions for masks, labels, and inclusive frame selection.
-- [x] 3.1 final boundary fixes: `manifest.json` is now required by default, with `--allow-incomplete` as the only bypass; missing tracks, masks directories, malformed manifests, and valid empty packages have controlled validation coverage. Tasks 3.2 and 3.3 remain pending.
+- [x] 3.1 final boundary fixes: `manifest.json` is now required by default, with `--allow-incomplete` as the only bypass; missing tracks, masks directories, malformed manifests, and valid empty packages have controlled validation coverage. Task 3.2 remains pending.
 - [x] 3.1 final review fixes: manifest `complete`/`truncated` fields now require real booleans; nested artifact keys, transfer errors, and missing lists require controlled types; CLI coverage proves `--allow-incomplete` reaches the render flow.
 - [x] `renderer-normalized-bboxes`: normalized `bbox_xyxy` values whose four coordinates are all in `[0, 1]` are scaled by the current frame width/height before drawing; any coordinate outside that range retains pixel-coordinate behavior. Mask overlays and raw labels remain rendered.
 
@@ -130,7 +130,7 @@
 - [x] `sam31-output-envelope` corrected official nested propagation output handling and empty-frame normalization without changing SAM3.1 upstream code.
 - [x] 3.1 Local renderer and focused synthetic artifact/video coverage.
 - [ ] 3.2 Validate `game_03`, approved prompts, and frames 60–130 with complete returned artifacts and identity-first acceptance.
-- [ ] 3.3 Record ordered conventional commits, verify unchanged `modal_app.py` rollback, and run `.venv/bin/python -m pytest`; create no PRs.
+- [x] 3.3 Record ordered conventional commits, verify unchanged `modal_app.py` rollback, and run `.venv/bin/python -m pytest`; create no PRs.
 
 ## Phase 3 Task 3.1 TDD Cycle Evidence
 
@@ -177,6 +177,31 @@
 - `sam31-session-compat` test strengthening changed tests and cumulative progress only; the production helper required no modification.
 - `sam31-session-compat-fix` changed only `modal_app_v2.py`, its focused fake-predictor tests, and this progress record; no upstream/legacy/R2/renderer/game files were touched.
 - `sam31-output-envelope` changed only `modal_app_v2.py`, `tests/test_modal_app_v2.py`, this progress record, and the task checkbox; no upstream/legacy/R2/renderer/game files were touched.
+
+## `prompt-render-style` Work Unit
+
+- Boundary: V2 default prompt and local debug renderer styling only; no pipeline or Modal behavior changes.
+- Delivery: One local conventional commit on the active native branch; no branch acquisition/reset and no PR.
+- Scope guard: `modal_app.py` remains unchanged; deterministic renderer labels/colors and coordinate handling remain unchanged.
+
+### Completed
+
+- [x] Changed both V2 prompt defaults to `basketball player on the court` and updated the process manifest expectation.
+- [x] Increased local bbox stroke thickness from 1 to 3 and label stroke thickness from 1 to 2.
+- [x] Updated focused deterministic renderer references and added a source-level default-prompt regression test.
+- [x] Verified unchanged legacy `modal_app.py` rollback boundary.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `prompt-render-style` | `tests/test_modal_app_v2.py`, `tests/test_debug_v2.py` | Unit/static boundary | ✅ 88 focused tests | ✅ New prompt/styling expectations failed before implementation | ✅ 89 focused tests passed; exact normalized, pixel, mixed, and missing-mask render references | ✅ Existing deterministic labels/colors and both V2 entrypoint defaults covered | ✅ Minimal literal/renderer stroke changes; no new abstraction |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_debug_v2.py -q` — `89 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `402 passed, 1 skipped`.
+- No real Modal deployment, GPU inference, `game_03` validation, or unrelated pipeline behavior was performed.
 
 ## `sam31-memory-mitigation` Work Unit
 

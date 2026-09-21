@@ -88,8 +88,8 @@ def test_render_frame_scales_all_bbox_corners_and_full_raw_label(tmp_path: Path)
     rendered = render_frame(frame, [row], root)
 
     expected = frame.copy()
-    cv2.rectangle(expected, (20, 20), (60, 60), color, 1)
-    cv2.putText(expected, "RAW: 7", (20, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    cv2.rectangle(expected, (20, 20), (60, 60), color, 3)
+    cv2.putText(expected, "RAW: 7", (20, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2, cv2.LINE_AA)
     assert np.array_equal(rendered[5:21, 20:70], expected[5:21, 20:70])
     for x, y in ((20, 20), (60, 20), (20, 60), (60, 60)):
         assert np.array_equal(rendered[y, x], color)
@@ -143,8 +143,8 @@ def test_render_frame_treats_exact_normalized_boundaries_as_normalized(tmp_path:
     rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": [0, 0, 1, 1]}], root)
 
     expected = frame.copy()
-    cv2.rectangle(expected, (0, 0), (60, 40), color, 1)
-    cv2.putText(expected, "RAW: 7", (0, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    cv2.rectangle(expected, (0, 0), (60, 40), color, 3)
+    cv2.putText(expected, "RAW: 7", (0, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2, cv2.LINE_AA)
     assert np.array_equal(rendered, expected)
 
 
@@ -157,8 +157,8 @@ def test_render_frame_treats_mixed_coordinates_as_pixel_style(tmp_path: Path):
     rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": [5, 6, 20, 18]}], root)
 
     expected = frame.copy()
-    cv2.rectangle(expected, (5, 6), (20, 18), color, 1)
-    cv2.putText(expected, "RAW: 7", (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    cv2.rectangle(expected, (5, 6), (20, 18), color, 3)
+    cv2.putText(expected, "RAW: 7", (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2, cv2.LINE_AA)
     assert np.array_equal(rendered, expected)
 
 
@@ -174,10 +174,10 @@ def test_render_frame_supports_normalized_and_pixel_boxes_in_one_frame(tmp_path:
     rendered = render_frame(frame, rows, root)
 
     expected = frame.copy()
-    cv2.rectangle(expected, (10, 16), (30, 32), debug_v2.color_for_track(7), 1)
-    cv2.putText(expected, "RAW: 7", (10, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(7), 1, cv2.LINE_AA)
-    cv2.rectangle(expected, (60, 30), (80, 50), debug_v2.color_for_track(8), 1)
-    cv2.putText(expected, "RAW: 8", (60, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(8), 1, cv2.LINE_AA)
+    cv2.rectangle(expected, (10, 16), (30, 32), debug_v2.color_for_track(7), 3)
+    cv2.putText(expected, "RAW: 7", (10, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(7), 2, cv2.LINE_AA)
+    cv2.rectangle(expected, (60, 30), (80, 50), debug_v2.color_for_track(8), 3)
+    cv2.putText(expected, "RAW: 8", (60, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(8), 2, cv2.LINE_AA)
     assert np.array_equal(rendered, expected)
 
 
@@ -196,8 +196,8 @@ def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):
     }], artifacts)
     expected = frame_for_missing_mask.copy()
     color = debug_v2.color_for_track(8)
-    cv2.rectangle(expected, (15, 5), (22, 14), color, 1)
-    cv2.putText(expected, "RAW: 8", (15, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    cv2.rectangle(expected, (15, 5), (22, 14), color, 3)
+    cv2.putText(expected, "RAW: 8", (15, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2, cv2.LINE_AA)
     assert np.array_equal(rendered[0:15, 15:75], expected[0:15, 15:75])
 
     stats = render_debug_video(video, artifacts / "tracks.jsonl", artifacts, output)

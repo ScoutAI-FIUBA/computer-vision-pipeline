@@ -38,6 +38,33 @@ def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
     assert decorated_gpu(legacy_source, "Pipeline") == "L4"
 
 
+def test_v2_defaults_to_on_court_prompt():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    defaults = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"process", "main"}:
+            if node.name == "process":
+                defaults[node.name] = next(
+                    default
+                    for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                    if argument.arg == "prompt"
+                )
+            else:
+                defaults[node.name] = next(
+                    default
+                    for argument, default in zip(node.args.args, node.args.defaults)
+                    if argument.arg == "prompt"
+                )
+
+    assert all(
+        isinstance(default, ast.Constant) and default.value == "basketball player on the court"
+        for default in defaults.values()
+    )
+    assert set(defaults) == {"process", "main"}
+
+
 def test_v2_image_isolated_and_uses_only_modal_model_storage():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
 
@@ -793,7 +820,11 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     manifest = json.loads(artifacts["manifest.json"])
     assert manifest["complete"] is True
     assert manifest["observation_count"] == 1
-    assert manifest["config"] == {"prompt": "basketball player", "frame_end": 60, "frame_start": 60}
+    assert manifest["config"] == {
+        "prompt": "basketball player on the court",
+        "frame_end": 60,
+        "frame_start": 60,
+    }
     assert "wall_seconds" in manifest["benchmark"]
     observation = json.loads(artifacts["tracks.jsonl"].decode())
     assert observation == {
