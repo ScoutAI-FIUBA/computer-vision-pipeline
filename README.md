@@ -22,6 +22,18 @@ High-level flow:
 
 `stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/numbers.json`, `stats/shot_events.jsonl`, and `stats/possession_events.jsonl` therefore use the legacy contract and are referenced in the V2 manifest with relative paths, sizes, and hashes. This performs a second, independent stats run; it does not claim that SAM3.1 rows are already legacy stats rows. The stats pass uses its own `PipelineConfig`/environment scope rather than V2's `frame_start`/`frame_end`, so configure its frame limits explicitly when cost matters. The V2 image consequently also requires the legacy SAM2/Roboflow runtime and `ROBOFLOW_API_KEY`.
 
+Render possession from a saved V2 bundle with the root SAM3.1 video overlay and the legacy stats events/tracks:
+
+```bash
+./.venv/bin/python scripts/tracking/debug_v2.py \
+  --video-path path/to/input.mp4 \
+  --artifact-dir outputs/v2-bundle \
+  --stats-dir outputs/v2-bundle/stats \
+  --output outputs/v2-bundle/possession-debug.mp4
+```
+
+The renderer matches possession events by exact `frame_index`. It displays only the event's authoritative `stable_player_id`, `team_id`, or explicit `UNKNOWN`/`LOST`/`UNASSIGNED` status; it never infers a holder.
+
 ## Phase status
 
 - **Completed for this phase:** production ball detection and production team identification.

@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 from scripts.tracking import debug_v2
-from scripts.tracking.debug_v2 import render_debug_video, render_frame, validate_artifacts
+from scripts.tracking.debug_v2 import (
+    load_possession_events,
+    render_debug_video,
+    render_frame,
+    validate_artifacts,
+)
 
 
 def _write_video(path: Path, count: int = 4) -> None:
@@ -256,6 +261,183 @@ def test_render_frame_supports_normalized_and_pixel_boxes_in_one_frame(tmp_path:
     cv2.rectangle(expected, (60, 30), (80, 50), debug_v2.color_for_team(None), 3)
     cv2.putText(expected, "RAW: 8", (60, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_team(None), 2, cv2.LINE_AA)
     assert np.array_equal(rendered, expected)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("confirmed", "POSSESSION: player-007 TEAM: 1"),
+        ("unknown", "POSSESSION: UNKNOWN"),
+        ("lost", "POSSESSION: LOST"),
+        ("unassigned", "POSSESSION: UNASSIGNED"),
+    ],
+)
+def test_render_frame_overlays_authoritative_possession_status(status, expected, monkeypatch):
+    calls = []
+    original_put_text = cv2.putText
+
+    def recording_put_text(image, text, *args, **kwargs):
+        calls.append(text)
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", recording_put_text)
+    event = {"frame_index": 4, "status": status, "stable_player_id": "player-007", "team_id": 1}
+
+    rendered = render_frame(np.zeros((80, 120, 3), dtype=np.uint8), [], Path("."), possession_event=event)
+
+    assert not np.array_equal(rendered, np.zeros((80, 120, 3), dtype=np.uint8))
+    assert calls == [expected]
+
+
+def test_possession_events_match_frames_without_inference(tmp_path: Path):
+    path = tmp_path / "possession_events.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"frame_index": 3, "status": "confirmed", "stable_player_id": "player-3", "team_id": 0},
+                {"frame_index": 5, "status": "lost", "stable_player_id": "player-should-not-be-used", "team_id": 1},
+            ]
+        )
+        + "\n"
+    )
+
+    events = load_possession_events(path)
+
+    assert events[3]["stable_player_id"] == "player-3"
+    assert events.get(4) is None
+    assert events[5]["status"] == "lost"
+
+
+def test_possession_duplicate_frame_records_fail_closed(tmp_path: Path):
+    path = tmp_path / "possession_events.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"frame_index": 3, "status": "unknown"},
+                {"frame_index": 3, "status": "confirmed", "stable_player_id": "player-3", "team_id": 0},
+            ]
+        )
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="duplicate possession frame_index 3"):
+        load_possession_events(path)
+
+
+def test_render_debug_video_writes_possession_overlay_video(tmp_path: Path):
+    video = tmp_path / "input.mp4"
+    artifacts = tmp_path / "artifacts"
+    stats_dir = tmp_path / "stats"
+    output = tmp_path / "possession-debug.mp4"
+    _write_video(video, count=2)
+    _write_artifacts(artifacts)
+    stats_dir.mkdir()
+    (stats_dir / "possession_events.jsonl").write_text(json.dumps({
+        "frame_index": 0,
+        "status": "confirmed",
+        "stable_player_id": "player-7",
+        "team_id": 1,
+        "player_track_id": 7,
+    }) + "\n")
+    (stats_dir / "tracks.jsonl").write_text(json.dumps({
+        "frame_index": 0,
+        "track_id": 7,
+        "xyxy": [4, 4, 14, 14],
+        "stable_player_id": "player-7",
+        "team_id": 1,
+    }) + "\n")
+
+    stats = render_debug_video(
+        video,
+        artifacts / "tracks.jsonl",
+        artifacts / "masks",
+        output,
+        possession_jsonl=stats_dir / "possession_events.jsonl",
+        stats_tracks_jsonl=stats_dir / "tracks.jsonl",
+    )
+
+    assert output.is_file()
+    assert stats["frames_written"] == 2
+    capture = cv2.VideoCapture(str(output))
+    try:
+        ok, first_frame = capture.read()
+    finally:
+        capture.release()
+    assert ok
+    # The confirmed event draws the possession banner on the actual encoded frame.
+    assert not np.array_equal(first_frame[0:28, 0:32], np.full((28, 32, 3), (20, 30, 200), dtype=np.uint8))
+    assert np.linalg.norm(first_frame[4, 4].astype(float) - np.array(debug_v2.color_for_team(1))) < 100
+
+
+def test_cli_without_stats_input_remains_backward_compatible(tmp_path: Path, monkeypatch):
+    captured: dict = {}
+
+    def fake_render(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return {"frames_written": 0}
+
+    monkeypatch.setattr(debug_v2, "render_debug_video", fake_render)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debug_v2.py",
+            "--video-path",
+            str(tmp_path / "input.mp4"),
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+            "--output",
+            str(tmp_path / "debug.mp4"),
+        ],
+    )
+
+    debug_v2.main()
+
+    assert captured["kwargs"]["possession_jsonl"] is None
+    assert captured["kwargs"]["stats_tracks_jsonl"] is None
+
+
+@pytest.mark.parametrize("explicit", ["--possession-jsonl", "--stats-tracks-jsonl"])
+def test_cli_rejects_stats_dir_with_only_one_explicit_stats_path(tmp_path: Path, explicit: str, monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debug_v2.py",
+            "--video-path", str(tmp_path / "input.mp4"),
+            "--artifact-dir", str(tmp_path / "artifacts"),
+            "--stats-dir", str(tmp_path / "stats"),
+            explicit, str(tmp_path / "explicit.jsonl"),
+            "--output", str(tmp_path / "debug.mp4"),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        debug_v2.main()
+    assert "only one explicit stats path" in capsys.readouterr().err
+
+
+def test_cli_rejects_stats_dir_with_both_explicit_stats_paths(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setattr(debug_v2, "render_debug_video", lambda *args, **kwargs: {"frames_written": 0})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "debug_v2.py",
+            "--video-path", str(tmp_path / "input.mp4"),
+            "--artifact-dir", str(tmp_path / "artifacts"),
+            "--stats-dir", str(tmp_path / "stats"),
+            "--possession-jsonl", str(tmp_path / "possession.jsonl"),
+            "--stats-tracks-jsonl", str(tmp_path / "stats-tracks.jsonl"),
+            "--output", str(tmp_path / "debug.mp4"),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        debug_v2.main()
+    assert "cannot be combined" in capsys.readouterr().err
 
 
 def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):

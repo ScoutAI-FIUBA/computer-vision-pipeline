@@ -20,6 +20,7 @@ TEAM_COLORS = {
     1: (255, 140, 0),
 }
 NEUTRAL_COLOR = (160, 255, 160)
+POSSESSION_STATUSES = {"confirmed", "unknown", "lost", "unassigned"}
 
 
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
@@ -40,6 +41,23 @@ def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
                     row.setdefault("rejection_state", rejection_state)
                 by_frame[int(row["frame_index"])].append(row)
     return dict(by_frame)
+
+
+def load_possession_events(possession_jsonl: Path) -> dict[int, dict[str, Any]]:
+    """Load authoritative possession records keyed by their exact source frame."""
+    by_frame: dict[int, dict[str, Any]] = {}
+    with possession_jsonl.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            frame_index = row.get("frame_index")
+            if not isinstance(frame_index, int) or isinstance(frame_index, bool):
+                continue
+            if frame_index in by_frame:
+                raise ValueError(f"duplicate possession frame_index {frame_index}")
+            by_frame[frame_index] = row
+    return by_frame
 
 
 def color_for_track(raw_track_id: int) -> tuple[int, int, int]:
@@ -144,7 +162,58 @@ def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete:
         raise ValueError(f"artifact package is {detail}; pass --allow-incomplete to override")
 
 
-def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: Path) -> np.ndarray:
+def _possession_label(event: Mapping[str, Any]) -> str:
+    status = str(event.get("status", "unknown")).strip().lower()
+    if status not in POSSESSION_STATUSES:
+        status = "unknown"
+    if status != "confirmed":
+        return f"POSSESSION: {status.upper()}"
+    player_id = event.get("stable_player_id")
+    holder = player_id.strip() if isinstance(player_id, str) and player_id.strip() else "UNKNOWN"
+    team_id = event.get("team_id")
+    team = str(team_id) if team_id is not None else "UNKNOWN"
+    return f"POSSESSION: {holder} TEAM: {team}"
+
+
+def render_possession_overlay(
+    frame: np.ndarray,
+    event: Mapping[str, Any],
+    stats_rows: Iterable[dict[str, Any]] = (),
+) -> np.ndarray:
+    """Draw an event label and, when available, its exact authoritative track."""
+    rendered = frame.copy()
+    label = _possession_label(event)
+    color = color_for_team(event.get("team_id"))
+    cv2.rectangle(rendered, (0, 0), (min(rendered.shape[1] - 1, 420), 28), (0, 0, 0), -1)
+    cv2.putText(rendered, label, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+
+    if str(event.get("status", "")).strip().lower() != "confirmed":
+        return rendered
+    track_id = event.get("player_track_id")
+    if not isinstance(track_id, int) or isinstance(track_id, bool):
+        return rendered
+    for row in stats_rows:
+        row_track_id = row.get("track_id", row.get("raw_track_id"))
+        if row_track_id != track_id:
+            continue
+        try:
+            box = _bbox_xyxy_in_pixels(row.get("bbox_xyxy", row.get("xyxy")), rendered.shape[:2])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        x1, y1, x2, y2 = box
+        cv2.rectangle(rendered, (x1, y1), (x2, y2), color, 5)
+        break
+    return rendered
+
+
+def render_frame(
+    frame: np.ndarray,
+    rows: Iterable[dict[str, Any]],
+    masks_dir: Path,
+    *,
+    possession_event: Mapping[str, Any] | None = None,
+    possession_rows: Iterable[dict[str, Any]] = (),
+) -> np.ndarray:
     """Draw masks and provenance labels without running identity logic."""
     rendered = frame.copy()
     for row in rows:
@@ -191,6 +260,8 @@ def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: P
                 2,
                 cv2.LINE_AA,
             )
+    if possession_event is not None:
+        rendered = render_possession_overlay(rendered, possession_event, possession_rows)
     return rendered
 
 
@@ -203,6 +274,8 @@ def render_debug_video(
     start_frame: int | None = None,
     end_frame: int | None = None,
     allow_incomplete: bool = False,
+    possession_jsonl: Path | None = None,
+    stats_tracks_jsonl: Path | None = None,
 ) -> dict[str, int | None]:
     """Render the selected inclusive source-frame range to an MP4."""
     if start_frame is not None and start_frame < 0:
@@ -213,7 +286,15 @@ def render_debug_video(
         raise ValueError("end_frame must be greater than or equal to start_frame")
 
     validate_artifacts(tracks_jsonl, masks_dir, allow_incomplete=allow_incomplete)
+    if (possession_jsonl is None) != (stats_tracks_jsonl is None):
+        raise ValueError("possession_jsonl and stats_tracks_jsonl must be provided together")
+    if possession_jsonl is not None and not possession_jsonl.is_file():
+        raise ValueError(f"possession artifact is missing: {possession_jsonl}")
+    if stats_tracks_jsonl is not None and not stats_tracks_jsonl.is_file():
+        raise ValueError(f"stats tracks artifact is missing: {stats_tracks_jsonl}")
     observations = load_observations(tracks_jsonl)
+    possession_events = load_possession_events(possession_jsonl) if possession_jsonl else {}
+    stats_observations = load_observations(stats_tracks_jsonl) if stats_tracks_jsonl else {}
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -240,7 +321,13 @@ def render_debug_video(
                 continue
             if end_frame is not None and frame_index > end_frame:
                 break
-            writer.write(render_frame(frame, observations.get(frame_index, ()), masks_dir))
+            writer.write(render_frame(
+                frame,
+                observations.get(frame_index, ()),
+                masks_dir,
+                possession_event=possession_events.get(frame_index),
+                possession_rows=stats_observations.get(frame_index, ()),
+            ))
             first_written = frame_index if first_written is None else first_written
             last_written = frame_index
             frames_written += 1
@@ -257,6 +344,9 @@ def main() -> None:
     parser.add_argument("--tracks-jsonl", type=Path)
     parser.add_argument("--masks-dir", type=Path)
     parser.add_argument("--artifact-dir", type=Path, help="Directory containing tracks.jsonl and masks/")
+    parser.add_argument("--stats-dir", type=Path, help="V2 bundle stats/ directory containing possession and tracks JSONL")
+    parser.add_argument("--possession-jsonl", type=Path)
+    parser.add_argument("--stats-tracks-jsonl", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--start-frame", type=int)
     parser.add_argument("--end-frame", type=int)
@@ -272,6 +362,17 @@ def main() -> None:
     masks_dir = args.masks_dir or (artifact_dir / "masks" if artifact_dir else None)
     if tracks_jsonl is None or masks_dir is None:
         parser.error("provide --artifact-dir or both --tracks-jsonl and --masks-dir")
+    explicit_stats_paths = (args.possession_jsonl is not None, args.stats_tracks_jsonl is not None)
+    if args.stats_dir and any(explicit_stats_paths):
+        if not all(explicit_stats_paths):
+            parser.error("--stats-dir cannot be combined with only one explicit stats path; provide both explicit paths or neither")
+        parser.error("--stats-dir cannot be combined with explicit stats paths; use one stats source mode")
+    if not args.stats_dir and any(explicit_stats_paths) and not all(explicit_stats_paths):
+        parser.error("provide both --possession-jsonl and --stats-tracks-jsonl")
+    possession_jsonl = args.possession_jsonl or (args.stats_dir / "possession_events.jsonl" if args.stats_dir else None)
+    stats_tracks_jsonl = args.stats_tracks_jsonl or (args.stats_dir / "tracks.jsonl" if args.stats_dir else None)
+    if (possession_jsonl is None) != (stats_tracks_jsonl is None):
+        parser.error("provide --stats-dir or both --possession-jsonl and --stats-tracks-jsonl")
     stats = render_debug_video(
         args.video_path,
         tracks_jsonl,
@@ -280,6 +381,8 @@ def main() -> None:
         start_frame=args.start_frame,
         end_frame=args.end_frame,
         allow_incomplete=args.allow_incomplete,
+        possession_jsonl=possession_jsonl,
+        stats_tracks_jsonl=stats_tracks_jsonl,
     )
     print(f"Wrote {stats['frames_written']} frames to {args.output}")
 
