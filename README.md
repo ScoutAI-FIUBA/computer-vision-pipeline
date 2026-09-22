@@ -16,6 +16,12 @@ High-level flow:
 
 `pipeline/` contains no Modal imports, so the same code runs from local CLI, tests, notebooks, or Modal.
 
+## SAM3.1 V2 boundary
+
+`modal_app_v2.py` keeps its SAM3.1 observation artifact at the root of the returned bundle (`tracks.jsonl` and `manifest.json`). It then delegates the same input video to `pipeline.runner.run_pipeline` in `stats/`, so the returned statistics artifacts are produced by the existing orchestration rather than translated from V2 rows.
+
+`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/numbers.json`, and `stats/shot_events.jsonl` therefore use the legacy contract and are referenced in the V2 manifest with relative paths, sizes, and hashes. This performs a second, independent stats run; it does not claim that SAM3.1 rows are already legacy stats rows. The stats pass uses its own `PipelineConfig`/environment scope rather than V2's `frame_start`/`frame_end`, so configure its frame limits explicitly when cost matters. The V2 image consequently also requires the legacy SAM2/Roboflow runtime and `ROBOFLOW_API_KEY`.
+
 ## Phase status
 
 - **Completed for this phase:** production ball detection and production team identification.

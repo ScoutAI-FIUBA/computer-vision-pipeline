@@ -1,12 +1,35 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import sys
 import types
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def fake_legacy_stats(monkeypatch, request):
+    if request.node.name == "test_process_exercises_real_stats_adapter_and_manifest_contract":
+        return
+    import modal_app_v2
+
+    def run(_video_path, output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "results.json").write_text("{}", encoding="utf-8")
+        (output_dir / "tracks.jsonl").write_text("", encoding="utf-8")
+        return types.SimpleNamespace(
+            to_dict=lambda: {
+                "tracks_file": "tracks.jsonl",
+                "teams_file": None,
+                "numbers_file": None,
+                "shot_events_file": None,
+            }
+        )
+
+    monkeypatch.setattr(modal_app_v2, "_run_legacy_stats", run)
 
 
 def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
@@ -70,7 +93,7 @@ def test_v2_image_isolated_and_uses_only_modal_model_storage():
 
     assert "modal_app.py" not in source
     assert "facebookresearch/sam3" in source
-    assert "facebookresearch/sam2" not in source
+    assert "facebookresearch/sam2" in source
     assert "R2" not in source
     assert "r2_key" not in source
     assert "output_prefix" not in source
@@ -919,6 +942,87 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     }
     decoded_mask = cv2.imdecode(np.frombuffer(artifacts[mask_path], dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     assert np.array_equal(decoded_mask, mask)
+
+
+def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.config import PipelineConfig
+    import pipeline.runner as legacy_runner
+
+    config = PipelineConfig(
+        roboflow_api_key="test-key",
+        reid_backend="none",
+        team_embedder_backend="none",
+        court_model_id=None,
+        number_predictor_backend="dummy",
+        prefetch_detections=False,
+        max_frames=1,
+        team_debug_enabled=False,
+    )
+    probe_calls = []
+    info = types.SimpleNamespace(
+        fps=30.0,
+        frame_count=1,
+        width=4,
+        height=4,
+        duration_seconds=1 / 30,
+    )
+    segment = types.SimpleNamespace(
+        frames=[np.zeros((4, 4, 3), dtype=np.uint8)],
+        frame_indices=[0],
+        is_last=True,
+    )
+
+    class FakeDetector:
+        def __init__(self):
+            self.call_count = 0
+
+        def detect(self, _frame):
+            self.call_count += 1
+            return {"predictions": []}
+
+    class FakeTracker:
+        device = "cpu"
+
+        def propagate_segment(self, _frames, _seed_rows):
+            return {}
+
+    monkeypatch.setattr(PipelineConfig, "from_env", classmethod(lambda cls: config))
+    monkeypatch.setattr(legacy_runner, "probe", lambda path: probe_calls.append(path) or info)
+    monkeypatch.setattr(legacy_runner, "iter_segments", lambda *_args, **_kwargs: iter((segment,)))
+    monkeypatch.setattr(legacy_runner, "build_detector", lambda *_args, **_kwargs: FakeDetector())
+    monkeypatch.setattr(legacy_runner, "Sam2SegmentTracker", lambda _model_id: FakeTracker())
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: ([], {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda rows, **_kwargs: types.SimpleNamespace(
+        observations=rows, acceptance={}, acceptance_reasons=[]
+    ))
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
+
+    assert [path.name for path in probe_calls] == ["input.mp4"]
+    artifacts = payload["artifacts"]
+    manifest = json.loads(artifacts["manifest.json"])
+    assert manifest["artifacts"]["legacy_stats"]["results"]["key"] == "stats/results.json"
+    assert manifest["artifacts"]["legacy_stats"]["tracks"]["key"] == "stats/tracks.jsonl"
+    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl"} <= set(artifacts)
+    results = json.loads(artifacts["stats/results.json"])
+    assert results["schema_version"] == 5
+    assert results["tracks_file"] == "tracks.jsonl"
+    assert results["teams_file"] == "teams.json"
+    assert results["numbers_file"] == "numbers.json"
+    assert results["shot_events_file"] == "shot_events.jsonl"
+    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl"} <= set(artifacts)
+    for name, reference in manifest["artifacts"]["legacy_stats"].items():
+        data = artifacts[reference["key"]]
+        assert reference["size_bytes"] == len(data)
+        assert reference["sha256"] == hashlib.sha256(data).hexdigest()
+    assert manifest["legacy_stats_results"] == "stats/results.json"
 
 
 def test_process_passes_tracked_frames_and_masks_to_v2_runner(monkeypatch):

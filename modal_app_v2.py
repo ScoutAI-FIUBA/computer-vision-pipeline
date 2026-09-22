@@ -15,12 +15,18 @@ from typing import Any
 
 import modal
 
-from pipeline.results import _mask_filename, package_artifacts
+from pipeline.results import (
+    _artifact_ref,
+    _manifest_hash,
+    _mask_filename,
+    package_artifacts,
+)
 from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
 
 SAM31_REPOSITORY = "git+https://github.com/facebookresearch/sam3.git"
 SAM31_COMMIT = "2345a4a"
+SAM2_COMMIT = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
 SAM31_SMOKE_MODULES = (
     "pycocotools.mask",
     "PIL",
@@ -55,14 +61,20 @@ image = (
         "boxmot==22.0.0",
         "open_clip_torch==2.32.0",
         "timm==1.0.22",
+        "inference-sdk==1.3.3",
+        "supervision==0.29.1",
         "python-dotenv==1.2.2",
     )
+    .pip_install(f"git+https://github.com/facebookresearch/sam2.git@{SAM2_COMMIT}")
     .pip_install(f"{SAM31_REPOSITORY}@{SAM31_COMMIT}")
     .env({"HF_HOME": f"{CACHE_DIR}/huggingface", "HF_HUB_CACHE": f"{CACHE_DIR}/huggingface/hub"})
     .add_local_python_source("pipeline")
+    .add_local_file("scripts/ball/tracknet.py", remote_path="/root/scripts/ball/tracknet.py")
+    .add_local_file("scripts/ball/candidates.py", remote_path="/root/scripts/ball/candidates.py")
 )
 
 hf_secret = modal.Secret.from_name("scoutai-huggingface", required_keys=["HF_TOKEN"])
+roboflow_secret = modal.Secret.from_name("scoutai-roboflow", required_keys=["ROBOFLOW_API_KEY"])
 
 
 def check_sam31_imports(import_module=importlib.import_module) -> dict[str, Any]:
@@ -217,6 +229,14 @@ def _load_video_frames(path: Path, frame_start: int, frame_end: int) -> dict[int
         capture.release()
 
 
+def _run_legacy_stats(video_path: Path, output_dir: Path):
+    """Run the production stats orchestration in its own output namespace."""
+    from pipeline.config import PipelineConfig
+    from pipeline.runner import run_pipeline
+
+    return run_pipeline(video_path, PipelineConfig.from_env(), output_dir)
+
+
 def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
     ids = output.get("out_obj_ids")
     boxes = output.get("out_boxes_xywh")
@@ -319,7 +339,13 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
     return rows, masks
 
 
-@app.cls(image=image, gpu="A100-80GB", volumes={CACHE_DIR: model_cache}, secrets=[hf_secret], timeout=1800)
+@app.cls(
+    image=image,
+    gpu="A100-80GB",
+    volumes={CACHE_DIR: model_cache},
+    secrets=[hf_secret, roboflow_secret],
+    timeout=1800,
+)
 class PipelineV2:
     @modal.enter()
     def load_models(self) -> None:
@@ -392,18 +418,42 @@ class PipelineV2:
                 if hasattr(self, "seams"):
                     runner_kwargs["seams"] = self.seams
                 result = run_v2(rows, **runner_kwargs)
-                package_artifacts(
+                video_metadata = _video_metadata(video_path)
+                artifact_manifest = package_artifacts(
                     output_dir,
                     result.observations,
                     masks,
                     input_fingerprint=_file_fingerprint(video_path),
-                    video_metadata=_video_metadata(video_path),
+                    video_metadata=video_metadata,
                     frame_bounds=[frame_start, frame_end],
                     prompts=[prompt],
                     config={"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end},
                     benchmark={"wall_seconds": time.perf_counter() - started},
                     acceptance=result.acceptance,
                     acceptance_reasons=result.acceptance_reasons,
+                )
+                stats_result = _run_legacy_stats(video_path, output_dir / "stats")
+                stats_payload = stats_result.to_dict()
+                artifact_manifest["artifacts"]["legacy_stats"] = {
+                    name: _artifact_ref(output_dir / "stats" / filename, f"stats/{filename}")
+                    for name, filename in {
+                        "results": "results.json",
+                        "tracks": stats_payload["tracks_file"],
+                        "teams": stats_payload["teams_file"],
+                        "numbers": stats_payload["numbers_file"],
+                        "shot_events": stats_payload["shot_events_file"],
+                        "ball_tracks": stats_payload.get("ball_tracks_file"),
+                        "projected_tracks": stats_payload.get("projected_tracks_file"),
+                        "projected_shots": stats_payload.get("projected_shots_file"),
+                        "projected_shots_image": stats_payload.get("projected_shots_image_file"),
+                        "annotated_video": stats_payload.get("annotated_video_file"),
+                    }.items()
+                    if filename is not None
+                }
+                artifact_manifest["legacy_stats_results"] = "stats/results.json"
+                artifact_manifest["artifacts"]["manifest"]["sha256"] = _manifest_hash(artifact_manifest)
+                (output_dir / "manifest.json").write_text(
+                    json.dumps(artifact_manifest, indent=2, sort_keys=True), encoding="utf-8"
                 )
             except Exception as error:
                 print(f"[v2] error={type(error).__name__}: {error}")
