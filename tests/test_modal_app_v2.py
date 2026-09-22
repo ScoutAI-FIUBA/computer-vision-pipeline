@@ -1010,14 +1010,16 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
     manifest = json.loads(artifacts["manifest.json"])
     assert manifest["artifacts"]["legacy_stats"]["results"]["key"] == "stats/results.json"
     assert manifest["artifacts"]["legacy_stats"]["tracks"]["key"] == "stats/tracks.jsonl"
-    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl"} <= set(artifacts)
+    assert manifest["artifacts"]["legacy_stats"]["possession_events"]["key"] == "stats/possession_events.jsonl"
+    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
     results = json.loads(artifacts["stats/results.json"])
     assert results["schema_version"] == 5
     assert results["tracks_file"] == "tracks.jsonl"
     assert results["teams_file"] == "teams.json"
     assert results["numbers_file"] == "numbers.json"
     assert results["shot_events_file"] == "shot_events.jsonl"
-    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl"} <= set(artifacts)
+    assert results["possession_events_file"] == "possession_events.jsonl"
+    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
     for name, reference in manifest["artifacts"]["legacy_stats"].items():
         data = artifacts[reference["key"]]
         assert reference["size_bytes"] == len(data)

@@ -187,8 +187,8 @@ Implement the following in order during the next session:
    including unknown, lost, and unassigned states.
 3. Implement shot/event detection with explicit make/miss outcomes and
    reviewable unknown events.
-4. Add possession only after player/team/ball evidence passes validation; this
-   remains the next unimplemented statistics slice.
+4. Add possession only after player/team/ball evidence passes validation; the
+   narrow `possession_events.jsonl` slice is now implemented. Keep passes deferred.
 5. Add passes only after possession and transfer evidence support them; do not
    infer passes from proximity alone.
 6. Select a small evaluation clip set and define practical metrics for event

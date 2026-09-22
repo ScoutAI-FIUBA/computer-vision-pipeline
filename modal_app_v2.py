@@ -442,6 +442,7 @@ class PipelineV2:
                         "teams": stats_payload["teams_file"],
                         "numbers": stats_payload["numbers_file"],
                         "shot_events": stats_payload["shot_events_file"],
+                        "possession_events": stats_payload.get("possession_events_file"),
                         "ball_tracks": stats_payload.get("ball_tracks_file"),
                         "projected_tracks": stats_payload.get("projected_tracks_file"),
                         "projected_shots": stats_payload.get("projected_shots_file"),

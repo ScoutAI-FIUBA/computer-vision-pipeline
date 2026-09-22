@@ -42,6 +42,7 @@ from pipeline.number_evidence import (
     write_number_prediction_artifacts,
 )
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
+from pipeline.possession import resolve_possession_events
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
 from pipeline.results import RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter
@@ -84,6 +85,7 @@ SHOT_EVIDENCE_FILENAME = "shot_evidence.jsonl"
 SHOT_SIGNALS_FILENAME = "shot_signals.jsonl"
 SHOT_RAW_PREDICTIONS_FILENAME = "shot_raw_predictions.jsonl"
 BALL_TRACKS_FILENAME = "ball_tracks.jsonl"
+POSSESSION_EVENTS_FILENAME = "possession_events.jsonl"
 PROJECTED_TRACKS_FILENAME = "projected_tracks.jsonl"
 PROJECTED_SHOTS_FILENAME = "projected_shots.json"
 PROJECTED_SHOTS_IMAGE_FILENAME = "projected_shots.png"
@@ -426,6 +428,28 @@ def _load_jsonl_rows(path: Path) -> list[dict]:
                 continue
             rows.append(json.loads(line))
     return rows
+
+
+def _write_possession_events(
+    output_dir: Path,
+    tracks: list[dict],
+    ball_rows: list[dict],
+    *,
+    fps: float | None,
+    frame_step: int = 1,
+    team_ids_by_track_id: dict[int, int] | None = None,
+) -> Path:
+    """Write possession after final team IDs are available."""
+    events = resolve_possession_events(
+        tracks,
+        ball_rows,
+        fps=fps,
+        frame_step=frame_step,
+        team_ids_by_track_id=team_ids_by_track_id,
+    )
+    path = output_dir / POSSESSION_EVENTS_FILENAME
+    path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    return path
 
 
 def _foot_point_for_bbox(xyxy) -> list[float]:
@@ -1115,6 +1139,7 @@ def run_pipeline(
         shot_events_file=SHOT_EVENTS_FILENAME,
         shot_evidence_file=SHOT_EVIDENCE_FILENAME,
         ball_tracks_file=BALL_TRACKS_FILENAME if ball_track_records > 0 else None,
+        possession_events_file=POSSESSION_EVENTS_FILENAME,
         projected_tracks_file=PROJECTED_TRACKS_FILENAME if projected_track_records > 0 else None,
         annotated_video_file=ANNOTATED_FILENAME if annotated_path else None,
     )
@@ -1215,6 +1240,22 @@ def run_pipeline(
     if config.team_debug_enabled:
         write_debug_artifacts(output_dir, team_evidence_by_track_id)
         write_number_debug_artifacts(output_dir, number_evidence_by_track_id)
+
+    possession_path = _write_possession_events(
+        output_dir,
+        _load_jsonl_rows(tracks_path),
+        ball_rows,
+        fps=info.fps,
+        frame_step=step,
+        team_ids_by_track_id=team_by_track_id,
+    )
+    results.artifact_references = {
+        "possession_events": {
+            "file": possession_path.name,
+            "schema_version": 1,
+            "status_vocabulary": ["confirmed", "unknown", "lost", "unassigned"],
+        }
+    }
 
     # One line per suspected swap, so a run can be reviewed without watching the
     # video. Written even when empty, so its absence means "not computed" rather

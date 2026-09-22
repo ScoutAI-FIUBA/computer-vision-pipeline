@@ -20,12 +20,12 @@ High-level flow:
 
 `modal_app_v2.py` keeps its SAM3.1 observation artifact at the root of the returned bundle (`tracks.jsonl` and `manifest.json`). It then delegates the same input video to `pipeline.runner.run_pipeline` in `stats/`, so the returned statistics artifacts are produced by the existing orchestration rather than translated from V2 rows.
 
-`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/numbers.json`, and `stats/shot_events.jsonl` therefore use the legacy contract and are referenced in the V2 manifest with relative paths, sizes, and hashes. This performs a second, independent stats run; it does not claim that SAM3.1 rows are already legacy stats rows. The stats pass uses its own `PipelineConfig`/environment scope rather than V2's `frame_start`/`frame_end`, so configure its frame limits explicitly when cost matters. The V2 image consequently also requires the legacy SAM2/Roboflow runtime and `ROBOFLOW_API_KEY`.
+`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/numbers.json`, `stats/shot_events.jsonl`, and `stats/possession_events.jsonl` therefore use the legacy contract and are referenced in the V2 manifest with relative paths, sizes, and hashes. This performs a second, independent stats run; it does not claim that SAM3.1 rows are already legacy stats rows. The stats pass uses its own `PipelineConfig`/environment scope rather than V2's `frame_start`/`frame_end`, so configure its frame limits explicitly when cost matters. The V2 image consequently also requires the legacy SAM2/Roboflow runtime and `ROBOFLOW_API_KEY`.
 
 ## Phase status
 
 - **Completed for this phase:** production ball detection and production team identification.
-- **Current slice:** ball-track validation and shot-to-ball evidence references are available offline. Player attribution, possession, and passes remain deferred; missing evidence stays unknown.
+- **Current slice:** ball-track validation, shot-to-ball evidence, and conservative possession events are available offline. Passes remain deferred; missing evidence stays explicit.
 
 ## Dedicated player-position pipeline
 
@@ -152,7 +152,25 @@ Expected local artifacts in `--output-dir`:
 - `shot_events.jsonl`
 - `shot_evidence.jsonl`
 - `ball_tracks.jsonl` when TrackNet or the ball fallback emits ball rows
+- `possession_events.jsonl` with one shared player-frame record per evaluated frame
 - `annotated.mp4` when `--annotated` is set
+
+### Possession contract
+
+`possession_events.jsonl` is schema version 1. A `confirmed` record requires a
+valid ball center inside or within 8 pixels of exactly one authoritative player
+box for 0.5 seconds, with a valid player track identity. `team_id` is copied
+only when row and final team evidence agree; otherwise it is `null`.
+
+Statuses are `confirmed`, `unknown`, `lost`, and `unassigned`:
+
+- `confirmed`: the temporal gate passed.
+- `unknown`: ball geometry/state or player matching is ambiguous, invalid, or still pending confirmation.
+- `lost`: the exact shared frame has missing or authoritative lost ball evidence.
+- `unassigned`: one player matched, but its identity is missing or unresolved.
+
+Gaps reset confirmation. The stage never interpolates missing ball rows, infers
+possession from proximity when candidates are tied, or emits passes yet.
 
 Expected local artifacts for `--pipeline player-positions`:
 
