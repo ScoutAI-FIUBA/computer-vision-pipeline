@@ -25,7 +25,7 @@ High-level flow:
 ## Phase status
 
 - **Completed for this phase:** production ball detection and production team identification.
-- **Next phase:** statistics detection. Statistics are not implemented yet; the existing `shot_events.jsonl` is only the current minimal detector-driven artifact, not a complete statistics system.
+- **Current slice:** ball-track validation and shot-to-ball evidence references are available offline. Player attribution, possession, and passes remain deferred; missing evidence stays unknown.
 
 ## Dedicated player-position pipeline
 
@@ -150,6 +150,7 @@ Expected local artifacts in `--output-dir`:
 - `teams.json`
 - `numbers.json`
 - `shot_events.jsonl`
+- `shot_evidence.jsonl`
 - `ball_tracks.jsonl` when TrackNet or the ball fallback emits ball rows
 - `annotated.mp4` when `--annotated` is set
 
@@ -246,9 +247,16 @@ Current outputs from one pipeline run:
 | `numbers.json` | Final per-track jersey-number confirmations and ambiguity details. |
 | `shot_events.jsonl` | Detector-frame make/miss event records from the active pipeline path. Empty means no shot events were resolved for that clip. |
 | `ball_tracks.jsonl` | One ball record per decoded source frame in the dense TrackNet stream, in source-frame order. Rows include `timestamp_seconds`; TrackNet detections are preferred, bounded SAM2 fallback rows use `track_state: "fallback"`, and an exhausted miss emits `track_state: "lost"` with null geometry. |
+| `results.json.ball_provenance` | Backward-compatible validation metadata: backend, state counts, configured/missing coverage, lost coverage, and track-ID diagnostics. |
 | `team_debug.json` | Per-track sample summaries when team debug is enabled. |
 | `team_debug/` | Crops and masks for manual team-ID inspection when team debug is enabled. |
+
 | `annotated.mp4` | Optional final render after team assignment/number aggregation, with confirmed jersey numbers when available. |
+
+`shot_events.jsonl` keeps its legacy schema. The additive `shot_evidence.jsonl`
+joins each event to ball evidence for its frame window and includes a
+`player_identity` object. The latter is `unknown` unless an existing artifact can
+prove the identity; this slice does not infer a shooter or team.
 
 ### Offline team-backbone A/B evaluation
 

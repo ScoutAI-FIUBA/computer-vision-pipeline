@@ -144,6 +144,13 @@ def test_legacy_results_serialization_is_unchanged_when_no_artifacts_are_set():
     }
 
 
+def test_new_result_fields_follow_existing_positional_optional_fields():
+    results = PipelineResults(5, {}, {}, RunSummary(), "cpu", "tracks.jsonl", "teams.json", "numbers.json", "shots.json", "balls.json")
+
+    assert results.ball_tracks_file == "balls.json"
+    assert results.shot_evidence_file is None
+
+
 def test_package_rejects_duplicate_observation_keys(tmp_path: Path):
     observations = _observations() * 2
 

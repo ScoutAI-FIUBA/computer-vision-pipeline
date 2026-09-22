@@ -30,6 +30,7 @@ from pipeline.ball import (
     TRACKNET_CONTEXT_SIZE,
     write_ball_track_rows,
 )
+from pipeline.ball_contract import attach_shot_evidence, load_ball_track_rows, validate_ball_track_rows
 from pipeline.config import PipelineConfig
 from pipeline.court_projection import compute_frame_homography, parse_court_keypoints, project_points
 from pipeline.detection import PrefetchingDetector, build_detector, detections_from_result
@@ -79,6 +80,7 @@ SWAPS_FILENAME = "suspected_swaps.jsonl"
 TEAMS_FILENAME = "teams.json"
 NUMBERS_FILENAME = "numbers.json"
 SHOT_EVENTS_FILENAME = "shot_events.jsonl"
+SHOT_EVIDENCE_FILENAME = "shot_evidence.jsonl"
 SHOT_SIGNALS_FILENAME = "shot_signals.jsonl"
 SHOT_RAW_PREDICTIONS_FILENAME = "shot_raw_predictions.jsonl"
 BALL_TRACKS_FILENAME = "ball_tracks.jsonl"
@@ -600,6 +602,17 @@ def _write_shot_events(video_path: Path, output_path: Path, *, info, step: int, 
             write_shot_event_record(shot_events_file, final_shot_event)
 
 
+def _attach_ball_evidence(output_dir: Path, *, expected_frame_indices) -> None:
+    events = _load_jsonl_rows(output_dir / SHOT_EVENTS_FILENAME)
+    evidence_path = output_dir / SHOT_EVIDENCE_FILENAME
+    enriched = attach_shot_evidence(
+        events,
+        load_ball_track_rows(output_dir / BALL_TRACKS_FILENAME),
+        expected_frame_indices=expected_frame_indices,
+    )
+    evidence_path.write_text("".join(json.dumps(event) + "\n" for event in enriched), encoding="utf-8")
+
+
 def run_pipeline(
     video_path: Path,
     config: PipelineConfig,
@@ -1093,6 +1106,7 @@ def run_pipeline(
         teams_file=TEAMS_FILENAME,
         numbers_file=NUMBERS_FILENAME,
         shot_events_file=SHOT_EVENTS_FILENAME,
+        shot_evidence_file=SHOT_EVIDENCE_FILENAME,
         ball_tracks_file=BALL_TRACKS_FILENAME if ball_track_records > 0 else None,
         projected_tracks_file=PROJECTED_TRACKS_FILENAME if projected_track_records > 0 else None,
         annotated_video_file=ANNOTATED_FILENAME if annotated_path else None,
@@ -1105,6 +1119,26 @@ def run_pipeline(
         step=shot_step,
         config=config,
     )
+    ball_rows = load_ball_track_rows(output_dir / BALL_TRACKS_FILENAME)
+    ball_step = 1 if config.ball_all_frames else frame_step_for(info.fps, config.ball_target_fps)
+    expected_ball_count = info.frame_count
+    if config.max_frames is not None:
+        expected_ball_count = min(expected_ball_count, config.max_frames * step)
+    expected_ball_frames = range(0, expected_ball_count, step if tracknet_detector is None else ball_step)
+    _attach_ball_evidence(output_dir, expected_frame_indices=expected_ball_frames)
+    ball_validation = validate_ball_track_rows(
+        ball_rows,
+        expected_frame_indices=expected_ball_frames,
+        frame_step=ball_step if tracknet_detector is not None else step,
+        frame_width=info.width,
+        frame_height=info.height,
+    )
+    results.ball_provenance = {
+        "backend": "tracknet" if tracknet_detector is not None else "hosted_detector",
+        "contract_version": ball_validation.metadata["contract_version"],
+        "validation": ball_validation.to_dict(),
+        "evidence_policy": "no_interpolation; missing evidence remains unknown",
+    }
 
     number_prediction_records: list[NumberPredictionRecord] = []
     for sample in _iter_number_evidence_samples(number_evidence_by_track_id):

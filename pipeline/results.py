@@ -62,6 +62,8 @@ class PipelineResults:
     annotated_video_file: str | None = None
     artifact_manifest_file: str | None = None
     artifact_references: dict[str, Any] | None = None
+    shot_evidence_file: str | None = None
+    ball_provenance: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -74,10 +76,14 @@ class PipelineResults:
             payload.pop("projected_tracks_file", None)
         if payload.get("ball_tracks_file") is None:
             payload.pop("ball_tracks_file", None)
+        if payload.get("shot_evidence_file") is None:
+            payload.pop("shot_evidence_file", None)
         if payload.get("artifact_manifest_file") is None:
             payload.pop("artifact_manifest_file", None)
         if payload.get("artifact_references") is None:
             payload.pop("artifact_references", None)
+        if payload.get("ball_provenance") is None:
+            payload.pop("ball_provenance", None)
         return payload
 
     def write(self, path: Path) -> None:

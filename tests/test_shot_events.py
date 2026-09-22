@@ -702,6 +702,7 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
 
     assert results.schema_version == 5
     assert results.shot_events_file == "shot_events.jsonl"
+    assert results.shot_evidence_file == "shot_evidence.jsonl"
     assert requested_model_ids == [
         "basketball-player-detection-3-ycjdo/16",
         config.shot_model_id,
@@ -710,6 +711,10 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
     results_payload = json.loads((tmp_path / "out" / "results.json").read_text(encoding="utf-8"))
     assert results_payload["schema_version"] == 5
     assert results_payload["shot_events_file"] == "shot_events.jsonl"
+    assert results_payload["shot_evidence_file"] == "shot_evidence.jsonl"
+    assert results_payload["ball_provenance"]["backend"] == "hosted_detector"
+    assert results_payload["ball_provenance"]["validation"]["valid"] is False
+    assert results_payload["ball_provenance"]["validation"]["metadata"]["missing_frame_count"] == 2
     assert results_payload["config"]["player_model_id"] == "basketball-player-detection-3-ycjdo/16"
     assert results_payload["config"]["shot_model_id"] == config.shot_model_id
     assert results_payload["config"]["shot_target_fps"] is None
@@ -747,6 +752,13 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
             "resolution_reason": "ball_in_basket",
         }
     ]
+    shot_evidence = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "shot_evidence.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert shot_evidence[0]["ball_evidence"]["status"] == "missing"
+    assert shot_evidence[0]["ball_evidence"]["coverage_status"] == "missing"
+    assert shot_evidence[0]["player_identity"]["status"] == "unknown"
     assert shot_signals == [
         {
             "frame_index": 0,
