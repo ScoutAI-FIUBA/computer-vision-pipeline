@@ -7,6 +7,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Protocol
 
 
+STABLE_PLAYER_TEAM_VOTE_SHARE_THRESHOLD = 0.85
+
+
 @dataclass(frozen=True)
 class TeamObservation:
     """One accepted team-evidence sample that may be eligible for clustering."""
@@ -172,6 +175,7 @@ def identify_teams(
     backend: str = "unknown",
     minimum_samples: int = 1,
     assignment_margin: float = 0.03,
+    minimum_vote_share: float | None = None,
 ) -> TeamIdentificationResult:
     """Cluster accepted samples globally, then vote one team label per track."""
 
@@ -181,6 +185,8 @@ def identify_teams(
         raise ValueError("minimum_samples must be at least 1")
     if assignment_margin < 0:
         raise ValueError("assignment_margin must be at least 0")
+    if minimum_vote_share is not None and not 0 < minimum_vote_share <= 1:
+        raise ValueError("minimum_vote_share must be greater than 0 and at most 1")
 
     track_ids = sorted({int(observation.track_id) for observation in observations if observation.track_id is not None})
     eligible_by_track_id: dict[int, list[TeamObservation]] = {track_id: [] for track_id in track_ids}
@@ -226,7 +232,9 @@ def identify_teams(
         if not vote_labels:
             skipped.append(track_id)
             continue
-        team_id, diagnostics = _vote_for_track(vote_labels, minimum_samples, assignment_margin)
+        team_id, diagnostics = _vote_for_track(
+            vote_labels, minimum_samples, assignment_margin, minimum_vote_share
+        )
         track_diagnostics[track_id] = diagnostics
         assignments.append(TeamAssignment(detection_id=track_id, track_id=track_id, team_id=team_id))
 
@@ -271,7 +279,12 @@ def _reduce_embeddings(embeddings: list[list[float]]) -> list[list[float]]:
     return np.asarray(reduced, dtype=np.float32).tolist()
 
 
-def _vote_for_track(vote_labels: list[int], minimum_samples: int, assignment_margin: float) -> tuple[int | None, dict]:
+def _vote_for_track(
+    vote_labels: list[int],
+    minimum_samples: int,
+    assignment_margin: float,
+    minimum_vote_share: float | None = None,
+) -> tuple[int | None, dict]:
     vote_counts = Counter(int(label) for label in vote_labels)
     ranked = vote_counts.most_common()
     top_label, top_count = ranked[0]
@@ -286,6 +299,9 @@ def _vote_for_track(vote_labels: list[int], minimum_samples: int, assignment_mar
     elif top_count * 2 <= sample_count:
         team_id = None
         reason = "no_majority"
+    elif minimum_vote_share is not None and majority_share < minimum_vote_share:
+        team_id = None
+        reason = "ambiguous_vote"
     elif vote_margin <= assignment_margin:
         team_id = None
         reason = "ambiguous_vote"

@@ -165,6 +165,15 @@ This is an import/environment check only. It does not replace the GPU
 predictor smoke or inference path: `PipelineV2.process` initializes the
 predictor lazily when the normal V2 video command is run.
 
+For a V2 review run, add `--return-diagnostics` to the local entrypoint. The
+JSON response then includes opt-in `debug_diagnostics` with Team vote counts;
+normal responses and returned `tracks.jsonl` artifacts do not include it:
+
+```bash
+modal run modal_app_v2.py --video-path clips/game_03.mp4 \
+  --frame-start 60 --frame-end 130 --return-diagnostics
+```
+
 ---
 
 ## 4. First run — smallest possible

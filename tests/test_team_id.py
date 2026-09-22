@@ -12,6 +12,7 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -280,6 +281,27 @@ def test_siglip_team_embedder_uses_visible_torso_crop(monkeypatch: pytest.Monkey
     assert vectors[0].embedding == pytest.approx([0.6, 0.8])
 
 
+def test_siglip_embed_crops_converts_bfloat16_at_numpy_boundary():
+    torch = pytest.importorskip("torch")
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    embedder = object.__new__(SiglipTeamEmbedder)
+    embedder._torch = torch
+    embedder._cv2 = cv2
+    embedder._image = Image
+    embedder._np = np
+    embedder.device = "cpu"
+    embedder._uses_open_clip = False
+    embedder._transform = lambda image: torch.zeros(2)
+    embedder._model = lambda inputs: torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16)
+
+    vectors = embedder.embed_crops([np.zeros((2, 2, 3), dtype=np.uint8)])
+
+    assert vectors == [pytest.approx([0.6, 0.8])]
+
+
 def test_fashion_siglip_uses_huggingface_image_features_without_downloads(monkeypatch: pytest.MonkeyPatch):
     import numpy as np
 
@@ -450,12 +472,13 @@ def test_default_fashion_siglip_embed_extracts_crops_and_propagates_features(mon
     assert all(feature.debug_crop is not None for feature in features)
 
 
-def test_extract_team_features_prefers_masked_uniform_region():
+@pytest.mark.parametrize("mask_dtype", [bool, float])
+def test_extract_team_features_prefers_masked_uniform_region(mask_dtype):
     import numpy as np
 
     frame = np.zeros((50, 40, 3), dtype=np.uint8)
     frame[15:30, 9:21] = (0, 0, 255)
-    mask = np.zeros((32, 20), dtype=bool)
+    mask = np.zeros((32, 20), dtype=mask_dtype)
     mask[5:20, 4:16] = True
 
     features = extract_team_features(
@@ -469,6 +492,73 @@ def test_extract_team_features_prefers_masked_uniform_region():
     assert features.debug_mask is not None
     assert features.uniform_pixel_count > 0
     assert features.color_signature is not None
+
+
+@pytest.mark.parametrize(
+    ("player_mask", "expected_reason"),
+    [
+        ("empty", "empty_uniform_mask"),
+        ("invalid", "mask_shape_mismatch"),
+    ],
+)
+def test_extract_team_features_rejects_empty_or_invalid_mask_without_bbox_fallback(
+    monkeypatch: pytest.MonkeyPatch, player_mask: str, expected_reason: str
+):
+    import numpy as np
+
+    frame = np.full((50, 40, 3), 255, dtype=np.uint8)
+    mask = np.zeros((32, 20), dtype=bool) if player_mask == "empty" else np.zeros((31, 20), dtype=bool)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("bbox torso fallback must not be used for an explicit mask")
+
+    monkeypatch.setattr("pipeline.team_embedder.visible_torso", fail_if_called)
+    features = extract_team_features(
+        frame,
+        TeamEmbeddingSample(detection_id=2, track_id=8, xyxy=(5.0, 10.0, 25.0, 42.0), player_mask=mask),
+        [],
+        ReidConfig(),
+    )
+
+    assert features.color_signature is None
+    assert features.embedding is None
+    assert features.used_mask is True
+    assert expected_reason in features.rejection_reasons
+
+
+@pytest.mark.parametrize(
+    ("player_mask", "expected_reason"),
+    [
+        pytest.param(object(), "mask_not_array_like", id="non-array-like"),
+        pytest.param(np.zeros((32, 20, 1), dtype=bool), "mask_not_2d", id="three-dimensional"),
+        pytest.param(np.full((32, 20), float("nan")), "mask_non_finite", id="non-finite"),
+        pytest.param(np.full((32, 20), "1"), "mask_not_numeric", id="string"),
+        pytest.param(np.full((32, 20), 1, dtype=object), "mask_not_numeric", id="object"),
+        pytest.param(np.zeros((31, 20), dtype=bool), "mask_shape_mismatch", id="shape-mismatch"),
+    ],
+)
+def test_extract_team_features_rejects_malformed_masks_before_bbox_fallback(
+    monkeypatch: pytest.MonkeyPatch, player_mask, expected_reason: str
+):
+    import numpy as np
+
+    frame = np.full((50, 40, 3), 255, dtype=np.uint8)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("bbox torso fallback must not be used for an explicit mask")
+
+    monkeypatch.setattr("pipeline.team_embedder.visible_torso", fail_if_called)
+    features = extract_team_features(
+        frame,
+        TeamEmbeddingSample(detection_id=3, track_id=9, xyxy=(5.0, 10.0, 25.0, 42.0), player_mask=player_mask),
+        [],
+        ReidConfig(),
+    )
+
+    assert features.color_signature is None
+    assert features.embedding is None
+    assert features.used_mask is True
+    assert expected_reason in features.rejection_reasons
 
 
 def test_compute_track_coherence_reports_similarity_to_center():

@@ -82,6 +82,30 @@ def test_render_frame_draws_stable_team_and_rejection_labels(tmp_path: Path):
     assert rendered[20, 10].any()
 
 
+def test_render_frame_uses_one_color_for_players_on_same_team(tmp_path: Path):
+    frame = np.zeros((60, 100, 3), dtype=np.uint8)
+    rows = [
+        {"raw_track_id": 7, "team_id": 0, "bbox_xyxy": [5, 5, 25, 25]},
+        {"raw_track_id": 8, "team_id": 0, "bbox_xyxy": [55, 5, 75, 25]},
+    ]
+
+    rendered = render_frame(frame, rows, tmp_path)
+
+    assert np.array_equal(rendered[5, 5], rendered[5, 55])
+
+
+def test_render_frame_uses_different_colors_for_different_teams(tmp_path: Path):
+    frame = np.zeros((60, 100, 3), dtype=np.uint8)
+    rows = [
+        {"raw_track_id": 7, "team_id": 0, "bbox_xyxy": [5, 5, 25, 25]},
+        {"raw_track_id": 8, "team_id": 1, "bbox_xyxy": [55, 5, 75, 25]},
+    ]
+
+    rendered = render_frame(frame, rows, tmp_path)
+
+    assert not np.array_equal(rendered[5, 5], rendered[5, 55])
+
+
 def test_render_frame_uses_artifact_fields_for_all_debug_labels(tmp_path: Path, monkeypatch):
     calls = []
     original_put_text = cv2.putText
@@ -126,7 +150,7 @@ def test_render_frame_scales_normalized_bbox_before_drawing_mask_and_label(tmp_p
         "mask_ref": "masks/one.png",
     }], root)
 
-    color = np.array(debug_v2.color_for_track(7), dtype=np.uint8)
+    color = np.array(debug_v2.color_for_team(None), dtype=np.uint8)
     assert np.array_equal(rendered[6, 8], color)
     assert rendered[7, 7].any()
 
@@ -135,7 +159,7 @@ def test_render_frame_scales_all_bbox_corners_and_full_raw_label(tmp_path: Path)
     frame = np.zeros((80, 100, 3), dtype=np.uint8)
     root = tmp_path / "artifacts"
     root.mkdir()
-    color = debug_v2.color_for_track(7)
+    color = debug_v2.color_for_team(None)
     row = {"raw_track_id": 7, "bbox_xyxy": [0.2, 0.25, 0.6, 0.75]}
 
     rendered = render_frame(frame, [row], root)
@@ -191,7 +215,7 @@ def test_render_frame_treats_exact_normalized_boundaries_as_normalized(tmp_path:
     frame = np.zeros((40, 60, 3), dtype=np.uint8)
     root = tmp_path / "artifacts"
     root.mkdir()
-    color = debug_v2.color_for_track(7)
+    color = debug_v2.color_for_team(None)
 
     rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": [0, 0, 1, 1]}], root)
 
@@ -205,7 +229,7 @@ def test_render_frame_treats_mixed_coordinates_as_pixel_style(tmp_path: Path):
     frame = np.zeros((40, 60, 3), dtype=np.uint8)
     root = tmp_path / "artifacts"
     root.mkdir()
-    color = debug_v2.color_for_track(7)
+    color = debug_v2.color_for_team(None)
 
     rendered = render_frame(frame, [{"raw_track_id": 7, "bbox_xyxy": [5, 6, 20, 18]}], root)
 
@@ -227,10 +251,10 @@ def test_render_frame_supports_normalized_and_pixel_boxes_in_one_frame(tmp_path:
     rendered = render_frame(frame, rows, root)
 
     expected = frame.copy()
-    cv2.rectangle(expected, (10, 16), (30, 32), debug_v2.color_for_track(7), 3)
-    cv2.putText(expected, "RAW: 7", (10, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(7), 2, cv2.LINE_AA)
-    cv2.rectangle(expected, (60, 30), (80, 50), debug_v2.color_for_track(8), 3)
-    cv2.putText(expected, "RAW: 8", (60, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_track(8), 2, cv2.LINE_AA)
+    cv2.rectangle(expected, (10, 16), (30, 32), debug_v2.color_for_team(None), 3)
+    cv2.putText(expected, "RAW: 7", (10, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_team(None), 2, cv2.LINE_AA)
+    cv2.rectangle(expected, (60, 30), (80, 50), debug_v2.color_for_team(None), 3)
+    cv2.putText(expected, "RAW: 8", (60, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.4, debug_v2.color_for_team(None), 2, cv2.LINE_AA)
     assert np.array_equal(rendered, expected)
 
 
@@ -248,7 +272,7 @@ def test_missing_masks_do_not_drop_detection_or_frames(tmp_path: Path):
         "mask_ref": "masks/missing.png",
     }], artifacts)
     expected = frame_for_missing_mask.copy()
-    color = debug_v2.color_for_track(8)
+    color = debug_v2.color_for_team(None)
     cv2.rectangle(expected, (15, 5), (22, 14), color, 3)
     cv2.putText(expected, "RAW: 8", (15, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2, cv2.LINE_AA)
     assert np.array_equal(rendered[0:15, 15:75], expected[0:15, 15:75])

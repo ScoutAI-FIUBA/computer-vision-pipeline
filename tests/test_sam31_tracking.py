@@ -59,6 +59,22 @@ def test_normalization_converts_xywh_and_leaves_unassigned_identity_null():
     assert rows[0]["probability"] is None
 
 
+def test_normalization_preserves_explicit_bbox_coordinate_space():
+    rows = normalize_multiplex_output(
+        frame_index=61,
+        timestamp_seconds=2.033,
+        objects=[
+            {
+                "object_id": 4,
+                "bbox": [0.1, 0.2, 0.5, 0.8],
+            }
+        ],
+        bbox_coordinate_space="normalized",
+    )
+
+    assert rows[0]["bbox_coordinate_space"] == "normalized"
+
+
 def test_normalization_keeps_multiple_raw_tracks_separate():
     rows = normalize_multiplex_output(
         frame_index=62,

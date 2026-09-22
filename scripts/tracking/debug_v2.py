@@ -15,6 +15,11 @@ import cv2
 import numpy as np
 
 MAX_DRAW_COORDINATE = int(np.iinfo(np.int32).max) - 1
+TEAM_COLORS = {
+    0: (0, 90, 255),
+    1: (255, 140, 0),
+}
+NEUTRAL_COLOR = (160, 255, 160)
 
 
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
@@ -41,6 +46,11 @@ def color_for_track(raw_track_id: int) -> tuple[int, int, int]:
     """Return a stable, visible BGR color for a raw SAM track ID."""
     digest = hashlib.sha256(str(int(raw_track_id)).encode()).digest()
     return tuple(80 + byte % 176 for byte in digest[:3])
+
+
+def color_for_team(team_id: Any) -> tuple[int, int, int]:
+    """Return the deterministic team color, or neutral for unknown IDs."""
+    return TEAM_COLORS.get(team_id, NEUTRAL_COLOR) if type(team_id) is int else NEUTRAL_COLOR
 
 
 def _mask_path(mask_ref: Any, masks_dir: Path) -> Path | None:
@@ -144,7 +154,7 @@ def render_frame(frame: np.ndarray, rows: Iterable[dict[str, Any]], masks_dir: P
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
 
-        color = color_for_track(raw_id)
+        color = color_for_team(row.get("team_id"))
         mask = _load_mask(row, masks_dir, rendered.shape[:2])
         if mask is not None:
             overlay = rendered.copy()

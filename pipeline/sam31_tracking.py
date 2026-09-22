@@ -36,6 +36,7 @@ def normalize_multiplex_output(
     stable_player_ids: Mapping[int, str] | None = None,
     *,
     track_state: str = "tracked",
+    bbox_coordinate_space: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convert session objects into the V2 observation contract."""
 
@@ -43,19 +44,20 @@ def normalize_multiplex_output(
     rows = []
     for obj in objects:
         raw_track_id = int(obj["object_id"])
-        rows.append(
-            {
-                "observation_key": observation_key(frame_index, raw_track_id),
-                "frame_index": int(frame_index),
-                "timestamp_seconds": float(timestamp_seconds),
-                "raw_track_id": raw_track_id,
-                "stable_player_id": stable_player_ids.get(raw_track_id),
-                "bbox_xyxy": _xyxy(list(obj["bbox"]), str(obj.get("bbox_format", "xyxy"))),
-                "confidence": None if obj.get("confidence") is None else float(obj["confidence"]),
-                "probability": None if obj.get("probability") is None else float(obj["probability"]),
-                "track_state": track_state,
-            }
-        )
+        row = {
+            "observation_key": observation_key(frame_index, raw_track_id),
+            "frame_index": int(frame_index),
+            "timestamp_seconds": float(timestamp_seconds),
+            "raw_track_id": raw_track_id,
+            "stable_player_id": stable_player_ids.get(raw_track_id),
+            "bbox_xyxy": _xyxy(list(obj["bbox"]), str(obj.get("bbox_format", "xyxy"))),
+            "confidence": None if obj.get("confidence") is None else float(obj["confidence"]),
+            "probability": None if obj.get("probability") is None else float(obj["probability"]),
+            "track_state": track_state,
+        }
+        if bbox_coordinate_space is not None:
+            row["bbox_coordinate_space"] = bbox_coordinate_space
+        rows.append(row)
     return rows
 
 

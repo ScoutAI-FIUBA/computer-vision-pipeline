@@ -119,6 +119,47 @@
 
 ## Remaining Tasks
 
+- [x] BFloat16 ReID boundary remediation: BoxMOT 22.0.0 converts backend
+  tensors with `.cpu().numpy()` at `base_backend.py:215`; V2's surrounding SAM
+  CUDA autocast therefore made the tensor BFloat16 before BoxMOT's conversion.
+  `pipeline/reid.py` now disables CUDA autocast only around the BoxMOT call,
+  while retaining the defensive float conversion for direct tensor outputs and
+  the unchanged NumPy backend path. Added a project-boundary regression test.
+  Focused result: `tests/test_reid_backends.py` — 13 passed. Full result:
+  `.venv/bin/python -m pytest -q` — 461 passed, 1 skipped.
+
+- [ ] Task 5.3 native validation retry (2026-09-21): `.venv/bin/modal` completed
+  the exact game03 run on A100 and local rendering wrote/decoded 71 frames. Fresh
+  artifacts are complete for frames 60–130 with 709 masks and stable IDs on every
+  row, but `team_id` is absent, ReID evidence is `invalid_mask`, and manifest
+  acceptance remains `tracking_identity: unvalidated`; task remains pending.
+   Modal also logged two `max_num_objects=16` warnings. Full report:
+   `verify-report.md`.
+
+- [ ] Task 5.3 bounded native validation (2026-09-21, fresh attempt): executed
+  the exact requested `.venv/bin/modal` command. SAM propagation reached ReID,
+  but the remote process failed before artifact packaging with
+  `TypeError: Got unsupported ScalarType BFloat16` in BoxMOT's tensor-to-NumPy
+  conversion. The existing package was not treated as fresh evidence; local
+  debug rendering was regenerated successfully for frames 60–130. Focused
+  contract tests: `165 passed`. Full details: `verify-report.md`.
+
+- [ ] Task 5.3 verification update (2026-09-21): reran the required local
+  renderer after the failed native attempt. It wrote and decoded 71 debug
+  frames for source frames 60–130. The inspected pre-existing package has 709
+  rows/masks, 10 stable IDs, zero Team IDs, and `invalid_mask` ReID on every
+  row; it is not fresh native evidence and native settle remains rejected.
+
+- [ ] Task 5.3 fresh post-fix Modal validation (2026-09-21): reran the exact
+  requested command after the ReID remediation. SAM propagation completed, but
+  the remote process failed before packaging at
+  `pipeline/team_embedder.py:168` with `TypeError: Got unsupported ScalarType
+  BFloat16` while converting a TeamEmbedder tensor through NumPy. The existing
+  package was not treated as fresh evidence. Local debug rendering was
+  regenerated and decoded successfully: 71 frames, source frames 60–130.
+  Existing package inspection remains 709 rows/masks, 10 stable IDs, zero Team
+  IDs, and `invalid_mask` ReID on every row. Native settle remains rejected.
+
 - [x] 2.1–2.3 Artifact packaging and truthful runner adapter boundary.
 - [x] 2.4 Modal V2 wiring and raw artifact retrieval boundary.
 - [x] 2.5 Added controlled-fake process coverage for complete direct artifacts, lossless masks, manifest config/benchmark metadata, explicit size-limit failure, SAM cardinality errors, and existing local nested-path, acceptance, no-R2, no-debug-video, and legacy-isolation contracts.
@@ -129,7 +170,7 @@
 - [x] `sam31-session-compat-fix` corrected compatibility for SAM3 base `handle_request` request rebuilding, generalized per-keyword filtering, and added intermediate-signature coverage.
 - [x] `sam31-output-envelope` corrected official nested propagation output handling and empty-frame normalization without changing SAM3.1 upstream code.
 - [x] 3.1 Local renderer and focused synthetic artifact/video coverage.
-- [ ] 3.2 Validate `game_03`, approved prompts, and frames 60–130 with complete returned artifacts and identity-first acceptance.
+- [x] 3.2 Validate `game_03`, approved prompts, and frames 60–130 with complete returned artifacts and identity-first acceptance. Final fresh native run with runtime identity authority accepted stable identity, mask-authoritative ReID, and Team ID; 0.85 Team-majority diagnostics passed; 709/709 rows carried stable IDs, Team IDs, and ReID embeddings; debug video decoded 71/71 frames; focused tests passed 142 and full suite passed 488 with 1 skipped.
 - [x] 3.3 Record ordered conventional commits, verify unchanged `modal_app.py` rollback, and run `.venv/bin/python -m pytest`; create no PRs.
 
 ## Phase 3 Task 3.1 TDD Cycle Evidence
@@ -178,6 +219,71 @@
 - `sam31-session-compat-fix` changed only `modal_app_v2.py`, its focused fake-predictor tests, and this progress record; no upstream/legacy/R2/renderer/game files were touched.
 - `sam31-output-envelope` changed only `modal_app_v2.py`, `tests/test_modal_app_v2.py`, this progress record, and the task checkbox; no upstream/legacy/R2/renderer/game files were touched.
 
+## Explicit Runtime Identity Authority Follow-up
+
+- [x] 5.5 Added `IdentityAuthorityDecision` and the optional `identity_authority`
+  seam to `RunnerV2Seams`. `RuntimeIdentityAuthority` accepts only when every row
+  has stable identity, valid mask-authoritative ReID evidence, and an integer Team
+  ID, returning explicit metadata and check reasons.
+- [x] 5.5 Wired `PipelineV2.load_models()` to the concrete runtime authority. The
+  existing no-authority path remains `unvalidated`; authority rejection uses the
+  existing atomic derived-field scrub.
+- [x] 5.5 Added runner and Modal boundary coverage for accepted, rejected, and
+  no-authority states. The Team vote threshold remains the existing 0.85 policy.
+
+### TDD Cycle Evidence — Explicit Runtime Identity Authority
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 5.5 | `tests/test_runner_v2.py` | Unit | ✅ 67/67 | ✅ New authority imports/tests failed before implementation | ✅ 69 runner tests passed | ✅ Complete evidence acceptance and callback rejection/scrubbing | ✅ Optional seam preserves no-authority behavior |
+| 5.5 | `tests/test_modal_app_v2.py` | Modal boundary | ✅ 69/69 | ✅ Seam wiring/acceptance-state assertions failed before implementation | ✅ 60 Modal tests passed | ✅ Accepted, rejected, and unvalidated payload states | ✅ Boundary remains transport-only |
+
+### Verification Evidence — Explicit Runtime Identity Authority
+
+- Focused runner and Modal boundary tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py -q` → 129 passed.
+- Full repository tests: `.venv/bin/python -m pytest -q` → 483 passed, 1 skipped.
+
+## Runtime Stage Receipt Hardening
+
+- [x] 5.6 Added runner-owned `RuntimeStageReceipts` for stable identity, valid
+  mask-authoritative ReID, and Team ID processing. `RuntimeIdentityAuthority` now
+  requires all three receipts in addition to validating the derived evidence.
+- [x] 5.6 Added regressions for forged/prepopulated fields, complete receipts,
+  missing Team receipts, failure reasons, and atomic scrubbing. No-authority
+  callers remain `unvalidated`; the Team 0.85 policy is unchanged.
+
+### TDD Cycle Evidence — Runtime Stage Receipt Hardening
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 5.6 | `tests/test_runner_v2.py` | Unit | ✅ 72/72 | ✅ Forged/missing receipt assertions failed before receipt enforcement | ✅ 72 runner tests passed | ✅ Forged fields, complete receipts, and missing Team receipt | ✅ Runner-owned receipt sidecar; derived rows remain unchanged |
+
+### Verification Evidence — Runtime Stage Receipt Hardening
+
+- Focused runner and Modal boundary tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py -q` → 132 passed.
+- Full repository tests: `.venv/bin/python -m pytest -q` → 486 passed, 1 skipped.
+
+## Provenance-Enforced Receipts and Multi-Row Coverage
+
+- [x] 5.7 Added an opaque runner-private token to `RuntimeStageReceipts`; the
+  authority rejects externally/synthetically constructed receipt containers even
+  when their key sets are complete.
+- [x] 5.7 Added multi-row RunnerV2 acceptance coverage and a partial-stage failure
+  regression proving one missing row receipt rejects and scrubs every row. The
+  no-authority path and 0.85 Team policy remain unchanged.
+
+### TDD Cycle Evidence — Provenance-Enforced Receipts
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| 5.7 | `tests/test_runner_v2.py` | Unit | ✅ 74/74 | ✅ Synthetic receipt and multi-row regressions failed before provenance enforcement | ✅ 74 runner tests passed | ✅ All-row receipts, synthetic provenance, and partial failure scrubbing | ✅ Opaque token plus private receipt evolution method |
+
+### Verification Evidence — Provenance-Enforced Receipts
+
+- Focused runner tests: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` → 74 passed.
+- Focused runner and Modal boundary tests: `.venv/bin/python -m pytest tests/test_runner_v2.py tests/test_modal_app_v2.py -q` → 134 passed.
+- Full repository tests: `.venv/bin/python -m pytest -q` → 488 passed, 1 skipped.
+
 ## `prompt-render-style` Work Unit
 
 - Boundary: V2 default prompt and local debug renderer styling only; no pipeline or Modal behavior changes.
@@ -225,6 +331,348 @@
 
 - Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `51 passed`.
 - Full: `.venv/bin/python -m pytest -q` — `364 passed, 1 skipped`.
+
+## Post-completion Planning Follow-up — 2026-09-22
+
+- [ ] **SAM3 propagation quality gating (not a renderer workaround):** Add propagation-time gates for low mask fill inside the tracked bbox and sudden bbox-growth drift. Reject drift before downstream identity/ReID/Team acceptance, then deterministically reinitialize or refresh the track from a trusted detector seed/session state. Add focused regressions for low-fill rejection, abrupt-growth rejection, refresh/reinitialization, and normal propagation. Keep the change in the SAM3 tracking/runner quality boundary; do not modify renderer behavior or `scripts/tracking/debug_v2.py` to conceal drift.
+- **Planning-only status:** no production source or tests were modified in this step; completed task history and prior validation evidence remain unchanged.
+
+## Recommended Next Pipeline Task
+
+- **Task 8.1 — Define the versioned statistics contract and validate provenance:** specify event fields/status vocabulary and validate player-track, team, ball, and court-coordinate provenance, including unknown/lost states, before implementing additional shot or possession logic.
+- **Rationale:** tracking and team validation are accepted, and the roadmap explicitly names statistics detection as the next phase. A provenance-first contract is the highest-value next slice because it prevents shot, possession, and pass outputs from diverging or claiming attribution without evidence.
+- **Dependencies:** accepted SAM3.1 tracking/team artifacts, existing ball-signal output, and court homography/projected coordinates where available. Shot make/miss follows the contract; possession and passes remain downstream.
+
+## Task 5.3 Closure — Runtime Identity Authority — 2026-09-22
+
+- [x] Closed only task 5.3 after the final fresh `game_03` runtime validation.
+- Evidence is preserved in `verify-report.md`: runtime identity authority accepted
+  stable identity, mask-authoritative ReID, and Team ID; artifacts covered frames
+  60–130 with 709/709 rows and masks; debug decoding covered 71/71 frames.
+- The approved 0.85 Team-majority policy remains unchanged: player-004 passed at
+  65/70 (`0.9286`) and player-007 at 69/70 (`0.9857`), with zero unresolved
+  below-threshold conflicts.
+- No source code, runtime behavior, `modal_app.py`, notebook, or site-packages
+  files were changed.
+
+## Fresh Final Modal Validation — Runtime Identity Authority — 2026-09-22
+
+- [x] Reran the exact requested `.venv/bin/modal run modal_app_v2.py` command for
+  `game_03`, frames 60–130, with `--return-diagnostics`.
+- [x] Runtime acceptance was `authority=runtime_identity`, with stable identity,
+  mask-authoritative ReID, and Team ID all `passed`; `tracking_identity=accepted`
+  and `statistics=deferred`.
+- [x] Fresh artifacts: complete manifest, 71 frames, 709 rows, 10 raw IDs, 709
+  mask references/files with zero missing and 709 non-empty `1034×1882` masks,
+  709 stable IDs, 709 Team IDs, and 709 ReID embeddings.
+- [x] Team diagnostics passed the 0.85 majority policy: player-004 `65/70`
+  (`0.9286`) and player-007 `69/70` (`0.9857`); zero unresolved conflicts.
+- [x] Regenerated and decoded `debug.mp4`: 71/71 frames at `1882×1034`.
+- [x] Focused runtime/artifact tests: `142 passed`.
+- [x] Native settle accepted. Only `verify-report.md` and this progress record
+  were updated for this validation slice; source, `modal_app.py`, site-packages,
+  notebooks, and tests were not modified.
+
+## Final Fresh `game_03` Native Validation — 2026-09-22
+
+- [x] Ran the exact `.venv/bin/modal run modal_app_v2.py` command for frames 60–130 with `--return-diagnostics` against the current runtime identity-authority stage.
+- [x] Acceptance: `authority=runtime_identity`, `stable_identity=passed`, `mask_authoritative_reid=passed`, `team_id=passed`, `tracking_identity=accepted`, `statistics=deferred`.
+- [x] Artifacts: complete manifest, 71 frames, 709 rows, 10 raw/stable IDs, 709 masks, 709 stable IDs, 709 Team IDs, and 709 ReID embeddings.
+- [x] Team diagnostics: player-004 `65/70` cluster 0 (`0.9286`); player-007 `69/70` cluster 0 (`0.9857`); all other stable-player votes unambiguous; zero below-threshold conflicts.
+- [x] Regenerated and decoded `debug.mp4`: 71/71 frames at `1882×1034`.
+- [x] Verification: focused runtime/artifact tests `142 passed`; full suite `488 passed, 1 skipped`.
+- [x] Native settle accepted. Only `verify-report.md` and this progress record were updated for the validation slice.
+
+## Fresh 0.85-Majority Native Validation — 2026-09-22
+
+- [ ] Task 5.3 remains pending after the exact requested command with
+  `--return-diagnostics`. Modal completed successfully and returned
+  `tracking_identity: unvalidated` plus `statistics: deferred`.
+- Diagnostics confirmed `player-004` cluster votes `0:65, 1:5` (65/70 =
+  0.9286) and `player-007` cluster votes `0:69, 1:1` (69/70 = 0.9857). Both
+  were accepted as cluster 0 by the approved 0.85 majority policy.
+- There were **0 unresolved conflicts below 0.85**. All other stable players
+  had one cluster label only; no rows were rejected or atomically scrubbed by
+  the Team-majority decision.
+- Fresh artifacts are complete: 71 frames (60–130), 709 rows, 10 raw IDs,
+  709 mask references/files, 0 missing masks, and 709/709 non-empty full-frame
+  masks at 1882×1034.
+- Stable/ReID/Team evidence is present on every serialized row: 709/709
+  `stable_player_id`, 709/709 ReID embeddings, and 709/709 `team_id` values.
+  `player-004` and `player-007` are cluster 0 on all serialized rows.
+- Regenerated and decoded `debug.mp4`: 71/71 frames at 1882×1034.
+- Focused verification: `.venv/bin/python -m pytest tests/test_runner_v2.py
+  tests/test_modal_app_v2.py tests/test_results_artifacts.py -q` — `132 passed`.
+- Identity-first acceptance remains unproven: `RunnerV2` reports
+  `tracking_identity: unvalidated` without an identity-authority acceptance
+  stage. Final native acceptance is **FAIL / PENDING**, despite the passing
+  0.85 Team-majority decisions.
+- Fresh evidence revision:
+  `sha256:caa7b8518eafdea345c2a92a8e0f2aeabb23950e82e06c49183d56f0ef6d9099`.
+- Only `verify-report.md` and this progress record were updated; source,
+  `modal_app.py`, site-packages, and notebooks remain untouched.
+
+## `stable-player-team-vote-threshold` Work Unit
+
+- Boundary: Apply the approved stable-player Team resolution policy only in the
+  V2 stable-first path. A dominant cluster label is accepted at a minimum 0.85
+  vote share; lower shares and ties remain rejected. Preserve mask-only gating,
+  diagnostics, stable-first aggregation, and atomic scrubbing.
+- Delivery: Bounded local remediation; no commit or PR.
+- Scope guard: `modal_app.py`, notebooks, and site-packages remain untouched.
+
+### Completed
+
+- [x] Added focused V2 regressions for 65/70 and 69/70 accepted votes and a
+  below-threshold ambiguous distribution rejected with derived-field scrubbing.
+- [x] Added the explicit `STABLE_PLAYER_TEAM_VOTE_SHARE_THRESHOLD = 0.85`
+  policy constant and applied it to V2 stable-player resolution without changing
+  the legacy `identify_teams` default behavior.
+- [x] Kept diagnostics captured before rejection scrubbing and changed conflict
+  detection to reject only unresolved vote decisions, allowing accepted dominant
+  votes with minority labels.
+- [x] Updated the Team clustering specification and task record with the 0.85
+  acceptance/rejection scenarios.
+
+### TDD Cycle Evidence
+
+| Scope | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| Stable-player Team vote threshold | `tests/test_runner_v2.py` | Unit | ✅ 65 existing runner tests | ✅ 2 new acceptance tests failed before policy change | ✅ 67 focused runner tests passed | ✅ 65/70, 69/70, and 59/70 with atomic scrubbing | ✅ Reused existing vote diagnostics and stable aggregation; no new config surface |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `67 passed`.
+
+## `return-diagnostics` Review Follow-up
+
+- [x] Added a same-input Modal V2 boundary regression with a conflicting Team
+  result. `return_diagnostics=False` remains the unchanged rejected response;
+  `return_diagnostics=True` preserves the exact same `acceptance` mapping and
+  adds only `debug_diagnostics` with the Team vote evidence.
+- [x] No production implementation change was required beyond the existing
+  explicit opt-in response path. The existing `SETUP.md` V2 operator note
+  documents `--return-diagnostics`; no additional documentation change was
+  needed.
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_modal_app_v2.py -q` — `57 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `475 passed, 1 skipped`.
+
+## `team-mask-validation-fail-closed` Work Unit
+
+- Boundary: Validate every explicit `player_mask` as a finite 2-D boolean or
+  numeric array matching the bbox ROI shape before mask extraction; reject
+  non-array-like, string/object, non-finite, 3-D, and mismatched masks without
+  bbox fallback. Omitted masks retain existing torso behavior. `modal_app.py`,
+  site-packages, and notebooks remain untouched.
+- Delivery: Bounded local remediation; no commit or PR.
+
+### Completed
+
+- [x] Added focused regressions for non-array-like, 3-D, NaN/non-finite,
+  string/object, and shape-mismatched explicit masks.
+- [x] Added finite dtype/shape validation while preserving valid boolean and
+  numeric 2-D masks and no-mask compatibility.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `team-mask-validation-fail-closed` | `tests/test_team_id.py` | Unit | ✅ 28 passed | ✅ 5 malformed-mask cases failed before implementation | ✅ 35 focused tests passed | ✅ Boolean/numeric valid masks plus six malformed categories | ✅ Central validation before bool coercion/fallback |
+
+### Verification
+
+- Focused malformed masks: `.venv/bin/python -m pytest tests/test_team_id.py -q -k malformed_masks` — `6 passed`.
+- Focused Team ID suite: `.venv/bin/python -m pytest tests/test_team_id.py -q` — `35 passed`.
+
+## Fresh Post-Fix Native Validation — 2026-09-21
+
+- [ ] Task 5.3 remains pending after the exact requested command:
+  `.venv/bin/modal run modal_app_v2.py --video-path
+  "dataset-tracknet/train/game_03/video/clip_003.mp4" --output-dir
+  "outputs/sam31/game_03-court-prompt" --frame-start 60 --frame-end 130`.
+- Modal process completion and packaging passed: `[v2] progress=100`, complete
+  manifest, 71 frames (60–130), 709 track rows, 709 mask references/files, and
+  zero missing masks. Acceptance was `tracking_identity: rejected` and
+  `statistics: deferred`.
+- Fresh manifest rejection reasons were three stable-first Team conflicts:
+  `player-004`, `player-007`, and `player-010`.
+- Atomic rejection left 0/709 serialized stable IDs, 0/709 Team IDs, and 0/709
+  ReID evidence. Raw tracking used 10 IDs; IDs 0–8 span frames 60–130 and ID 9
+  spans 61–130. This cannot establish stable identity or contamination-free
+  association without accepted derived evidence.
+- Regenerated and decoded `outputs/sam31/game_03-court-prompt/debug.mp4`:
+  71/71 frames, 1882×1034. Native settle remains rejected.
+
+## `team-embedder-bfloat16` Work Unit
+
+- Boundary: Convert tensor Team features to float32 before the NumPy boundary;
+  preserve device transfer, normalization, mask-authoritative extraction, and
+  existing NumPy outputs. `modal_app.py`, site-packages, and notebooks remain
+  untouched. No commit or PR.
+
+### Completed
+
+- [x] Added a focused BFloat16 TeamEmbedder regression test.
+- [x] Convert tensor features with `detach().float().cpu().numpy()` before
+  normalization while retaining the existing NumPy path.
+
+## Fresh Post-Fix Native Validation Rerun — 2026-09-22
+
+- [ ] Task 5.3 remains pending after the exact requested Modal command. The
+  process completed and packaged complete artifacts for frames 60–130: 71
+  frames, 709 track rows, 10 raw IDs, 709 mask references/files, zero missing
+  masks, and 709 non-empty full-frame mask decodes.
+- Acceptance remains rejected with stable-first conflicts for `player-004`,
+  `player-007`, and `player-010`. Atomic rejection serialized 0/709
+  `stable_player_id`, 0/709 `team_id`, and 0/709 ReID evidence fields.
+- Raw ID spans are IDs 0–8 over frames 60–130 and ID 9 over 61–130; this does
+  not establish accepted stable identity or contamination-free association.
+- Local `debug_v2.py` regeneration and OpenCV decode passed: 71/71 frames at
+  1882×1034. Native settle remains rejected.
+- Only `verify-report.md` and this progress record were updated for this slice;
+  source, `modal_app.py`, site-packages, and notebooks remain untouched.
+
+## Final Fresh Native Validation with Diagnostics — 2026-09-22
+
+- [ ] Task 5.3 remains pending after the exact requested command with
+  `--return-diagnostics`. Modal completed and returned `statistics: deferred` plus
+  `tracking_identity: rejected`.
+- Exact stable-player vote distributions: `player-001 {"1": 71}/71`,
+  `player-002 {"1": 71}/71`, `player-003 {"0": 71}/71`,
+  `player-004 {"0": 65, "1": 5}/70`, `player-005 {"1": 71}/71`,
+  `player-006 {"1": 71}/71`, `player-007 {"0": 69, "1": 1}/70`,
+  `player-008 {"1": 71}/71`, `player-009 {"0": 71}/71`, and
+  `player-010 {"0": 70}/70`.
+- The fresh diagnostic conflict labels are only `player-004` and `player-007`;
+  `player-010` is unambiguous (`{"0": 70}`). Atomic rejection leaves 0/709
+  serialized stable IDs, Team IDs, and ReID fields.
+- Complete artifacts passed: 71 frames (60–130), 709 track rows, 709 mask
+  references/files, 0 missing, and 709/709 valid non-empty 2-D masks. Debug video
+  regeneration and decode passed for 71/71 frames at 1882×1034.
+- Native settle remains **rejected**. Only `verify-report.md` and this progress
+  record were updated for this validation slice; source, `modal_app.py`,
+  site-packages, and notebooks were not modified.
+
+## `team-mask-fail-closed` Work Unit
+
+- Boundary: Explicit `player_mask` inputs are authoritative; bbox remains only
+  the crop ROI. Empty or invalid masks reject the Team sample without invoking
+  `visible_torso` fallback. Callers that omit a mask retain the existing torso
+  behavior. `modal_app.py`, site-packages, and notebooks remain untouched.
+- Delivery: Bounded local remediation; no commit or PR.
+
+### Completed
+
+- [x] Added focused regressions for empty and shape-invalid masks, including a
+  guard that fails if bbox torso fallback is called.
+- [x] Return a rejected feature for an explicit mask with no valid uniform
+  pixels; preserve mask-authoritative behavior and no-mask compatibility.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `team-mask-fail-closed` | `tests/test_team_id.py` | Unit | ✅ 26 passed | ✅ Empty mask reached `visible_torso` fallback | ✅ 28 focused tests passed | ✅ Empty and shape-invalid masks; existing no-mask torso case retained | ✅ One early rejection after mask validation |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_team_id.py -q` — `28 passed`.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `team-embedder-bfloat16` | `tests/test_team_id.py` | Unit | ✅ 25 passed | ✅ BFloat16 conversion raised `TypeError` | ✅ 26 focused tests passed | ✅ Existing NumPy output case retained | ✅ Small tensor-boundary guard |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_team_id.py -q` — `26 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `462 passed, 1 skipped`.
+
+## `sam31-reid-bfloat16` Work Unit
+
+- Boundary: Convert tensor ReID embeddings to float32 at the shared `OsnetEmbedder` NumPy boundary; preserve ordinary NumPy and CPU/GPU behavior. `modal_app.py` and notebooks remain untouched.
+- Delivery: Bounded local remediation; no commit or PR.
+
+### Completed
+
+- [x] Added a BFloat16 regression test using the locally supported PyTorch runtime.
+- [x] Convert tensor outputs with `detach().float().cpu().numpy()` before normalization; retain the existing NumPy path for ordinary array outputs.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|---|---|---|---|---|---|---|---|
+| `sam31-reid-bfloat16` | `tests/test_reid_backends.py` | Unit | ✅ 11 passed | ✅ BFloat16 conversion raised `TypeError` | ✅ 12 passed | ✅ Existing NumPy/backend cases retained | ✅ Small shared tensor boundary guard |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_reid_backends.py tests/test_runner_v2.py -q` — `74 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `460 passed, 1 skipped`.
+
+## Bounded Normalized-Bbox Remediation
+
+- [x] Corrected `MaskAppearanceAdapter` at the shared crop boundary: SAM3
+  normalized `[0, 1]` `bbox_xyxy` values are scaled by the current frame shape;
+  pixel-coordinate boxes remain unchanged, and masks remain authoritative with
+  no bbox-only fallback.
+- [x] Added focused regression coverage for normalized conversion and pixel bbox
+  compatibility in `tests/test_runner_v2.py`.
+
+### TDD Cycle Evidence
+
+| Scope | Test File | RED | GREEN | REFACTOR |
+|---|---|---|---|---|
+| Normalized/pixel bbox adapter compatibility | `tests/test_runner_v2.py` | ✅ Normalized ROI regression failed before fix | ✅ Focused and full suites passed | ✅ Shared adapter fix; no caller changes |
+
+### Verification
+
+- Focused: `.venv/bin/python -m pytest tests/test_runner_v2.py -q` — `58 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `453 passed, 1 skipped`.
+
+## Coordinate-Domain Review Blocker Remediation
+
+- [x] Replaced ambiguous all-`[0,1]` inference with an explicit optional
+  `bbox_coordinate_space` signal. SAM3 V2 runtime rows mark `normalized`,
+  while rows without a signal retain pixel-coordinate compatibility, including
+  the valid pixel boundary `[0, 0, 1, 1]`.
+- [x] Reject malformed/non-finite explicit normalized coordinates and preserve
+  mask-authoritative zeroing/no bbox-only fallback. The runtime signal is
+  removed before result/artifact serialization to preserve existing contracts.
+- [x] Added focused tests for explicit normalized conversion, pixel boundary,
+  malformed/mixed/non-finite inputs, signal propagation, and masked output.
+
+### TDD Cycle Evidence
+
+| Scope | Test File | RED | GREEN | REFACTOR |
+|---|---|---|---|---|
+| Coordinate-domain ambiguity blocker | `tests/test_runner_v2.py`, `tests/test_sam31_tracking.py`, `tests/test_modal_app_v2.py` | ✅ Boundary and explicit-signal tests failed before fix | ✅ Relevant 124 tests and full 458-test suite passed | ✅ Optional signal, pixel default, and serialization stripping kept local |
+
+### Verification
+
+- Relevant: `.venv/bin/python -m pytest tests/test_modal_app_v2.py tests/test_runner_v2.py tests/test_sam31_tracking.py -q` — `124 passed`.
+- Full: `.venv/bin/python -m pytest -q` — `458 passed, 1 skipped`.
+
+## Coordinate-Domain Serialization Review Follow-up
+
+- [x] Added runtime and direct artifact regressions: SAM3 rows carry
+  `bbox_coordinate_space: "normalized"` before serialization, while
+  `tracks.jsonl` omits the runtime-only field.
+- TDD: serialization test failed before the guard; focused `132 passed`, full
+  `459 passed, 1 skipped`; signal and stripping remain at their boundaries.
+
+## Final Normalized-Behavior Review Follow-up
+
+- [x] Strengthened the SAM3 V2 fixture with genuine normalized `[0,1]` XYWH
+  values and asserted normalized XYXY output plus pixel ROI/crop conversion.
+- [x] No renderer change was needed: artifact serialization intentionally strips
+  the runtime signal, and the existing renderer contract already covers its
+  normalized/pixel compatibility behavior.
+- Verification: focused V2/artifact/renderer suite `172 passed`; full suite
+  `459 passed, 1 skipped`.
 
 ## Task 3.4 Work Unit
 

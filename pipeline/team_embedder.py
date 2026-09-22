@@ -165,10 +165,9 @@ class SiglipTeamEmbedder:
         inputs = self._torch.stack([self._transform(image) for image in images]).to(self.device)
         with self._torch.inference_mode():
             features = self._model.encode_image(inputs) if self._uses_open_clip else self._model(inputs)
-        array = self._np.asarray(
-            features.detach().cpu() if hasattr(features, "detach") else features,
-            dtype=self._np.float32,
-        )
+        if hasattr(features, "detach"):
+            features = features.detach().float().cpu().numpy()
+        array = self._np.asarray(features, dtype=self._np.float32)
         norms = self._np.clip(self._np.linalg.norm(array, axis=1, keepdims=True), 1e-12, None)
         normalized = array / norms
 
@@ -245,9 +244,21 @@ def _extract_uniform_region(frame, xyxy, player_mask, other_boxes, config: ReidC
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return None, None, None, quality_details, ["empty_crop"], True
-        mask = np.asarray(player_mask).astype(bool)
-        if mask.shape[:2] != crop.shape[:2]:
+        try:
+            mask = np.asarray(player_mask)
+        except (TypeError, ValueError):
+            return None, None, None, quality_details, ["mask_not_array_like"], True
+        if mask.ndim == 0:
+            return None, None, None, quality_details, ["mask_not_array_like"], True
+        if mask.ndim != 2:
+            return None, None, None, quality_details, ["mask_not_2d"], True
+        if not (np.issubdtype(mask.dtype, np.bool_) or np.issubdtype(mask.dtype, np.number)):
+            return None, None, None, quality_details, ["mask_not_numeric"], True
+        if not np.isfinite(mask).all():
+            return None, None, None, quality_details, ["mask_non_finite"], True
+        if mask.shape != crop.shape[:2]:
             return None, None, None, quality_details, ["mask_shape_mismatch"], True
+        mask = mask.astype(bool)
         height, width = crop.shape[:2]
         rx1 = max(0, int(round(width * 0.18)))
         rx2 = min(width, int(round(width * 0.82)))
@@ -261,6 +272,7 @@ def _extract_uniform_region(frame, xyxy, player_mask, other_boxes, config: ReidC
         if uniform_mask.any():
             return uniform_crop, uniform_mask, (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2), quality_details, rejection_reasons, True
         rejection_reasons.append("empty_uniform_mask")
+        return None, None, None, quality_details, rejection_reasons, True
 
     region = visible_torso(frame.shape, xyxy, other_boxes, config)
     if region is None:

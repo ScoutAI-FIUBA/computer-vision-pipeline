@@ -84,6 +84,7 @@ class OsnetEmbedder:
 
     def embed(self, frame, boxes: list[list[float]]) -> list[list[float] | None]:
         import numpy as np
+        import torch
 
         if not boxes:
             return []
@@ -103,9 +104,17 @@ class OsnetEmbedder:
         # NOTE: the argument order is (frame, boxes). Reversing it does NOT
         # raise — it silently returns one row per image pixel-row instead of one
         # per box. Verified against boxmot 22.0.0.
-        features = self._model(frame, np.asarray([boxes[index] for index in keep], dtype=float))
+        # BoxMOT 22.0.0 converts its internal output with `.cpu().numpy()`.
+        # SAM's CUDA autocast scope otherwise makes that tensor bfloat16 first.
+        with torch.autocast(device_type="cuda", enabled=False):
+            features = self._model(frame, np.asarray([boxes[index] for index in keep], dtype=float))
 
-        features = np.asarray(features, dtype=np.float32)
+        if hasattr(features, "detach"):
+            # NumPy does not support torch.bfloat16; keep CPU/GPU tensor handling
+            # in the shared ReID boundary before crossing into NumPy.
+            features = features.detach().float().cpu().numpy()
+        else:
+            features = np.asarray(features, dtype=np.float32)
         norms = np.clip(np.linalg.norm(features, axis=1, keepdims=True), 1e-12, None)
         for position, index in enumerate(keep):
             results[index] = (features[position] / norms[position]).tolist()

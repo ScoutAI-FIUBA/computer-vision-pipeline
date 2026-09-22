@@ -15,7 +15,8 @@ Stable identity resolves before team clustering; statistics remain deferred.
 | Mask authority | One `MaskAppearanceAdapter` at the runner boundary validates shape/non-empty pixels, zeroes outside the mask, and passes only masked ROI evidence. | Changing `reid.py` or duplicating team extraction would fork tested contracts. |
 | Identity | Implement the explicit resolver behind `RunnerV2Seams.identity`: deterministic stable IDs, `similarity_threshold=0.90`, `max_frame_gap=5`, and ambiguous cases fragment. If the seam is absent, identity remains unvalidated/rejected; no resolver is synthesized. Duplicate observation keys reject before authority invocation. | Geometry-only continuity can contaminate another player, violating fragmentation-first safety. |
 | Team order | Run `TeamEmbedder`/`identify_teams` only for valid, stably identified rows; aggregate labels by stable ID and commit only when each ID has one label. | Raw-track voting allows SAM fragmentation to create conflicting assignments. |
-| Rejection | Treat identity/team validation as one transaction; scrub `stable_player_id`, `reid_embedding`, and `team_id` on rejection while retaining raw rows and artifacts. | Partial derived output is unsafe for downstream joins. |
+| Rejection | Treat identity/team/authority validation as one transaction; scrub `stable_player_id`, `reid_embedding`, and `team_id` on rejection while retaining raw rows and artifacts. | Partial derived output is unsafe for downstream joins. |
+| Acceptance authority | Add an optional explicit post-stage `identity_authority` seam returning a decision, metadata, and reasons. Wire the V2 Modal runtime to the concrete authority; absent callers remain `unvalidated`. | Field presence is evidence, not authority, and must not silently become acceptance. |
 
 ## Data Flow
 
@@ -53,13 +54,37 @@ class MaskAppearanceAdapter(Protocol):
 
 class IdentityResolver(Protocol):
     def __call__(self, rows: list[dict]) -> Mapping[str, str]: ...
+
+
+class IdentityAuthority(Protocol):
+    def __call__(self, rows: list[dict], receipts: RuntimeStageReceipts) -> IdentityAuthorityDecision: ...
+
+
+@dataclass(frozen=True)
+class RuntimeStageReceipts:
+    stable_identity: frozenset[str]
+    reid: frozenset[str]
+    team: frozenset[str]
+
+
+@dataclass(frozen=True)
+class IdentityAuthorityDecision:
+    accepted: bool
+    reasons: tuple[str, ...]
+    metadata: Mapping[str, Any]
 ```
 
 The adapter accepts only a 2-D mask matching `frame.shape[:2]` with nonzero pixels.
 It supplies a crop-local mask to the existing team contract and a masked frame to the
 existing ReID contract. Any invalid mask returns no feature. Accepted records retain
 `raw_track_id`, `stable_player_id`, and `team_id`; rejected records retain raw fields,
-`bbox_xyxy`, and `mask_ref` only. `statistics: deferred` remains explicit.
+`bbox_xyxy`, and `mask_ref` only. The optional authority stage is the only path to
+`tracking_identity: accepted`; without it, a structurally valid result remains
+`unvalidated`. `statistics: deferred` remains explicit. Receipts are created by
+the runner only when the corresponding runtime stage processes a row successfully;
+prepopulated derived fields do not create receipts. The receipt container carries
+an opaque runner-private provenance token, and the authority rejects containers
+without that token, including synthetic containers with complete key sets.
 
 ## Testing Strategy
 

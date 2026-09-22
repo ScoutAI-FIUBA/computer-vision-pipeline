@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pipeline.reid import (  # noqa: E402
     ColourEmbedder,
     NullEmbedder,
+    OsnetEmbedder,
     build_embedder,
     occlusion_fraction,
 )
@@ -93,3 +94,28 @@ def test_build_embedder_falls_back_when_boxmot_is_absent(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", fail_on_boxmot)
     assert isinstance(build_embedder("osnet"), ColourEmbedder)
+
+
+def test_osnet_embed_converts_bfloat16_features_before_numpy():
+    torch = pytest.importorskip("torch")
+    embedder = object.__new__(OsnetEmbedder)
+    embedder._model = lambda frame, boxes: torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16)
+
+    assert embedder.embed(np.zeros((2, 2, 3), dtype=np.uint8), [[0, 0, 2, 2]]) == [
+        pytest.approx([0.6, 0.8])
+    ]
+
+
+def test_osnet_embed_disables_cuda_autocast_at_boxmot_boundary(monkeypatch):
+    torch = pytest.importorskip("torch")
+    embedder = object.__new__(OsnetEmbedder)
+    seen = []
+
+    def model(frame, boxes):
+        seen.append(torch.is_autocast_enabled("cuda"))
+        return torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16)
+
+    embedder._model = model
+    embedder.embed(np.zeros((2, 2, 3), dtype=np.uint8), [[0, 0, 2, 2]])
+
+    assert seen == [False]

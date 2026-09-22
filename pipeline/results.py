@@ -167,7 +167,7 @@ def package_artifacts(
 
     tracks_path = output_dir / "tracks.jsonl"
     tracks_path.write_text(
-        "".join(json.dumps(dict(row), sort_keys=True) + "\n" for row in rows),
+        "".join(json.dumps({key: value for key, value in row.items() if key != "bbox_coordinate_space"}, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
 

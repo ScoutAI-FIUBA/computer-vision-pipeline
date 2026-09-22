@@ -8,9 +8,12 @@ import numpy as np
 
 from pipeline.runner_v2 import (
     ConservativeStableIdentityResolver,
+    IdentityAuthorityDecision,
     MaskAppearanceAdapter,
     RunnerV2,
     RunnerV2Seams,
+    RuntimeStageReceipts,
+    RuntimeIdentityAuthority,
 )
 from pipeline.team_embedder import TeamFeatures
 
@@ -113,6 +116,229 @@ def test_runner_without_identity_authority_remains_rejected_without_synthetic_id
     assert "stable_player_id" not in result.observations[0]
 
 
+def test_explicit_identity_authority_accepts_complete_runtime_evidence():
+    class FakeEmbedder:
+        def embed(self, _frame, boxes):
+            return [[3.0, 4.0] for _ in boxes]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[float(sample.track_id)], embedding=None) for sample in samples]
+
+    class FakeClusterer:
+        name = "fake-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0]
+
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=resolve,
+            reid=FakeEmbedder(),
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=FakeClusterer(),
+            identity_authority=RuntimeIdentityAuthority(),
+        )
+    ).run(
+        [row()],
+        frames_by_index={60: np.ones((24, 12, 3), dtype=np.uint8)},
+        masks_by_observation={"60:3": np.ones((24, 12), dtype=bool)},
+    )
+
+    assert result.acceptance == {
+        "tracking_identity": "accepted",
+        "statistics": "deferred",
+        "authority": "runtime_identity",
+        "checks": {
+            "stable_identity": "passed",
+            "mask_authoritative_reid": "passed",
+            "team_id": "passed",
+        },
+    }
+    assert result.acceptance_reasons == [
+        "stable_identity_resolved",
+        "mask_authoritative_reid_verified",
+        "team_id_resolved",
+    ]
+    assert result.observations[0]["team_id"] == 0
+
+
+def test_explicit_identity_authority_rejection_scrubs_derived_fields_atomically():
+    def reject(_rows, _receipts):
+        return IdentityAuthorityDecision(
+            accepted=False,
+            reasons=("identity_authority_rejected:test",),
+            metadata={"authority": "test"},
+        )
+
+    result = RunnerV2(
+        RunnerV2Seams(identity=resolve, identity_authority=reject)
+    ).run([row()])
+
+    assert result.acceptance == {"tracking_identity": "rejected", "statistics": "deferred"}
+    assert result.acceptance_reasons == ["identity_authority_rejected:test"]
+    assert result.downstream == {}
+    assert result.observations == [{key: value for key, value in row().items() if key != "stable_player_id"}]
+
+
+def test_runtime_authority_rejects_forged_prepopulated_stage_fields():
+    forged = {
+        **row(),
+        "stable_player_id": "player-3",
+        "reid_embedding": [1.0, 0.0],
+        "reid_evidence": {"status": "valid"},
+        "team_id": 0,
+    }
+
+    result = RunnerV2(
+        RunnerV2Seams(identity=resolve, identity_authority=RuntimeIdentityAuthority())
+    ).run([forged])
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == [
+        "identity_authority:missing_stage_receipt:reid:60:3",
+        "identity_authority:missing_stage_receipt:team:60:3",
+    ]
+    assert all(
+        not {"stable_player_id", "reid_embedding", "reid_evidence", "team_id"}.intersection(observation)
+        for observation in result.observations
+    )
+
+
+def test_runtime_authority_rejects_external_synthetic_receipts():
+    observation = {
+        **row(),
+        "stable_player_id": "player-3",
+        "reid_embedding": [1.0, 0.0],
+        "reid_evidence": {"status": "valid"},
+        "team_id": 0,
+    }
+
+    decision = RuntimeIdentityAuthority()(
+        [observation],
+        RuntimeStageReceipts(
+            stable_identity=frozenset({"60:3"}),
+            reid=frozenset({"60:3"}),
+            team=frozenset({"60:3"}),
+        ),
+    )
+
+    assert decision.accepted is False
+    assert decision.reasons == ("identity_authority:invalid_stage_receipts",)
+
+
+def test_runtime_authority_reports_missing_stage_receipt_reason():
+    observation = {
+        **row(),
+        "stable_player_id": "player-3",
+        "reid_embedding": [1.0, 0.0],
+        "reid_evidence": {"status": "valid"},
+        "team_id": 0,
+    }
+
+    decision = RuntimeIdentityAuthority()(
+        [observation],
+        RuntimeStageReceipts(
+            stable_identity=frozenset({"60:3"}),
+            reid=frozenset({"60:3"}),
+        ),
+    )
+
+    assert decision.accepted is False
+    assert decision.reasons == ("identity_authority:invalid_stage_receipts",)
+
+
+def test_explicit_identity_authority_requires_receipts_for_every_row():
+    class FakeEmbedder:
+        def embed(self, _frame, boxes):
+            return [[3.0, 4.0] for _ in boxes]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[float(sample.track_id)], embedding=None) for sample in samples]
+
+    class FakeClusterer:
+        name = "fake-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0, 1]
+
+    observations = [row(raw_track_id=3), row(raw_track_id=4)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=resolve,
+            reid=FakeEmbedder(),
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=FakeClusterer(),
+            identity_authority=RuntimeIdentityAuthority(),
+        )
+    ).run(
+        observations,
+        frames_by_index={60: np.ones((24, 12, 3), dtype=np.uint8)},
+        masks_by_observation={key: np.ones((24, 12), dtype=bool) for key in ("60:3", "60:4")},
+    )
+
+    assert result.acceptance["tracking_identity"] == "accepted"
+    assert result.acceptance_reasons == [
+        "stable_identity_resolved",
+        "mask_authoritative_reid_verified",
+        "team_id_resolved",
+    ]
+    assert {row["observation_key"] for row in result.observations} == {"60:3", "60:4"}
+
+
+def test_partial_runtime_stage_failure_rejects_and_scrubs_all_rows():
+    class FakeEmbedder:
+        def embed(self, _frame, boxes):
+            return [[3.0, 4.0] for _ in boxes]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class FakeClusterer:
+        name = "fake-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0]
+
+    observations = [row(raw_track_id=3), row(frame_index=61, raw_track_id=4)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=resolve,
+            reid=FakeEmbedder(),
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=FakeClusterer(),
+            identity_authority=RuntimeIdentityAuthority(),
+        )
+    ).run(
+        observations,
+        frames_by_index={
+            60: np.ones((24, 12, 3), dtype=np.uint8),
+            61: np.ones((24, 12, 3), dtype=np.uint8),
+        },
+        masks_by_observation={
+            "60:3": np.ones((24, 12), dtype=bool),
+            "61:4": np.zeros((24, 12), dtype=bool),
+        },
+    )
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert "identity_authority:missing_stage_receipt:reid:61:4" in result.acceptance_reasons
+    assert "identity_authority:missing_stage_receipt:team:61:4" in result.acceptance_reasons
+    assert result.downstream == {}
+    assert all(
+        not {"stable_player_id", "reid_embedding", "reid_evidence", "team_id"}.intersection(observation)
+        for observation in result.observations
+    )
+
+
 def test_duplicate_observation_keys_are_rejected_before_identity_authority_runs():
     def should_not_run(_rows):
         raise AssertionError("identity authority must not receive duplicate keys")
@@ -178,6 +404,51 @@ def test_mask_adapter_returns_masked_roi_and_deterministic_metadata():
         "crop_shape": (4, 4),
         "mask_pixel_count": 4,
     }
+
+
+def test_mask_adapter_converts_normalized_bbox_to_pixel_roi():
+    frame = np.full((4, 5, 3), 7, dtype=np.uint8)
+    mask = np.zeros((4, 5), dtype=bool)
+    mask[1:3, 1:4] = True
+    mask[1, 2] = False
+
+    crop = MaskAppearanceAdapter().crop(
+        frame, [0.2, 0.25, 0.8, 0.75], mask, coordinate_space="normalized"
+    )
+
+    assert crop is not None
+    assert crop.bbox_xyxy == (1, 1, 4, 3)
+    assert np.array_equal(crop.image[0, 1], [0, 0, 0])
+
+
+def test_mask_adapter_keeps_unit_pixel_bbox_as_pixels():
+    frame = np.ones((4, 5, 3), dtype=np.uint8)
+    mask = np.zeros((4, 5), dtype=bool)
+    mask[0, 0] = True
+
+    crop = MaskAppearanceAdapter().crop(frame, [0, 0, 1, 1], mask)
+
+    assert crop is not None
+    assert crop.bbox_xyxy == (0, 0, 1, 1)
+
+
+@pytest.mark.parametrize("bbox", [[0.1, 0.2, 20, 30], [np.nan, 0, 1, 1], [0, 0, np.inf, 1]])
+def test_mask_adapter_rejects_malformed_explicit_normalized_bbox(bbox):
+    frame = np.ones((4, 5, 3), dtype=np.uint8)
+    mask = np.ones((4, 5), dtype=bool)
+
+    assert MaskAppearanceAdapter().crop(frame, bbox, mask, coordinate_space="normalized") is None
+
+
+def test_mask_adapter_preserves_pixel_bbox_compatibility():
+    frame = np.ones((4, 5, 3), dtype=np.uint8)
+    mask = np.zeros((4, 5), dtype=bool)
+    mask[1:3, 2:4] = True
+
+    crop = MaskAppearanceAdapter().crop(frame, [1, 0, 5, 4], mask)
+
+    assert crop is not None
+    assert crop.bbox_xyxy == (1, 0, 5, 4)
 
 
 def test_mask_adapter_zeros_every_pixel_outside_mask():
@@ -436,6 +707,77 @@ def test_same_stable_player_with_conflicting_team_assignments_is_rejected():
     ]
 
 
+def test_rejected_team_conflict_preserves_runtime_vote_diagnostics():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class ConflictingClusterer:
+        name = "conflicting-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0, 1, 1]
+
+    observations = [
+        row(frame_index=60, raw_track_id=3),
+        row(frame_index=61, raw_track_id=4),
+        row(frame_index=62, raw_track_id=5),
+    ]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=ConflictingClusterer(),
+        )
+    ).run(
+        observations,
+        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in (60, 61, 62)},
+        masks_by_observation={
+            f"{index}:{raw_id}": np.ones((24, 12), dtype=bool)
+            for index, raw_id in ((60, 3), (61, 4), (62, 5))
+        },
+    )
+
+    assert result.runtime_diagnostics == {
+        "debug_runtime_only": True,
+        "team_vote_diagnostics": {
+            "player-7": {"cluster_votes": {"0": 1, "1": 2}, "total_samples": 3}
+        },
+    }
+    assert result.acceptance["tracking_identity"] == "rejected"
+
+
+def test_runtime_vote_diagnostics_are_bounded_to_observed_stable_players():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[float(sample.track_id)], embedding=None) for sample in samples]
+
+    class StableClusterer:
+        name = "stable-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [2, 2]
+
+    result = RunnerV2(
+        RunnerV2Seams(identity=resolve, team_embedder=FakeTeamEmbedder(), team_clusterer=StableClusterer())
+    ).run(
+        [row(frame_index=60, raw_track_id=3), row(frame_index=61, raw_track_id=3)],
+        frames_by_index={60: np.ones((24, 12, 3), dtype=np.uint8), 61: np.ones((24, 12, 3), dtype=np.uint8)},
+        masks_by_observation={
+            "60:3": np.ones((24, 12), dtype=bool),
+            "61:3": np.ones((24, 12), dtype=bool),
+        },
+    )
+
+    assert result.runtime_diagnostics["team_vote_diagnostics"] == {
+        "player-3": {"cluster_votes": {"2": 2}, "total_samples": 2}
+    }
+
+
 def test_same_stable_player_with_consistent_team_assignments_is_retained():
     class FakeTeamEmbedder:
         name = "fake-team"
@@ -470,6 +812,78 @@ def test_same_stable_player_with_consistent_team_assignments_is_retained():
 
     assert result.downstream["team_assignments"] == {"player-7": 1}
     assert result.acceptance["tracking_identity"] == "unvalidated"
+
+
+@pytest.mark.parametrize("dominant_count", [65, 69])
+def test_stable_player_team_vote_accepts_dominant_share_at_or_above_85_percent(dominant_count):
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class DominantClusterer:
+        name = "dominant-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0] * dominant_count + [1] * (70 - dominant_count)
+
+    observations = [row(frame_index=60 + index, raw_track_id=3 + index) for index in range(70)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=DominantClusterer(),
+        )
+    ).run(
+        observations,
+        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in range(60, 130)},
+        masks_by_observation={
+            item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations
+        },
+    )
+
+    assert result.acceptance["tracking_identity"] == "unvalidated"
+    assert result.downstream["team_assignments"] == {"player-7": 0}
+
+
+def test_stable_player_team_vote_rejects_ambiguous_share_below_85_percent():
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class AmbiguousClusterer:
+        name = "ambiguous-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0] * 59 + [1] * 11
+
+    observations = [row(frame_index=60 + index, raw_track_id=3 + index) for index in range(70)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: "player-7" for item in rows},
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=AmbiguousClusterer(),
+        )
+    ).run(
+        observations,
+        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in range(60, 130)},
+        masks_by_observation={
+            item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations
+        },
+    )
+
+    assert result.downstream == {}
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance_reasons == [
+        "conflicting_team_assignment:stable_player_id=player-7"
+    ]
+    assert all(
+        not {"stable_player_id", "team_id"}.intersection(observation)
+        for observation in result.observations
+    )
 
 
 def test_team_id_runs_after_identity_and_groups_fragments_by_stable_player():

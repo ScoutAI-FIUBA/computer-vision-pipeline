@@ -307,7 +307,9 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
             if not frame_start <= frame_index <= frame_end:
                 continue
             objects = _session_objects(output.get("outputs", output))
-            frame_rows = normalize_multiplex_output(frame_index, 0.0, objects)
+            frame_rows = normalize_multiplex_output(
+                frame_index, 0.0, objects, bbox_coordinate_space="normalized"
+            )
             rows.extend(frame_rows)
             for row, obj in zip(frame_rows, objects):
                 if obj["mask"] is not None:
@@ -323,7 +325,11 @@ class PipelineV2:
     def load_models(self) -> None:
         """Warm SAM, ReID, and team models once per Modal container."""
         from pipeline.reid import build_embedder
-        from pipeline.runner_v2 import ConservativeStableIdentityResolver, RunnerV2Seams
+        from pipeline.runner_v2 import (
+            ConservativeStableIdentityResolver,
+            RunnerV2Seams,
+            RuntimeIdentityAuthority,
+        )
         from pipeline.team_embedder import build_team_embedder
 
         self._ensure_predictor()
@@ -334,6 +340,7 @@ class PipelineV2:
             identity=ConservativeStableIdentityResolver(),
             reid=build_embedder(reid_backend, weights=f"{CACHE_DIR}/reid/osnet_x1_0_msmt17.pt"),
             team_embedder=build_team_embedder(team_backend, model_id=team_model_id),
+            identity_authority=RuntimeIdentityAuthority(),
         )
         model_cache.commit()
 
@@ -359,6 +366,7 @@ class PipelineV2:
         frame_start: int = 60,
         frame_end: int = 130,
         return_artifacts: bool = False,
+        return_diagnostics: bool = False,
         max_artifact_bytes: int | None = None,
     ) -> dict[str, Any]:
         validate_entrypoint_args(
@@ -402,6 +410,8 @@ class PipelineV2:
                 raise
             print("[v2] progress=100")
             payload = {"acceptance": result.acceptance}
+            if return_diagnostics:
+                payload["debug_diagnostics"] = result.runtime_diagnostics
             if return_artifacts:
                 payload["artifacts"] = collect_artifacts(output_dir, max_bytes=max_artifact_bytes)
             return payload
@@ -415,6 +425,7 @@ def main(
     frame_start: int = 60,
     frame_end: int = 130,
     max_artifact_bytes: int = 0,
+    return_diagnostics: bool = False,
 ) -> None:
     if not video_path:
         raise ValueError("--video-path is required")
@@ -434,6 +445,7 @@ def main(
         frame_start=frame_start,
         frame_end=frame_end,
         return_artifacts=bool(output_dir),
+        return_diagnostics=return_diagnostics,
         max_artifact_bytes=max_artifact_bytes or None,
     )
     artifacts = payload.pop("artifacts", None)

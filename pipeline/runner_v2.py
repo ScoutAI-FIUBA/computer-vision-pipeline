@@ -17,13 +17,23 @@ import numpy as np
 
 from pipeline.reid import Embedder
 from pipeline.team_embedder import TeamEmbedder, TeamEmbeddingSample
-from pipeline.team_id import KMeansTeamClusterer, TeamClusterer, TeamObservation, identify_teams
+from pipeline.team_id import (
+    STABLE_PLAYER_TEAM_VOTE_SHARE_THRESHOLD,
+    KMeansTeamClusterer,
+    TeamClusterer,
+    TeamObservation,
+    identify_teams,
+)
 
 
 IdentityResolver = Callable[[list[dict[str, Any]]], Mapping[str, str]]
+IdentityAuthority = Callable[
+    [list[dict[str, Any]], "RuntimeStageReceipts"], "IdentityAuthorityDecision"
+]
 _DERIVED_OBSERVATION_FIELDS = frozenset(
     {"stable_player_id", "reid_embedding", "reid_evidence", "team_id"}
 )
+_RUNTIME_RECEIPT_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -39,7 +49,14 @@ class MaskAppearanceCrop:
 class MaskAppearanceAdapter:
     """Create appearance crops where the full-frame mask is authoritative."""
 
-    def crop(self, frame: Any, bbox_xyxy: Any, full_mask: Any) -> MaskAppearanceCrop | None:
+    def crop(
+        self,
+        frame: Any,
+        bbox_xyxy: Any,
+        full_mask: Any,
+        *,
+        coordinate_space: str | None = None,
+    ) -> MaskAppearanceCrop | None:
         """Return a zeroed ROI, or ``None`` when mask evidence is unusable."""
 
         try:
@@ -68,6 +85,17 @@ class MaskAppearanceAdapter:
             return None
         if len(coordinates) != 4 or not all(np.isfinite(value) for value in coordinates):
             return None
+        if coordinate_space not in (None, "pixel", "normalized"):
+            return None
+        if coordinate_space == "normalized":
+            if not all(0.0 <= value <= 1.0 for value in coordinates):
+                return None
+            coordinates = (
+                coordinates[0] * width,
+                coordinates[1] * height,
+                coordinates[2] * width,
+                coordinates[3] * height,
+            )
         x1, y1, x2, y2 = (int(round(value)) for value in coordinates)
         x1, x2 = max(0, min(width, x1)), max(0, min(width, x2))
         y1, y2 = max(0, min(height, y1)), max(0, min(height, y2))
@@ -97,6 +125,7 @@ class RunnerV2Seams:
     reid: Embedder | None = None
     team_embedder: TeamEmbedder | None = None
     team_clusterer: TeamClusterer | None = None
+    identity_authority: IdentityAuthority | None = None
     team_count: int = 2
 
 
@@ -104,8 +133,92 @@ class RunnerV2Seams:
 class RunnerV2Result:
     observations: list[dict[str, Any]]
     downstream: dict[str, Any] = field(default_factory=dict)
-    acceptance: dict[str, str] = field(default_factory=dict)
+    acceptance: dict[str, Any] = field(default_factory=dict)
     acceptance_reasons: list[str] = field(default_factory=list)
+    runtime_diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class IdentityAuthorityDecision:
+    accepted: bool
+    reasons: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuntimeStageReceipts:
+    stable_identity: frozenset[str] = frozenset()
+    reid: frozenset[str] = frozenset()
+    team: frozenset[str] = frozenset()
+    _token: object = field(default=None, repr=False, compare=False)
+
+    def _is_runner_provenance(self) -> bool:
+        return self._token is _RUNTIME_RECEIPT_TOKEN
+
+    def _with(
+        self,
+        *,
+        stable_identity: frozenset[str] | None = None,
+        reid: frozenset[str] | None = None,
+        team: frozenset[str] | None = None,
+    ) -> "RuntimeStageReceipts":
+        return RuntimeStageReceipts(
+            stable_identity=self.stable_identity if stable_identity is None else stable_identity,
+            reid=self.reid if reid is None else reid,
+            team=self.team if team is None else team,
+            _token=self._token,
+        )
+
+
+def _mint_runtime_stage_receipts() -> RuntimeStageReceipts:
+    return RuntimeStageReceipts(_token=_RUNTIME_RECEIPT_TOKEN)
+
+
+class RuntimeIdentityAuthority:
+    """Accept only rows with every runtime identity authority check complete."""
+
+    def __call__(
+        self, rows: list[dict[str, Any]], receipts: RuntimeStageReceipts
+    ) -> IdentityAuthorityDecision:
+        if not isinstance(receipts, RuntimeStageReceipts) or not receipts._is_runner_provenance():
+            return IdentityAuthorityDecision(False, ("identity_authority:invalid_stage_receipts",))
+        reasons: list[str] = []
+        for row in rows:
+            key = str(row.get("observation_key", ""))
+            if key not in receipts.stable_identity:
+                reasons.append(f"identity_authority:missing_stage_receipt:stable_identity:{key}")
+            if key not in receipts.reid:
+                reasons.append(f"identity_authority:missing_stage_receipt:reid:{key}")
+            if key not in receipts.team:
+                reasons.append(f"identity_authority:missing_stage_receipt:team:{key}")
+            if not isinstance(row.get("stable_player_id"), str) or not row["stable_player_id"].strip():
+                reasons.append(f"identity_authority:missing_stable_player_id:{key}")
+            evidence = row.get("reid_evidence")
+            if not isinstance(evidence, Mapping) or evidence.get("status") != "valid":
+                reasons.append(f"identity_authority:invalid_reid_evidence:{key}")
+            if _normalize_embedding(row.get("reid_embedding")) is None:
+                reasons.append(f"identity_authority:missing_reid_embedding:{key}")
+            team_id = row.get("team_id")
+            if type(team_id) is not int:
+                reasons.append(f"identity_authority:missing_team_id:{key}")
+        if reasons:
+            return IdentityAuthorityDecision(False, tuple(dict.fromkeys(reasons)))
+        return IdentityAuthorityDecision(
+            True,
+            (
+                "stable_identity_resolved",
+                "mask_authoritative_reid_verified",
+                "team_id_resolved",
+            ),
+            {
+                "authority": "runtime_identity",
+                "checks": {
+                    "stable_identity": "passed",
+                    "mask_authoritative_reid": "passed",
+                    "team_id": "passed",
+                },
+            },
+        )
 
 
 @dataclass
@@ -298,7 +411,12 @@ def _prepare_masked_crops(
         frame_index = int(row["frame_index"])
         if frame_index not in frames_by_index:
             continue
-        crop = adapter.crop(frames_by_index[frame_index], row["bbox_xyxy"], masks_by_observation.get(key))
+        crop = adapter.crop(
+            frames_by_index[frame_index],
+            row["bbox_xyxy"],
+            masks_by_observation.get(key),
+            coordinate_space=row.get("bbox_coordinate_space"),
+        )
         if crop is not None:
             prepared[key] = crop
     return prepared
@@ -309,9 +427,10 @@ def _run_reid(
     embedder: Embedder,
     frames_by_index: Mapping[int, Any],
     masks_by_observation: Mapping[str, Any] | None,
-) -> tuple[int, dict[str, MaskAppearanceCrop]]:
+) -> tuple[int, dict[str, MaskAppearanceCrop], frozenset[str]]:
     prepared = _prepare_masked_crops(rows, frames_by_index, masks_by_observation) if masks_by_observation is not None else {}
     count = 0
+    receipt_keys: set[str] = set()
     for row in rows:
         key = str(row.get("observation_key", ""))
         crop = prepared.get(key)
@@ -331,7 +450,8 @@ def _run_reid(
         row["reid_evidence"] = {"status": "valid"}
         prepared[key] = crop
         count += 1
-    return count, prepared
+        receipt_keys.add(key)
+    return count, prepared, frozenset(receipt_keys)
 
 
 def _run_team_id(
@@ -341,7 +461,7 @@ def _run_team_id(
     team_count: int,
     frames_by_index: Mapping[int, Any],
     crops_by_observation: Mapping[str, MaskAppearanceCrop] | None = None,
-) -> tuple[dict[str, int], list[str]]:
+) -> tuple[dict[str, int], list[str], dict[str, Any]]:
     observations: list[TeamObservation] = []
     next_detection_id = 1
     stable_ids = sorted(
@@ -394,11 +514,18 @@ def _run_team_id(
         team_count=team_count,
         backend=team_embedder.name,
         minimum_samples=1,
+        minimum_vote_share=STABLE_PLAYER_TEAM_VOTE_SHARE_THRESHOLD,
     )
     conflicts = []
+    vote_diagnostics: dict[str, dict[str, Any]] = {}
     for stable_id in stable_ids:
         diagnostics = result.track_diagnostics.get(stable_to_track[stable_id], {})
-        if len(diagnostics.get("cluster_votes", {})) > 1:
+        if diagnostics:
+            vote_diagnostics[stable_id] = {
+                "cluster_votes": dict(diagnostics.get("cluster_votes", {})),
+                "total_samples": int(diagnostics.get("eligible_samples", 0)),
+            }
+        if diagnostics.get("vote_decision") != "assigned":
             conflicts.append(f"conflicting_team_assignment:stable_player_id={stable_id}")
 
     assignments = {
@@ -409,7 +536,7 @@ def _run_team_id(
         for stable_id, track_id in stable_to_track.items()
         if track_id == assignment.track_id
     }
-    return assignments, conflicts
+    return assignments, conflicts, vote_diagnostics
 
 
 class RunnerV2:
@@ -435,6 +562,9 @@ class RunnerV2:
         structurally_valid = not reasons
         frames = frames_by_index or {}
         downstream: dict[str, Any] = {}
+        runtime_diagnostics: dict[str, Any] = {}
+        acceptance_reasons = reasons
+        stage_receipts = _mint_runtime_stage_receipts()
 
         appearance_requested = self.seams.reid is not None or self.seams.team_embedder is not None
         if structurally_valid and appearance_requested and masks_by_observation is None:
@@ -445,15 +575,20 @@ class RunnerV2:
 
         prepared_crops: dict[str, MaskAppearanceCrop] = {}
         if structurally_valid and self.seams.reid is not None:
-            downstream["reid_records"], prepared_crops = _run_reid(
+            downstream["reid_records"], prepared_crops, reid_receipts = _run_reid(
                 rows, self.seams.reid, frames, masks_by_observation
             )
+            stage_receipts = stage_receipts._with(reid=reid_receipts)
         elif structurally_valid and self.seams.team_embedder is not None and masks_by_observation is not None:
             prepared_crops = _prepare_masked_crops(rows, frames, masks_by_observation)
 
         if structurally_valid:
             reasons.extend(_resolve_identity(rows, self.seams.identity))
             structurally_valid = not reasons
+            if structurally_valid:
+                stage_receipts = stage_receipts._with(
+                    stable_identity=frozenset(str(row["observation_key"]) for row in rows),
+                )
 
         if structurally_valid and self.seams.team_embedder is not None:
             team_rows = rows
@@ -466,7 +601,7 @@ class RunnerV2:
                     and row["stable_player_id"].strip()
                 ]
             if team_rows:
-                team_assignments, team_reasons = _run_team_id(
+                team_assignments, team_reasons, vote_diagnostics = _run_team_id(
                     team_rows,
                     self.seams.team_embedder,
                     self.seams.team_clusterer or KMeansTeamClusterer(),
@@ -474,13 +609,34 @@ class RunnerV2:
                     frames,
                     prepared_crops if masks_by_observation is not None else None,
                 )
+                runtime_diagnostics = {
+                    "debug_runtime_only": True,
+                    "team_vote_diagnostics": vote_diagnostics,
+                }
                 reasons.extend(team_reasons)
                 if not team_reasons:
                     downstream["team_assignments"] = team_assignments
+                    stage_receipts = stage_receipts._with(
+                        team=frozenset(
+                            str(row["observation_key"])
+                            for row in team_rows
+                            if row.get("stable_player_id") in team_assignments
+                        ),
+                    )
                     for row in rows:
                         stable_id = row.get("stable_player_id")
                         if stable_id in team_assignments:
                             row["team_id"] = team_assignments[stable_id]
+
+        authority_decision: IdentityAuthorityDecision | None = None
+        if structurally_valid and self.seams.identity_authority is not None:
+            authority_decision = self.seams.identity_authority(rows, stage_receipts)
+            if not isinstance(authority_decision, IdentityAuthorityDecision):
+                raise TypeError("identity_authority must return IdentityAuthorityDecision")
+            if authority_decision.accepted and not reasons:
+                acceptance_reasons = list(authority_decision.reasons)
+            else:
+                reasons.extend(authority_decision.reasons or ("identity_authority_rejected",))
 
         structurally_valid = not reasons
         if not structurally_valid:
@@ -489,11 +645,17 @@ class RunnerV2:
             downstream = {}
             rows = _scrub_derived_observations(rows)
 
-        acceptance = {
-            "tracking_identity": "unvalidated" if structurally_valid else "rejected",
-            "statistics": "deferred",
-        }
-        return RunnerV2Result(rows, downstream, acceptance, reasons)
+        acceptance = {"tracking_identity": "unvalidated", "statistics": "deferred"}
+        if not structurally_valid:
+            acceptance["tracking_identity"] = "rejected"
+        elif authority_decision is not None:
+            acceptance.update(dict(authority_decision.metadata))
+            acceptance["tracking_identity"] = "accepted"
+        for row in rows:
+            row.pop("bbox_coordinate_space", None)
+        if not structurally_valid:
+            acceptance_reasons = reasons
+        return RunnerV2Result(rows, downstream, acceptance, acceptance_reasons, runtime_diagnostics)
 
 
 def run_v2(

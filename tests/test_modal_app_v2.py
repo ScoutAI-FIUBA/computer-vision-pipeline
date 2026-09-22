@@ -297,6 +297,7 @@ def test_v2_load_models_warms_cold_container_and_assigns_runtime_seams(monkeypat
     import modal_app_v2
     import pipeline.reid
     import pipeline.team_embedder
+    from pipeline.runner_v2 import RuntimeIdentityAuthority
 
     predictor_calls = []
     cache_commits = []
@@ -352,6 +353,7 @@ def test_v2_load_models_warms_cold_container_and_assigns_runtime_seams(monkeypat
     assert pipeline.seams.identity is not None
     assert pipeline.seams.reid is fake_reid
     assert pipeline.seams.team_embedder is fake_team
+    assert isinstance(pipeline.seams.identity_authority, RuntimeIdentityAuthority)
     assert len(cache_commits) == 2
 
 
@@ -703,7 +705,10 @@ def test_track_video_propagates_session_id_and_closes_in_lifecycle_order(tmp_pat
 
 
 def test_track_video_normalizes_official_nested_output_envelope(tmp_path: Path):
+    import numpy as np
+
     from modal_app_v2 import _track_video
+    from pipeline.runner_v2 import MaskAppearanceAdapter
 
     class FakeModel:
         def init_state(self, **_kwargs):
@@ -724,7 +729,7 @@ def test_track_video_normalizes_official_nested_output_envelope(tmp_path: Path):
                         "frame_index": 42,
                         "outputs": {
                             "out_obj_ids": [7],
-                            "out_boxes_xywh": [[1, 2, 3, 4]],
+                            "out_boxes_xywh": [[0.1, 0.2, 0.4, 0.6]],
                             "out_probs": [0.8],
                         },
                     }
@@ -735,9 +740,19 @@ def test_track_video_normalizes_official_nested_output_envelope(tmp_path: Path):
 
     assert rows[0]["frame_index"] == 42
     assert rows[0]["raw_track_id"] == 7
-    assert rows[0]["bbox_xyxy"] == [1.0, 2.0, 4.0, 6.0]
+    assert rows[0]["bbox_xyxy"] == [0.1, 0.2, 0.5, 0.8]
+    assert rows[0]["bbox_coordinate_space"] == "normalized"
     assert rows[0]["probability"] == 0.8
     assert masks == {}
+
+    frame = np.ones((40, 50, 3), dtype=np.uint8)
+    mask = np.zeros((40, 50), dtype=bool)
+    mask[8:32, 5:25] = True
+    crop = MaskAppearanceAdapter().crop(
+        frame, rows[0]["bbox_xyxy"], mask, coordinate_space=rows[0]["bbox_coordinate_space"]
+    )
+    assert crop is not None
+    assert crop.bbox_xyxy == (5, 8, 25, 32)
 
 
 def test_track_video_normalizes_empty_nested_outputs(tmp_path: Path):
@@ -946,6 +961,136 @@ def test_process_passes_tracked_frames_and_masks_to_v2_runner(monkeypatch):
     assert np.array_equal(captured["masks_by_observation"]["60:3"], mask)
 
 
+def test_process_exposes_runtime_diagnostics_only_through_explicit_debug_response(
+    monkeypatch,
+):
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result
+
+    diagnostics = {
+        "debug_runtime_only": True,
+        "team_vote_diagnostics": {
+            "player-3": {"cluster_votes": {"0": 1, "1": 2}, "total_samples": 3}
+        },
+    }
+    rows = [{
+        "observation_key": "60:3",
+        "frame_index": 60,
+        "raw_track_id": 3,
+        "bbox_xyxy": [1, 2, 11, 22],
+        "track_state": "tracked",
+    }]
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args: (rows, {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda observations, **_kwargs: RunnerV2Result(
+            observations, runtime_diagnostics=diagnostics
+        ),
+    )
+    cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    normal = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
+    debug = process(
+        cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_diagnostics=True
+    )
+
+    assert "debug_diagnostics" not in normal
+    assert "runtime_diagnostics" not in json.loads(normal["artifacts"]["tracks.jsonl"].decode())
+    assert "runtime_diagnostics" not in json.loads(normal["artifacts"]["manifest.json"].decode())
+    assert debug == {"acceptance": {}, "debug_diagnostics": diagnostics}
+
+
+def test_conflicting_team_response_keeps_rejected_policy_with_debug_opt_in(monkeypatch):
+    import modal_app_v2
+    import numpy as np
+    from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
+    from pipeline.team_embedder import TeamFeatures
+
+    rows = [
+        {
+            "observation_key": "60:3",
+            "frame_index": 60,
+            "raw_track_id": 3,
+            "bbox_xyxy": [1, 2, 11, 22],
+            "track_state": "tracked",
+        },
+        {
+            "observation_key": "61:4",
+            "frame_index": 61,
+            "raw_track_id": 4,
+            "bbox_xyxy": [1, 2, 11, 22],
+            "track_state": "tracked",
+        },
+    ]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class ConflictingClusterer:
+        name = "conflicting-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            return [0, 1]
+
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args: (rows, {
+        "60:3": np.ones((24, 12), dtype=bool),
+        "61:4": np.ones((24, 12), dtype=bool),
+    }))
+    monkeypatch.setattr(
+        modal_app_v2,
+        "_load_video_frames",
+        lambda *_args: {
+            60: np.ones((24, 12, 3), dtype=np.uint8),
+            61: np.ones((24, 12, 3), dtype=np.uint8),
+        },
+    )
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda observations, **kwargs: RunnerV2(
+            RunnerV2Seams(
+                identity=lambda items: {item["observation_key"]: "player-7" for item in items},
+                team_embedder=FakeTeamEmbedder(),
+                team_clusterer=ConflictingClusterer(),
+            )
+        ).run(observations, **kwargs),
+    )
+    cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    normal = process(
+        cls(), video_bytes=b"same-input", frame_start=60, frame_end=61, return_diagnostics=False
+    )
+    debug = process(
+        cls(), video_bytes=b"same-input", frame_start=60, frame_end=61, return_diagnostics=True
+    )
+
+    assert normal == {
+        "acceptance": {"tracking_identity": "rejected", "statistics": "deferred"}
+    }
+    assert debug["acceptance"] == normal["acceptance"]
+    assert debug.keys() == {"acceptance", "debug_diagnostics"}
+    assert debug["debug_diagnostics"]["team_vote_diagnostics"] == {
+        "player-7": {"cluster_votes": {"0": 1, "1": 1}, "total_samples": 2}
+    }
+
+
 def test_process_passes_runtime_seams_to_v2_runner(monkeypatch):
     import modal_app_v2
     from pipeline.runner_v2 import RunnerV2Result, RunnerV2Seams
@@ -1009,6 +1154,42 @@ def test_process_rejects_missing_identity_and_defers_statistics(monkeypatch):
     assert "stable_player_id" not in observation
     assert "reid_embedding" not in observation
     assert "team_id" not in observation
+
+
+@pytest.mark.parametrize(
+    "acceptance",
+    [
+        {
+            "tracking_identity": "accepted",
+            "statistics": "deferred",
+            "authority": "runtime_identity",
+        },
+        {"tracking_identity": "rejected", "statistics": "deferred"},
+        {"tracking_identity": "unvalidated", "statistics": "deferred"},
+    ],
+)
+def test_process_preserves_explicit_runner_acceptance_states(monkeypatch, acceptance):
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result
+
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args: ([], {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda rows, **_kwargs: RunnerV2Result(rows, acceptance=acceptance),
+    )
+    cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60)
+
+    assert payload == {"acceptance": acceptance}
 
 
 def test_process_size_limit_fails_before_returning_partial_artifacts(monkeypatch):
