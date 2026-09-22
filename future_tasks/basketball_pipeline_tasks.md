@@ -169,6 +169,15 @@ implementation notes. Ball detection and team identification are closed for
 this phase; do not reopen those sections as the next implementation target
 unless new evidence breaks their current output contracts.
 
+## Statistics progress
+
+The current shot slice now preserves legacy `shot_events.jsonl` and adds
+conservative player/team attribution to `shot_evidence.jsonl`. Attribution
+requires observed ball evidence plus exactly one consistent player/stable
+identity whose existing track box contains the shot anchor; team IDs are copied
+only when present and non-conflicting. Proximity and ball-only evidence are not
+enough.
+
 ## Next immediate task: statistics detection
 
 Implement the following in order during the next session:
@@ -178,7 +187,8 @@ Implement the following in order during the next session:
    including unknown, lost, and unassigned states.
 3. Implement shot/event detection with explicit make/miss outcomes and
    reviewable unknown events.
-4. Add possession only after player/team/ball evidence passes validation.
+4. Add possession only after player/team/ball evidence passes validation; this
+   remains the next unimplemented statistics slice.
 5. Add passes only after possession and transfer evidence support them; do not
    infer passes from proximity alone.
 6. Select a small evaluation clip set and define practical metrics for event

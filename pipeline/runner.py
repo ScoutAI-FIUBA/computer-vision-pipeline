@@ -602,13 +602,20 @@ def _write_shot_events(video_path: Path, output_path: Path, *, info, step: int, 
             write_shot_event_record(shot_events_file, final_shot_event)
 
 
-def _attach_ball_evidence(output_dir: Path, *, expected_frame_indices) -> None:
+def _attach_ball_evidence(
+    output_dir: Path, *, expected_frame_indices, team_ids_by_track_id: dict[int, int] | None = None
+) -> None:
     events = _load_jsonl_rows(output_dir / SHOT_EVENTS_FILENAME)
     evidence_path = output_dir / SHOT_EVIDENCE_FILENAME
+    tracks = _load_jsonl_rows(output_dir / TRACKS_FILENAME)
+    if team_ids_by_track_id is None:
+        team_ids_by_track_id = _load_team_ids_by_track_id(output_dir / TEAMS_FILENAME)
     enriched = attach_shot_evidence(
         events,
         load_ball_track_rows(output_dir / BALL_TRACKS_FILENAME),
         expected_frame_indices=expected_frame_indices,
+        player_rows=tracks,
+        team_ids_by_track_id=team_ids_by_track_id,
     )
     evidence_path.write_text("".join(json.dumps(event) + "\n" for event in enriched), encoding="utf-8")
 
@@ -1125,7 +1132,11 @@ def run_pipeline(
     if config.max_frames is not None:
         expected_ball_count = min(expected_ball_count, config.max_frames * step)
     expected_ball_frames = range(0, expected_ball_count, step if tracknet_detector is None else ball_step)
-    _attach_ball_evidence(output_dir, expected_frame_indices=expected_ball_frames)
+    _attach_ball_evidence(
+        output_dir,
+        expected_frame_indices=expected_ball_frames,
+        team_ids_by_track_id=team_by_track_id,
+    )
     ball_validation = validate_ball_track_rows(
         ball_rows,
         expected_frame_indices=expected_ball_frames,

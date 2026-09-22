@@ -255,8 +255,11 @@ Current outputs from one pipeline run:
 
 `shot_events.jsonl` keeps its legacy schema. The additive `shot_evidence.jsonl`
 joins each event to ball evidence for its frame window and includes a
-`player_identity` object. The latter is `unknown` unless an existing artifact can
-prove the identity; this slice does not infer a shooter or team.
+`player_identity` object. A player is assigned only when validated ball evidence
+is observed and the shot anchor lies inside exactly one consistent player/stable
+identity's track geometry in the event window. Team IDs are copied only from a
+non-conflicting existing assignment; proximity and ball-only evidence never
+assign a player or team.
 
 ### Offline team-backbone A/B evaluation
 
@@ -321,6 +324,8 @@ What it does today:
 3. Mark the event as `made` when `ball_in_basket` appears during that window.
 4. Mark the event as `missed` when the shot signal times out.
 5. Mark the event as `unknown` at end-of-clip if the run ends before resolution.
+6. Write conservative player/team attribution in the additive `shot_evidence.jsonl`
+   artifact without changing `shot_events.jsonl`.
 
 Current limits:
 
@@ -328,6 +333,10 @@ Current limits:
 - When court homography is available during the main pipeline run, `results.json` also exposes `projected_tracks_file`, `projected_shots_file`, and `projected_shots_image_file`.
 - If no frame yields a usable homography, those projected-artifact keys are omitted and no projected-shot artifacts are written.
 - The output can be empty for clips where the detector never emits the required action classes.
+- Attribution remains unknown when ball evidence is missing/lost, multiple player
+  boxes contain the anchor, stable identity evidence conflicts, or team evidence
+  is absent/conflicting. Possession and pass attribution are intentionally still
+  deferred.
 
 ## Jersey numbers
 

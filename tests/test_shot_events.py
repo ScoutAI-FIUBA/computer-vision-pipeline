@@ -798,6 +798,132 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
     ]
 
 
+def test_run_pipeline_writes_assigned_player_team_to_external_shot_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import numpy as np
+    from pipeline.runner import run_pipeline
+    from pipeline.team_id import TeamAssignment, TeamIdentificationResult
+
+    segment = Segment(
+        frame_indices=[0, 1],
+        frames=[np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(2)],
+        is_last=True,
+    )
+    tracking_result = {
+        "image": {"width": 16, "height": 16},
+        "predictions": [
+            {"class": "player", "confidence": 0.9, "x": 8, "y": 8, "width": 8, "height": 8},
+            {"class": "ball", "confidence": 0.9, "x": 2, "y": 2, "width": 2, "height": 2},
+        ],
+    }
+    shot_result = {
+        "image": {"width": 16, "height": 16},
+        "predictions": [
+            {"class_id": 5, "class": "jump_shot", "confidence": 0.9, "x": 8, "y": 8, "width": 8, "height": 8}
+        ],
+    }
+
+    class FakeDetector:
+        def __init__(self, result):
+            self.result = result
+            self.call_count = 0
+
+        def detect(self, _frame):
+            self.call_count += 1
+            return self.result
+
+    class FakeTracker:
+        device = "cpu"
+
+        def propagate_segment(self, _frames, seed_rows):
+            return {1: [dict(row) for row in seed_rows]}
+
+    class FakeEmbedder:
+        name = "none"
+
+    class FakeTeamEmbedder:
+        name = "fake"
+
+        def embed(self, _frame, samples):
+            from pipeline.team_embedder import TeamFeatures
+
+            return [TeamFeatures(color_signature=[1.0, 0.0], embedding=None, quality_score=1.0) for _ in samples]
+
+    class FakeNumberPredictor:
+        name = "dummy"
+
+        def predict(self, _sample):
+            from pipeline.number_predictor import NumberPrediction
+
+            return NumberPrediction(raw_text=None, score=None)
+
+    def fake_build_detector(config, *, model_id=None):
+        return FakeDetector(shot_result if model_id == config.shot_model_id else tracking_result)
+
+    def fake_detections_from_result(result, **_kwargs):
+        rows = []
+        for prediction in result["predictions"]:
+            x, y = prediction["x"], prediction["y"]
+            width, height = prediction["width"], prediction["height"]
+            rows.append(
+                {
+                    "class_name": prediction["class"],
+                    "confidence": prediction.get("confidence", 1.0),
+                    "xyxy": [x - width / 2, y - height / 2, x + width / 2, y + height / 2],
+                    "track_state": "detected",
+                }
+            )
+        return rows
+
+    monkeypatch.setattr("pipeline.runner.probe", lambda _path: VideoInfo(fps=30.0, frame_count=2, width=16, height=16))
+    monkeypatch.setattr("pipeline.runner.iter_segments", lambda *_args, **_kwargs: iter([segment]))
+    monkeypatch.setattr("pipeline.runner.build_detector", fake_build_detector)
+    monkeypatch.setattr("pipeline.runner.detections_from_result", fake_detections_from_result)
+    monkeypatch.setattr("pipeline.runner.detection_rows", lambda rows: [dict(row) for row in rows])
+    monkeypatch.setattr("pipeline.runner.build_embedder", lambda _backend: FakeEmbedder())
+    monkeypatch.setattr("pipeline.runner.build_team_embedder", lambda *_args, **_kwargs: FakeTeamEmbedder())
+    monkeypatch.setattr("pipeline.runner.build_number_predictor", lambda _config: FakeNumberPredictor())
+    monkeypatch.setattr(
+        "pipeline.runner._identify_track_teams",
+        lambda *_args, **_kwargs: TeamIdentificationResult(
+            backend="fake",
+            clusterer="fake",
+            requested_teams=2,
+            assignments=[TeamAssignment(detection_id=1, track_id=1, team_id=2)],
+            skipped_detection_ids=[],
+        ),
+    )
+
+    config = PipelineConfig(
+        roboflow_api_key="test-key",
+        target_fps=30.0,
+        appearance_weight=0.0,
+        reid_backend="none",
+        team_embedder_backend="none",
+        min_team_samples_per_track=1,
+        team_sample_stride=1,
+        max_team_samples_per_track=1,
+        prefetch_detections=False,
+        team_debug_enabled=False,
+        number_predictor_backend="dummy",
+    )
+
+    run_pipeline(tmp_path / "dummy.mp4", config, tmp_path / "out", tracker=FakeTracker())
+
+    evidence = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "shot_evidence.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert evidence[0]["ball_evidence"]["status"] == "observed"
+    assert evidence[0]["player_identity"] == {
+        "status": "assigned",
+        "track_id": 1,
+        "stable_player_id": None,
+        "team_id": 2,
+    }
+
+
 def test_run_pipeline_uses_independent_shot_target_fps(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
