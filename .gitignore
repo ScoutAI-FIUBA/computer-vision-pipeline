@@ -4,6 +4,7 @@
 docs/*
 !docs/
 !docs/possession-engine-v3.md
+!docs/possession-engine-v3-calibration.md
 openspec/
 
 .env
