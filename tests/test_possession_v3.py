@@ -12,6 +12,7 @@ from pipeline.possession_v3 import (
     PossessionObservation, PossessionState, Provenance, V3_CONTRACT_VERSION,
     engine_name,
     score_candidates, PossessionResolver,
+    normalize_ball_rows, derive_ball_primitives, derive_ball_transitions,
 )
 from pipeline.results import PipelineResults, RunSummary
 from pipeline.runner import _possession_result_config
@@ -218,3 +219,163 @@ def test_retroactive_confirmation_requires_unique_later_observed_holder():
     resolver.resolve(2, [rival])
     with pytest.raises(ValueError):
         resolver.retroactive_confirm(1, 2)
+
+
+def _ball(frame, x, y, state="detected"):
+    return {"frame_index": frame, "timestamp_seconds": frame / 10, "track_id": 1,
+            "track_state": state, "confidence": .9 if state != "lost" else None,
+            "center_xy": [x, y], "xyxy": [x - 2, y - 2, x + 2, y + 2]}
+
+
+def _pos(frame, holder):
+    return {"frame_index": frame, "stable_player_id": holder}
+
+
+def test_ball_interpolation_is_bounded_and_lower_quality_without_detection_state():
+    rows = normalize_ball_rows([_ball(0, 0, 0), _ball(2, 20, 0)], real_fps=10, max_gap_frames=1)
+    middle = next(row for row in rows if row["frame_index"] == 1)
+    assert middle["ball_source"] == "interpolated"
+    assert middle["track_state"] != "detected"
+    assert middle["quality"] < rows[0]["quality"]
+    assert middle["source_frame_indices"] == [0, 2]
+    assert len(normalize_ball_rows([_ball(0, 0, 0), _ball(3, 30, 0)], real_fps=10, max_gap_frames=1)) == 2
+
+
+@pytest.mark.parametrize("fps", [float("nan"), float("inf"), 0, -1])
+def test_ball_normalization_rejects_non_finite_or_non_positive_fps(fps):
+    with pytest.raises(ValueError):
+        normalize_ball_rows([_ball(0, 0, 0)], real_fps=fps, max_gap_frames=1)
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), -float("inf")])
+def test_ball_normalization_rejects_non_finite_timestamps(timestamp):
+    row = _ball(0, 0, 0)
+    row["timestamp_seconds"] = timestamp
+    with pytest.raises(ValueError):
+        normalize_ball_rows([row], real_fps=10, max_gap_frames=1)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1])
+def test_ball_normalization_fails_closed_for_invalid_quality(value):
+    row = _ball(0, 0, 0)
+    row["confidence"] = value
+    normalized = normalize_ball_rows([row], real_fps=10, max_gap_frames=1)
+    assert normalized[0]["ball_source"] == "lost"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"release_persistence_frames": 0},
+    {"release_persistence_frames": -1},
+    {"release_persistence_frames": 1.5},
+    {"reception_persistence_frames": 0},
+    {"reception_persistence_frames": float("nan")},
+    {"reception_persistence_frames": True},
+])
+def test_primitive_derivation_rejects_invalid_persistence_settings(kwargs):
+    with pytest.raises(ValueError):
+        derive_ball_primitives([], [], real_fps=10, **kwargs)
+
+
+def test_lost_ball_with_missing_confidence_fails_closed():
+    row = _ball(0, 0, 0, state="lost")
+    row["confidence"] = None
+    normalized = normalize_ball_rows([row], real_fps=10, max_gap_frames=1)
+    assert normalized[0]["ball_source"] == "lost"
+    assert normalized[0]["quality"] == 0.0
+
+
+@pytest.mark.parametrize("seconds", [float("nan"), float("inf"), -float("inf"), -0.1])
+def test_primitive_derivation_rejects_invalid_loose_seconds(seconds):
+    with pytest.raises(ValueError):
+        derive_ball_primitives([], [], real_fps=10, loose_seconds=seconds)
+
+
+def test_malformed_coordinates_and_frame_indices_cannot_interpolate_or_emit():
+    bad_frame = _ball(-1, 0, 0)
+    bad_point = _ball(1, float("nan"), 0)
+    rows = normalize_ball_rows([_ball(0, 0, 0), bad_frame, bad_point, _ball(2, 20, 0)], real_fps=10, max_gap_frames=2)
+    assert [row["frame_index"] for row in rows] == [0, 1, 2]
+    assert rows[1]["ball_source"] == "lost"
+    assert derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, "b")], real_fps=10) == []
+
+
+def test_reverse_frame_or_timestamp_order_fails_closed_before_interpolation():
+    reverse_frame = [_ball(2, 20, 0), _ball(0, 0, 0)]
+    with pytest.raises(ValueError):
+        normalize_ball_rows(reverse_frame, real_fps=10, max_gap_frames=2)
+    reverse_time = [_ball(0, 0, 0), _ball(1, 10, 0)]
+    reverse_time[1]["timestamp_seconds"] = -1
+    with pytest.raises(ValueError):
+        normalize_ball_rows(reverse_time, real_fps=10, max_gap_frames=2)
+
+
+@pytest.mark.parametrize("field,value", [("source_records", ["ok", 3]), ("source_records", "raw"),
+                                          ("source_frame_indices", [0, -1]), ("source_frame_indices", [True])])
+def test_malformed_raw_provenance_fails_closed(field, value):
+    left, right = _ball(0, 0, 0), _ball(2, 20, 0)
+    left[field] = value
+    rows = normalize_ball_rows([left, right], real_fps=10, max_gap_frames=1)
+    assert all(row["ball_source"] != "interpolated" for row in rows)
+    assert derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, "b")], real_fps=10) == []
+
+
+@pytest.mark.parametrize("field", ["source_records", "source_frame_indices"])
+def test_empty_supplied_provenance_fails_closed(field):
+    row = _ball(0, 0, 0)
+    row[field] = []
+    assert normalize_ball_rows([row], real_fps=10, max_gap_frames=1)[0]["ball_source"] == "lost"
+
+
+@pytest.mark.parametrize("derive", [derive_ball_primitives, derive_ball_transitions])
+def test_direct_derivation_rejects_duplicate_frames(derive):
+    rows = normalize_ball_rows([_ball(0, 0, 0), _ball(1, 10, 0)], real_fps=10, max_gap_frames=1)
+    with pytest.raises(ValueError):
+        derive(rows + [dict(rows[0])], [_pos(0, "a"), _pos(1, None)], real_fps=10)
+
+
+@pytest.mark.parametrize("derive", [derive_ball_primitives, derive_ball_transitions])
+def test_direct_derivation_rejects_reverse_order(derive):
+    for rows in ([_ball(1, 10, 0), _ball(0, 0, 0)], [_ball(0, 0, 0), _ball(1, 10, 0)], [_ball(0, 0, 0), _ball(1, 10, 0), _ball(2, 20, 0)]):
+        if len(rows) == 2:
+            rows[1]["timestamp_seconds"] = -1
+        else:
+            rows[0]["timestamp_seconds"], rows[1]["timestamp_seconds"], rows[2]["timestamp_seconds"] = 2, None, 1
+        with pytest.raises(ValueError):
+            derive(rows, [], real_fps=10)
+
+
+def test_ball_normalization_preserves_supplied_provenance():
+    left, right = _ball(0, 0, 0), _ball(2, 20, 0)
+    left["source_records"] = ["raw/custom#0"]
+    left["source_frame_indices"] = [100]
+    rows = normalize_ball_rows([left, right], real_fps=10, max_gap_frames=1)
+    assert rows[0]["source_records"] == ["raw/custom#0"]
+    assert rows[0]["source_frame_indices"] == [100]
+    assert rows[1]["source_records"] == ["raw/custom#0", "ball_tracks.jsonl#frame=2"]
+
+
+def test_release_requires_persistent_separation_and_transit_has_trajectory():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(5)], real_fps=10, max_gap_frames=1)
+    rows[1]["timestamp_seconds"] = None
+    primitives = derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, None), _pos(3, "b"), _pos(4, "b")], real_fps=10)
+    assert [item["primitive_type"] for item in primitives] == ["BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"]
+    assert primitives[1]["provenance"]["frame_indices"] == [1, 2]
+    assert derive_ball_transitions(rows, [_pos(0, "a"), _pos(1, None), _pos(2, None), _pos(3, "b"), _pos(4, "b")], real_fps=10)
+
+
+def test_single_destination_frame_does_not_confirm_reception():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(3)], real_fps=10, max_gap_frames=1)
+    primitives = derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, "b")], real_fps=10)
+    assert [item["primitive_type"] for item in primitives] == []
+
+
+def test_all_qualifying_loose_intervals_are_emitted():
+    rows = normalize_ball_rows([_ball(i, 0, 0) for i in range(10)], real_fps=10, max_gap_frames=1)
+    states = [_pos(i, None if 0 <= i <= 3 or 6 <= i <= 9 else "a") for i in range(10)]
+    loose = derive_ball_primitives(rows, states, real_fps=10, loose_seconds=.3)
+    assert [item["frame_index"] for item in loose if item["primitive_type"] == "LOOSE_BALL"] == [3, 9]
+
+
+def test_single_frame_noise_does_not_emit_primitive():
+    rows = normalize_ball_rows([_ball(0, 0, 0), _ball(1, 100, 100), _ball(2, 0, 0)], real_fps=10, max_gap_frames=1)
+    assert derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, "a")], real_fps=10) == []

@@ -118,6 +118,7 @@ DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS = 0.2
 DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS = 1.0
 DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE = "default"
 DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION = 1
+DEFAULT_POSSESSION_V3_BALL_MAX_GAP = 3
 
 
 
@@ -181,6 +182,7 @@ class PipelineConfig:
     possession_v3_event_window_seconds: float = DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS
     possession_v3_calibration_profile: str = DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE
     possession_v3_input_contract_version: int = DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION
+    possession_v3_ball_max_gap: int = DEFAULT_POSSESSION_V3_BALL_MAX_GAP
 
     @property
     def possession_v3_enabled(self) -> bool:
@@ -331,6 +333,8 @@ class PipelineConfig:
             raise ValueError("possession_v3_calibration_profile must not be empty")
         if type(self.possession_v3_input_contract_version) is not int or self.possession_v3_input_contract_version < 1:
             raise ValueError("possession_v3_input_contract_version must be at least 1")
+        if type(self.possession_v3_ball_max_gap) is not int or self.possession_v3_ball_max_gap < 0:
+            raise ValueError("possession_v3_ball_max_gap must be non-negative")
         if self.frame_stride < 1:
             raise ValueError("frame_stride must be at least 1")
         if self.shot_frame_stride < 1:
@@ -458,6 +462,9 @@ class PipelineConfig:
             ),
             "possession_v3_input_contract_version": _env_int(
                 "POSSESSION_V3_INPUT_CONTRACT_VERSION", DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION
+            ),
+            "possession_v3_ball_max_gap": _env_int(
+                "POSSESSION_V3_BALL_MAX_GAP", DEFAULT_POSSESSION_V3_BALL_MAX_GAP
             ),
             "team_embedder_backend": os.getenv(
                 "TEAM_EMBEDDER_BACKEND", DEFAULT_TEAM_EMBEDDER_BACKEND

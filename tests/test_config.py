@@ -71,6 +71,28 @@ def test_from_env_reads_possession_transition_gap(monkeypatch):
     assert PipelineConfig.from_env().possession_transition_max_gap == 7
 
 
+def test_v3_ball_gap_defaults_and_reads_env(monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.delenv("POSSESSION_V3_BALL_MAX_GAP", raising=False)
+    assert PipelineConfig(roboflow_api_key="test-key").possession_v3_ball_max_gap == 3
+    monkeypatch.setenv("POSSESSION_V3_BALL_MAX_GAP", "6")
+    assert PipelineConfig.from_env().possession_v3_ball_max_gap == 6
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, float("nan"), float("inf")])
+def test_v3_ball_gap_rejects_invalid_values(value):
+    with pytest.raises((ValueError, TypeError)):
+        PipelineConfig(roboflow_api_key="test-key", possession_v3_ball_max_gap=value)
+
+
+def test_v3_ball_gap_rejects_invalid_env(monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    for value in ("-1", "nan", "inf"):
+        monkeypatch.setenv("POSSESSION_V3_BALL_MAX_GAP", value)
+        with pytest.raises((ValueError, TypeError)):
+            PipelineConfig.from_env()
+
+
 def test_from_env_reads_opt_in_v3_engine_and_profile(monkeypatch):
     for key, value in {"ROBOFLOW_API_KEY": "test-key", "POSSESSION_ENGINE": "v3", "POSSESSION_V3_GRACE_SECONDS": "0.4", "POSSESSION_V3_CALIBRATION_PROFILE": "pilot"}.items():
         monkeypatch.setenv(key, value)

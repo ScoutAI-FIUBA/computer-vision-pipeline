@@ -359,3 +359,211 @@ class PossessionResolver:
                     frame_indices=obs.provenance.frame_indices + [confirmation_frame])))
                 self.history[i] = revised[-1]
         return revised
+
+
+def _ball_center(row):
+    center = row.get("center_xy", row.get("center")) if isinstance(row, dict) else None
+    return tuple(float(v) for v in center) if isinstance(center, (list, tuple)) and len(center) == 2 and all(isinstance(v, (int, float)) and math.isfinite(float(v)) for v in center) else None
+
+
+def _ball_source(row):
+    state = row.get("track_state") if isinstance(row, dict) else None
+    return state if state in {"detected", "fallback", "lost"} else None
+
+
+def _bounded_number(value):
+    return type(value) in {int, float} and math.isfinite(float(value)) and 0 <= float(value) <= 1
+
+
+def _provenance(row, frame):
+    records = row.get("source_records")
+    frames = row.get("source_frame_indices")
+    if records is None:
+        records = [f"ball_tracks.jsonl#frame={frame}"]
+    elif not isinstance(records, (list, tuple)) or not records or any(type(value) is not str or not value.strip() for value in records):
+        return None
+    if frames is None:
+        frames = [frame]
+    elif not isinstance(frames, (list, tuple)) or not frames or any(type(value) is not int or value < 0 for value in frames):
+        return None
+    return list(records), list(frames)
+
+
+def normalize_ball_rows(rows, *, real_fps, max_gap_frames=None, config=None):
+    """Copy closed TrackNet rows and fill only bounded, valid coordinate gaps."""
+    if max_gap_frames is None and config is not None:
+        max_gap_frames = config.possession_v3_ball_max_gap
+    if type(real_fps) not in {int, float} or not math.isfinite(float(real_fps)) or real_fps <= 0 or type(max_gap_frames) is not int or max_gap_frames < 0:
+        raise ValueError("real_fps must be positive and max_gap_frames must be non-negative")
+    raw_rows = [dict(row) for row in rows if isinstance(row, dict) and type(row.get("frame_index")) is int and row["frame_index"] >= 0]
+    previous_time = None
+    for previous, current in zip(raw_rows, raw_rows[1:]):
+        if current["frame_index"] < previous["frame_index"]:
+            raise ValueError("ball frame indices must be monotonic")
+    for row in raw_rows:
+        timestamp = row.get("timestamp_seconds")
+        if timestamp is not None and (type(timestamp) not in {int, float} or not math.isfinite(float(timestamp))):
+            raise ValueError("timestamp_seconds must be finite when present")
+        if timestamp is not None and previous_time is not None and timestamp < previous_time:
+            raise ValueError("ball timestamps must be monotonic")
+        if timestamp is not None:
+            previous_time = timestamp
+    ordered = sorted(raw_rows, key=lambda row: row["frame_index"])
+    if len({row["frame_index"] for row in ordered}) != len(ordered):
+        raise ValueError("duplicate ball frame indices")
+    output = []
+    for row in ordered:
+        source = _ball_source(row)
+        point = _ball_center(row)
+        confidence = row.get("confidence")
+        valid_quality = source == "lost" or _bounded_number(confidence)
+        provenance = _provenance(row, row["frame_index"])
+        if source and point is not None and valid_quality and provenance is not None:
+            copy = dict(row)
+            records, frames = provenance
+            copy.update(ball_source=source, quality=float(confidence) if _bounded_number(confidence) else 0.0,
+                        source_frame_indices=frames, source_records=records)
+            output.append(copy)
+        else:
+            output.append(dict(row, ball_source="lost", quality=0.0))
+    filled = []
+    for left, right in zip(output, output[1:]):
+        filled.append(left)
+        gap = right["frame_index"] - left["frame_index"] - 1
+        if gap < 1 or gap > max_gap_frames or left["ball_source"] not in {"detected", "fallback"} or right["ball_source"] not in {"detected", "fallback"}:
+            continue
+        lt = left.get("timestamp_seconds")
+        rt = right.get("timestamp_seconds")
+        duration = (float(rt) - float(lt)) if isinstance(lt, (int, float)) and isinstance(rt, (int, float)) else (gap + 1) / float(real_fps)
+        if duration > (max_gap_frames + 1) / float(real_fps) + 1e-9:
+            continue
+        a, b = _ball_center(left), _ball_center(right)
+        for frame in range(1, gap + 1):
+            ratio = frame / (gap + 1)
+            point = [a[i] + (b[i] - a[i]) * ratio for i in range(2)]
+            records = left["source_records"] + right["source_records"]
+            frames = left["source_frame_indices"] + right["source_frame_indices"]
+            filled.append({"frame_index": left["frame_index"] + frame,
+                           "timestamp_seconds": (float(lt) + duration * ratio) if isinstance(lt, (int, float)) else None,
+                           "track_state": "inferred", "ball_source": "interpolated", "quality": min(left["quality"], right["quality"]) * .5,
+                           "center_xy": point, "xyxy": None, "track_id": None,
+                           "source_frame_indices": list(dict.fromkeys(frames)),
+                           "source_records": list(dict.fromkeys(records))})
+    if output:
+        filled.append(output[-1])
+    return sorted(filled, key=lambda row: row["frame_index"])
+
+
+def _holder_by_frame(states):
+    result = {}
+    for state in states or []:
+        frame = state.frame_index if isinstance(state, PossessionObservation) else state.get("frame_index")
+        holder = state.stable_player_id if isinstance(state, PossessionObservation) else state.get("stable_player_id")
+        result[frame] = holder
+    return result
+
+
+def _reject_duplicate_ball_frames(rows):
+    frames = [row.get("frame_index") for row in rows]
+    if len(frames) != len(set(frames)):
+        raise ValueError("duplicate ball frame indices")
+    last_time = None
+    for row in rows:
+        timestamp = row.get("timestamp_seconds")
+        if timestamp is not None and last_time is not None and timestamp < last_time:
+            raise ValueError("ball rows must be monotonic")
+        if timestamp is not None:
+            last_time = timestamp
+    if any(b < a for a, b in zip(frames, frames[1:])):
+        raise ValueError("ball rows must be monotonic")
+
+
+def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seconds=.3, release_persistence_frames=2, reception_persistence_frames=2):
+    """Derive only conservative, provenance-bearing primitive ball events."""
+    if type(real_fps) not in {int, float} or not math.isfinite(float(real_fps)) or real_fps <= 0:
+        raise ValueError("real_fps must be positive")
+    if type(loose_seconds) not in {int, float} or not math.isfinite(float(loose_seconds)) or loose_seconds < 0:
+        raise ValueError("loose_seconds must be finite and non-negative")
+    for value, name in ((release_persistence_frames, "release_persistence_frames"), (reception_persistence_frames, "reception_persistence_frames")):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    ball_rows = list(ball_rows)
+    _reject_duplicate_ball_frames(ball_rows)
+    rows = sorted((row for row in ball_rows if type(row.get("frame_index")) is int and row["frame_index"] >= 0
+                   and row.get("ball_source") in {"detected", "fallback", "interpolated"}
+                   and _ball_center(row) is not None and _bounded_number(row.get("quality"))
+                   and _provenance(row, row["frame_index"]) is not None
+                   and "source_records" in row and "source_frame_indices" in row
+                   and (row.get("timestamp_seconds") is None or (type(row.get("timestamp_seconds")) in {int, float} and math.isfinite(float(row["timestamp_seconds"]))))), key=lambda row: row["frame_index"])
+    holders = _holder_by_frame(possession_states)
+    result = []
+    i = 0
+    while i < len(rows):
+        frame = rows[i]["frame_index"]
+        holder = holders.get(frame)
+        if holder is not None:
+            j = i + 1
+            while j < len(rows) and holders.get(rows[j]["frame_index"]) is None:
+                j += 1
+            destination = holders.get(rows[j]["frame_index"]) if j < len(rows) else None
+            destination_end = j
+            while (destination is not None and destination_end + 1 < len(rows)
+                   and rows[destination_end + 1]["frame_index"] == rows[destination_end]["frame_index"] + 1
+                   and holders.get(rows[destination_end + 1]["frame_index"]) == destination):
+                destination_end += 1
+            if (j < len(rows) and destination not in {None, holder}
+                    and len(rows[i + 1:j]) >= release_persistence_frames
+                    and destination_end - j + 1 >= reception_persistence_frames):
+                gap = rows[i + 1:j]
+                if gap and all(rows[k]["frame_index"] == rows[k - 1]["frame_index"] + 1 for k in range(i + 2, j)):
+                    destination = holders[rows[j]["frame_index"]]
+                    points = [_ball_center(row) for row in [rows[i], *gap, rows[j]]]
+                    points = [point for point in points if point is not None]
+                    moved = len(points) > 1 and any(points[n] != points[n - 1] for n in range(1, len(points)))
+                    refs = sorted({ref for row in [rows[i], *gap, rows[j]] for ref in row.get("source_records", [])})
+                    base = {"frame_index": gap[0]["frame_index"], "source_frame_indices": sorted({row["frame_index"] for row in [rows[i], *gap, rows[j]]}), "provenance": {"source_records": refs, "frame_indices": sorted({row["frame_index"] for row in [rows[i], *gap, rows[j]]}), "reason_codes": []}}
+                    result.append(dict(base, primitive_type="BALL_RELEASE", reason_codes=["holder_separation"]))
+                    if moved:
+                        result.append(dict(base, primitive_type="BALL_IN_TRANSIT", frame_index=gap[0]["frame_index"], reason_codes=["trajectory"] , provenance=dict(base["provenance"], frame_indices=[row["frame_index"] for row in gap])))
+                        result.append(dict(base, primitive_type="BALL_RECEPTION", frame_index=rows[destination_end]["frame_index"], reason_codes=["unique_reception"], provenance=dict(base["provenance"], frame_indices=[rows[destination_end]["frame_index"]])))
+                i = destination_end
+                continue
+        i += 1
+    # A loose interval is emitted once, only after its real-FPS duration is met.
+    empty = [row for row in rows if holders.get(row["frame_index"]) is None]
+    start = 0
+    while start < len(empty):
+        end = start
+        while end + 1 < len(empty) and empty[end + 1]["frame_index"] == empty[end]["frame_index"] + 1:
+            end += 1
+        if (empty[end]["frame_index"] - empty[start]["frame_index"]) / float(real_fps) >= loose_seconds:
+            refs = sorted({ref for row in empty[start:end + 1] for ref in row.get("source_records", [])})
+            result.append({"primitive_type": "LOOSE_BALL", "frame_index": empty[start]["frame_index"] + int(loose_seconds * real_fps),
+                           "source_frame_indices": [row["frame_index"] for row in empty[start:end + 1]],
+                           "provenance": {"source_records": refs, "frame_indices": [row["frame_index"] for row in empty[start:end + 1]], "reason_codes": ["unpossessed_duration"]},
+                           "reason_codes": ["unpossessed_duration"]})
+        start = end + 1
+    order = {"BALL_RELEASE": 0, "BALL_IN_TRANSIT": 1, "BALL_RECEPTION": 2, "LOOSE_BALL": 3}
+    return sorted(result, key=lambda item: (item["frame_index"], order[item["primitive_type"]]))
+
+
+def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_seconds=.3, release_persistence_frames=2, reception_persistence_frames=2):
+    ball_rows = list(ball_rows)
+    _reject_duplicate_ball_frames(ball_rows)
+    primitives = derive_ball_primitives(ball_rows, possession_states, real_fps=real_fps, loose_seconds=loose_seconds, release_persistence_frames=release_persistence_frames, reception_persistence_frames=reception_persistence_frames)
+    if not primitives:
+        return []
+    grouped = [item for item in primitives if item["primitive_type"] != "LOOSE_BALL"]
+    if not {item["primitive_type"] for item in grouped}.issuperset({"BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"}):
+        return []
+    holders = _holder_by_frame(possession_states)
+    release = next(item for item in grouped if item["primitive_type"] == "BALL_RELEASE")
+    reception = next(item for item in grouped if item["primitive_type"] == "BALL_RECEPTION")
+    refs = sorted({ref for item in grouped for ref in item["provenance"]["source_records"]})
+    return [BallTransition(f"ball-transition-{release['frame_index']}", holders.get(release["frame_index"] - 1), holders.get(reception["frame_index"]),
+                          [item["primitive_type"] for item in grouped],
+                          Provenance(refs, sorted({frame for item in grouped for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
+                          frame_start=release["frame_index"], frame_end=reception["frame_index"], confidence=.5)]
+
+
+extract_ball_primitives = derive_ball_primitives
