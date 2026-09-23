@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Any, Iterable, Mapping
 
+import cv2
+import numpy as np
+
 
 @dataclass(frozen=True)
 class BBoxSanitizerConfig:
@@ -36,6 +39,7 @@ class TemporalSanitizerResult:
     corrected_count: int = 0
     unresolved_count: int = 0
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    cleaned_masks_by_observation: dict[str, Any] = field(default_factory=dict)
 
 
 def _box(value: Any, coordinate_space: str | None) -> tuple[float, float, float, float] | None:
@@ -98,9 +102,145 @@ def _interpolate(first: tuple[float, ...], second: tuple[float, ...], fraction: 
     return [round(left + (right - left) * fraction, 6) for left, right in zip(first, second)]
 
 
+def _mask_bbox(component: tuple[int, int, int, int], shape: tuple[int, int], coordinate_space: str | None) -> list[float]:
+    x, y, width, height = component
+    x2, y2 = x + width, y + height
+    if coordinate_space == "normalized":
+        frame_height, frame_width = shape
+        return [round(x / frame_width, 6), round(y / frame_height, 6), round(x2 / frame_width, 6), round(y2 / frame_height, 6)]
+    return [float(x), float(y), float(x2), float(y2)]
+
+
+def _iou(first: tuple[float, float, float, float], second: tuple[float, float, float, float]) -> float:
+    x1, y1 = max(first[0], second[0]), max(first[1], second[1])
+    x2, y2 = min(first[2], second[2]), min(first[3], second[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if intersection <= 0:
+        return 0.0
+    union = (first[2] - first[0]) * (first[3] - first[1]) + (second[2] - second[0]) * (second[3] - second[1]) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _mask_cleanup(
+    rows: list[dict[str, Any]],
+    masks_by_observation: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
+    """Keep a component only when geometry gives a conservative winner."""
+    groups: dict[int, list[int]] = {}
+    for index, row in enumerate(rows):
+        groups.setdefault(int(row["raw_track_id"]), []).append(index)
+    cleaned: dict[str, Any] = {}
+    diagnostics: dict[int, dict[str, Any]] = {}
+    for indices in groups.values():
+        indices.sort(key=lambda index: int(rows[index]["frame_index"]))
+        for position, index in enumerate(indices):
+            row = rows[index]
+            key = str(row.get("observation_key", ""))
+            if key not in masks_by_observation:
+                continue
+            try:
+                raw_mask = np.asarray(masks_by_observation[key])
+                if raw_mask.ndim != 2 or not np.isfinite(raw_mask).all():
+                    raise ValueError
+                binary = raw_mask.astype(bool)
+            except (TypeError, ValueError, OverflowError):
+                diagnostics[index] = {"reason": "invalid_mask"}
+                continue
+            if not binary.any():
+                diagnostics[index] = {"reason": "empty_mask"}
+                continue
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(binary.astype(np.uint8), 8)
+            components = [
+                (int(stats[label, cv2.CC_STAT_LEFT]), int(stats[label, cv2.CC_STAT_TOP]), int(stats[label, cv2.CC_STAT_WIDTH]), int(stats[label, cv2.CC_STAT_HEIGHT]), int(stats[label, cv2.CC_STAT_AREA]), label)
+                for label in range(1, count)
+            ]
+            if not components:
+                diagnostics[index] = {"reason": "empty_mask"}
+                continue
+            coordinate_space = row.get("bbox_coordinate_space")
+            previous = _box(_raw_value(rows[indices[position - 1]]), coordinate_space) if position else None
+            following = _box(_raw_value(rows[indices[position + 1]]), coordinate_space) if position + 1 < len(indices) else None
+            neighbor_boxes = [box for box in (previous, following) if box is not None]
+            neighbor_areas = [(box[2] - box[0]) * (box[3] - box[1]) for box in neighbor_boxes]
+            total_area = float(binary.sum())
+            scored: list[tuple[float, tuple[int, int, int, int, int, int], dict[str, float]]] = []
+            for component in components:
+                component_box = tuple(_mask_bbox(component[:4], binary.shape, coordinate_space))
+                area = float(component[4])
+                overlap = sum(_iou(component_box, box) for box in neighbor_boxes) / len(neighbor_boxes) if neighbor_boxes else 0.0
+                proximity = 0.0
+                if neighbor_boxes:
+                    cx = (component_box[0] + component_box[2]) / 2
+                    cy = (component_box[1] + component_box[3]) / 2
+                    distances = []
+                    for box in neighbor_boxes:
+                        diagonal = max(math.hypot(box[2] - box[0], box[3] - box[1]), 1e-6)
+                        distances.append(math.hypot(cx - (box[0] + box[2]) / 2, cy - (box[1] + box[3]) / 2) / diagonal)
+                    proximity = 1.0 / (1.0 + sum(distances) / len(distances))
+                size_consistency = 0.0
+                if neighbor_areas:
+                    size_consistency = 1.0 / (1.0 + abs(math.log(max(area, 1.0) / max(median(neighbor_areas), 1.0))))
+                relative_area = area / total_area
+                score_parts = {"overlap": overlap, "proximity": proximity, "size_consistency": size_consistency, "relative_area": relative_area}
+                score = 3.0 * overlap + 2.0 * proximity + size_consistency + relative_area
+                scored.append((score, component, score_parts))
+            scored.sort(key=lambda item: (-item[0], -item[1][4], item[1][0], item[1][1]))
+            best_score, best, best_parts = scored[0]
+            raw_box = _box(_raw_value(row), coordinate_space)
+            reference_area = median(neighbor_areas) if neighbor_areas else None
+            raw_area = None if raw_box is None else (raw_box[2] - raw_box[0]) * (raw_box[3] - raw_box[1])
+            if coordinate_space == "normalized" and raw_area is not None:
+                raw_area *= binary.shape[0] * binary.shape[1]
+            mask_is_implausibly_broad = (
+                raw_area is not None
+                and (best[4] > raw_area * 2.0
+                     or reference_area is not None and best[4] > reference_area * 2.0)
+            )
+            both_temporally_supported = len(scored) > 1 and best_parts["overlap"] > 0 and scored[1][2]["overlap"] > 0
+            ambiguous = (
+                len(scored) > 1
+                and scored[1][1][4] >= best[4] * 0.8
+                and best_score - scored[1][0] < 3.0
+                and (both_temporally_supported or best_score - scored[1][0] < 0.45)
+            )
+            if not neighbor_boxes and len(scored) > 1:
+                raw_iou = 0.0 if raw_box is None else _iou(tuple(_mask_bbox(best[:4], binary.shape, coordinate_space)), raw_box)
+                dominant = best[4] >= scored[1][1][4] * 4.0 and best_parts["relative_area"] >= 0.7 and raw_iou >= 0.5
+                ambiguous = not dominant
+            if ambiguous:
+                reason = "ambiguous_components_no_temporal_evidence" if not neighbor_boxes else "ambiguous_components"
+                diagnostics[index] = {
+                    "reason": reason,
+                    "component_count": len(scored),
+                    "scores": [round(item[0], 6) for item in scored],
+                }
+                continue
+            if mask_is_implausibly_broad:
+                diagnostics[index] = {"reason": "implausibly_broad_component"}
+                continue
+            clean = np.zeros_like(binary, dtype=bool)
+            clean[labels == best[5]] = True
+            cleaned[key] = clean
+            new_bbox = _mask_bbox(best[:4], binary.shape, coordinate_space)
+            if _box(_raw_value(row), coordinate_space) != tuple(new_bbox):
+                _preserve_raw_provenance(row)
+                if "mask_ref" in row:
+                    row.setdefault("raw_mask_ref", row["mask_ref"])
+                row["bbox_xyxy"] = new_bbox
+                row.update({"bbox_corrected": True, "bbox_correction_method": "mask_cleanup", "bbox_unresolved": False})
+                row["bbox_outlier_score"] = round(best_score, 6)
+                row["bbox_outlier_diagnostics"] = {"mask_cleanup": {**best_parts, "component_count": len(scored)}}
+            else:
+                # Keep the cleaned component even when its bbox is unchanged;
+                # ReID and debug rendering must not silently fall back to blobs.
+                pass
+    return cleaned, diagnostics
+
+
 def sanitize_temporal_bboxes(
     observations: Iterable[Mapping[str, Any]],
     config: BBoxSanitizerConfig | Any,
+    masks_by_observation: Mapping[str, Any] | None = None,
 ) -> TemporalSanitizerResult:
     """Detect robust multi-signal outliers and interpolate only bounded gaps.
 
@@ -124,6 +264,10 @@ def sanitize_temporal_bboxes(
         if "bbox_xyxy" not in row and "bbox" in row:
             value = row["bbox"]
             row["bbox_xyxy"] = list(value) if isinstance(value, (list, tuple)) else value
+    cleaned_masks: dict[str, Any] = {}
+    mask_diagnostics: dict[int, dict[str, Any]] = {}
+    if masks_by_observation is not None:
+        cleaned_masks, mask_diagnostics = _mask_cleanup(rows, masks_by_observation)
     groups: dict[int, list[int]] = {}
     for index, row in enumerate(rows):
         groups.setdefault(int(row["raw_track_id"]), []).append(index)
@@ -176,7 +320,8 @@ def sanitize_temporal_bboxes(
                 candidates.add(index)
                 scores[index] = (score, signal_scores)
 
-    corrected = 0
+    mask_cleanup_count = sum(row.get("bbox_correction_method") == "mask_cleanup" for row in rows)
+    corrected = mask_cleanup_count
     unresolved = 0
     for indices in groups.values():
         indices.sort(key=lambda index: int(rows[index]["frame_index"]))
@@ -197,7 +342,11 @@ def sanitize_temporal_bboxes(
             frames = int(rows[indices[next_index]]["frame_index"]) - int(rows[indices[previous_index]]["frame_index"]) if previous_box and next_box else 0
             space = rows[indices[start]].get("bbox_coordinate_space")
             same_space = previous_index >= 0 and next_index < len(indices) and rows[indices[previous_index]].get("bbox_coordinate_space") == space == rows[indices[next_index]].get("bbox_coordinate_space")
-            if previous_box and next_box and same_space and gap <= cfg.max_interpolation_gap and frames - 1 <= cfg.max_interpolation_gap:
+            mask_blocks_interpolation = any(
+                mask_diagnostics.get(indices[offset], {}).get("reason") == "ambiguous_components"
+                for offset in range(start, end + 1)
+            )
+            if previous_box and next_box and same_space and not mask_blocks_interpolation and gap <= cfg.max_interpolation_gap and frames - 1 <= cfg.max_interpolation_gap:
                 endpoint_distance = _features(next_box, previous_box)[4]
                 baseline_distances = [
                     _features(valid[item], valid[indices[position - 1]])[4]
@@ -235,12 +384,36 @@ def sanitize_temporal_bboxes(
                 _preserve_raw_provenance(row)
                 row.update({"bbox_corrected": False, "bbox_correction_method": "unresolved_outlier", "bbox_outlier": True, "bbox_unresolved": True})
                 row["bbox_outlier_score"] = round(scores[indices[offset]][0], 6)
-                row["bbox_outlier_diagnostics"] = {"signals": scores[indices[offset]][1], "reason": "ambiguous_or_long_gap"}
+                diagnostics = {"signals": scores[indices[offset]][1], "reason": "ambiguous_or_long_gap"}
+                if indices[offset] in mask_diagnostics:
+                    diagnostics["mask_cleanup"] = mask_diagnostics[indices[offset]]
+                row["bbox_outlier_diagnostics"] = diagnostics
                 unresolved += 1
             position += 1
+
+    for index, mask_diagnostic in mask_diagnostics.items():
+        if not mask_diagnostic.get("reason", "").startswith("ambiguous_components"):
+            continue
+        row = rows[index]
+        if row.get("bbox_unresolved"):
+            continue
+        _preserve_raw_provenance(row)
+        row.update({"bbox_corrected": False, "bbox_correction_method": "unresolved_mask", "bbox_outlier": True, "bbox_unresolved": True})
+        row["bbox_outlier_score"] = 0.0
+        row["bbox_outlier_diagnostics"] = {"mask_cleanup": mask_diagnostic}
+        unresolved += 1
 
     for row in rows:
         if "bbox_corrected" not in row:
             _preserve_raw_provenance(row)
             row.update({"bbox_corrected": False, "bbox_correction_method": "none", "bbox_outlier": False, "bbox_unresolved": False, "bbox_outlier_score": 0.0})
-    return TemporalSanitizerResult(rows, corrected, unresolved, {"corrected_count": corrected, "unresolved_count": unresolved})
+    diagnostics = {"corrected_count": corrected, "unresolved_count": unresolved}
+    if masks_by_observation is not None:
+        diagnostics["mask_cleanup_count"] = mask_cleanup_count
+    return TemporalSanitizerResult(
+        rows,
+        corrected,
+        unresolved,
+        diagnostics,
+        cleaned_masks,
+    )

@@ -72,6 +72,23 @@ def test_package_preserves_acceptance_reasons_for_debug_review(tmp_path: Path):
     assert manifest["acceptance_reasons"] == ["missing_stable_player_id:60:3"]
 
 
+def test_package_adds_optional_clean_mask_without_replacing_raw_mask(tmp_path: Path):
+    observations = _observations()
+    observations[0]["mask_ref"] = "masks/raw.png"
+    manifest = package_artifacts(
+        tmp_path,
+        observations,
+        {"60:3": np.ones((2, 2), dtype=np.uint8)},
+        clean_masks={"60:3": np.eye(2, dtype=np.uint8)},
+    )
+
+    written = json.loads((tmp_path / "tracks.jsonl").read_text())
+    assert written["mask_ref"] == "masks/raw.png"
+    assert written["clean_mask_ref"] == "masks_clean/" + manifest["artifacts"]["clean_masks"]["references"]["60:3"]["key"].rsplit("/", 1)[-1]
+    clean_key = manifest["artifacts"]["clean_masks"]["references"]["60:3"]["key"]
+    assert cv2.imread(str(tmp_path / clean_key), cv2.IMREAD_UNCHANGED) is not None
+
+
 def test_package_strips_runtime_bbox_coordinate_space_from_tracks(tmp_path: Path):
     observations = [{**_observations()[0], "bbox_coordinate_space": "normalized"}]
 

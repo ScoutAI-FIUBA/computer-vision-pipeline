@@ -204,6 +204,13 @@ def _add_mask_references(rows: list[dict[str, Any]], masks: dict[str, Any]) -> N
             row["mask_ref"] = f"masks/{_mask_filename(key)}"
 
 
+def _add_clean_mask_references(rows: list[dict[str, Any]], masks: dict[str, Any]) -> None:
+    for row in rows:
+        key = str(row["observation_key"])
+        if key in masks:
+            row["clean_mask_ref"] = f"masks_clean/{_mask_filename(key)}"
+
+
 def _file_fingerprint(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -434,6 +441,8 @@ class PipelineV2:
                 if hasattr(self, "seams"):
                     runner_kwargs["seams"] = self.seams
                 result = run_v2(rows, **runner_kwargs)
+                clean_masks = getattr(result, "cleaned_masks_by_observation", {})
+                _add_clean_mask_references(result.observations, clean_masks)
                 video_metadata = _video_metadata(video_path)
                 artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
                 sanitizer_metadata = getattr(result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
@@ -443,6 +452,7 @@ class PipelineV2:
                     output_dir,
                     result.observations,
                     masks,
+                    clean_masks=clean_masks,
                     input_fingerprint=_file_fingerprint(video_path),
                     video_metadata=video_metadata,
                     frame_bounds=[frame_start, frame_end],

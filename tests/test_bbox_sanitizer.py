@@ -220,17 +220,24 @@ def test_corrected_bbox_reaches_reid_boundary_before_identity_processing():
     class FakeEmbedder:
         def embed(self, image, boxes):
             marker = int(image[0, 0, 0])
-            captured.append((marker, tuple(image.shape[:2]), boxes))
+            captured.append((marker, image.copy(), tuple(image.shape[:2]), boxes))
             stage_events.append(f"reid:{marker}")
             return [[3.0, 4.0]]
 
     rows = [
         box_row(0, (10, 10, 18, 28)),
-        box_row(1, (100, 100, 180, 190)),
+        box_row(1, (100, 100, 180, 190), mask_ref="masks/raw-1.png"),
         box_row(2, (12, 10, 24, 32)),
     ]
     frames = {index: np.full((40, 40, 3), index + 1, dtype=np.uint8) for index in range(3)}
-    masks = {row["observation_key"]: np.ones((40, 40), dtype=bool) for row in rows}
+    middle_mask = _mask(rects=((11, 10, 21, 30),))
+    middle_mask[16:22, 14:18] = 0
+    middle_mask[18:20, 15:17] = 1
+    masks = {
+        "0:7": _mask(rects=((10, 10, 18, 28), (35, 35, 38, 38))),
+        "1:7": middle_mask,
+        "2:7": _mask(rects=((12, 10, 24, 32), (35, 35, 38, 38))),
+    }
 
     def resolve(items):
         stage_events.append("identity")
@@ -254,9 +261,118 @@ def test_corrected_bbox_reaches_reid_boundary_before_identity_processing():
         [12, 10, 24, 32],
     ]
     assert result.observations[1]["raw_bbox"] == [100, 100, 180, 190]
-    assert captured == [
+    assert result.observations[1]["raw_mask_ref"] == "masks/raw-1.png"
+    assert [(marker, shape, boxes) for marker, _image, shape, boxes in captured] == [
         (1, (18, 8), [[0.0, 0.0, 8.0, 18.0]]),
         (2, (20, 10), [[0.0, 0.0, 10.0, 20.0]]),
         (3, (22, 12), [[0.0, 0.0, 12.0, 22.0]]),
     ]
+    assert captured[1][1].shape == (20, 10, 3)
+    assert int(captured[1][1].sum()) == 1056
+    assert captured[1][1][9, 5].tolist() == [0, 0, 0]
+    assert masks["1:7"].sum() == 180
+    assert result.cleaned_masks_by_observation["1:7"].sum() == 176
     assert stage_events == ["reid:1", "reid:2", "reid:3", "identity"]
+
+
+def _mask(shape=(40, 40), rects=()):
+    mask = np.zeros(shape, dtype=np.uint8)
+    for x1, y1, x2, y2 in rects:
+        mask[y1:y2, x1:x2] = 1
+    return mask
+
+
+def test_mask_cleanup_keeps_main_component_and_removes_remote_blob():
+    rows = [
+        box_row(0, (10, 10, 20, 30)),
+        box_row(1, (100, 100, 180, 190)),
+        box_row(2, (12, 10, 22, 30)),
+    ]
+    masks = {row["observation_key"]: _mask(rects=((11, 10, 21, 30), (35, 35, 38, 38))) for row in rows}
+
+    result = sanitize_temporal_bboxes(rows, enabled(), masks_by_observation=masks)
+
+    fixed = result.rows[1]
+    assert fixed["bbox_xyxy"] == [11.0, 10.0, 21.0, 30.0]
+    assert fixed["bbox_correction_method"] == "mask_cleanup"
+    assert fixed["bbox_corrected"] is True
+    assert result.cleaned_masks_by_observation["1:7"].sum() == 200
+    assert masks["1:7"].sum() == 209
+
+
+def test_mask_cleanup_does_not_choose_between_two_ambiguous_large_components():
+    rows = [box_row(0, (8, 8, 20, 28)), box_row(1, (100, 100, 180, 190)), box_row(2, (22, 8, 34, 28))]
+    masks = {row["observation_key"]: _mask(rects=((8, 8, 20, 28), (22, 8, 34, 28))) for row in rows}
+
+    result = sanitize_temporal_bboxes(rows, enabled(), masks_by_observation=masks)
+
+    assert result.rows[1]["bbox_xyxy"] == [100, 100, 180, 190]
+    assert result.rows[1]["bbox_correction_method"] == "unresolved_outlier"
+    assert result.rows[1]["bbox_unresolved"] is True
+    assert result.rows[1]["bbox_outlier_diagnostics"]["mask_cleanup"]["reason"] == "ambiguous_components"
+
+
+def test_clean_single_component_recalculates_bbox_and_preserves_raw_mask():
+    rows = [box_row(0, (0, 0, 40, 40), bbox_coordinate_space="pixel", mask_ref="masks/raw.png")]
+    raw_mask = _mask(rects=((5, 7, 15, 19),))
+
+    result = sanitize_temporal_bboxes(rows, enabled(), masks_by_observation={"0:7": raw_mask})
+
+    assert result.rows[0]["bbox_xyxy"] == [5.0, 7.0, 15.0, 19.0]
+    assert result.rows[0]["raw_bbox"] == [0, 0, 40, 40]
+    assert result.rows[0]["raw_mask_ref"] == "masks/raw.png"
+    assert np.array_equal(raw_mask, _mask(rects=((5, 7, 15, 19),)))
+
+
+def test_mask_cleanup_converts_pixel_bbox_to_normalized_coordinates():
+    row = box_row(0, (0.0, 0.0, 1.0, 1.0), bbox_coordinate_space="normalized")
+    mask = _mask(shape=(20, 40), rects=((4, 5, 14, 15),))
+
+    result = sanitize_temporal_bboxes([row], enabled(), masks_by_observation={"0:7": mask})
+
+    assert result.rows[0]["bbox_xyxy"] == [0.1, 0.25, 0.35, 0.75]
+
+
+def test_mask_cleanup_falls_back_to_temporal_interpolation_when_mask_is_unusable():
+    rows = [box_row(0, (10, 10, 20, 30)), box_row(1, (100, 100, 180, 190)), box_row(2, (12, 10, 22, 30))]
+    masks = {"1:7": np.zeros((40, 40), dtype=np.uint8)}
+
+    result = sanitize_temporal_bboxes(rows, enabled(), masks_by_observation=masks)
+
+    assert result.rows[1]["bbox_xyxy"] == [11.0, 10.0, 21.0, 30.0]
+    assert result.rows[1]["bbox_correction_method"] == "linear_interpolation"
+
+
+def test_runner_reid_receives_clean_mask_geometry():
+    rows = [box_row(0, (100, 100, 180, 190), mask_ref="masks/raw.png")]
+    mask = _mask(rects=((5, 7, 15, 19),))
+    captured = []
+
+    class Embedder:
+        def embed(self, image, boxes):
+            captured.append((image.shape[:2], boxes))
+            return [[1.0, 0.0]]
+
+    result = run_v2(
+        rows,
+        seams=RunnerV2Seams(identity=lambda items: {items[0]["observation_key"]: "player-007"}, reid=Embedder()),
+        frames_by_index={0: np.zeros((40, 40, 3), dtype=np.uint8)},
+        masks_by_observation={"0:7": mask},
+        bbox_sanitizer_config=enabled(),
+    )
+
+    assert captured == [((12, 10), [[0.0, 0.0, 10.0, 12.0]])]
+    assert result.cleaned_masks_by_observation["0:7"].sum() == 120
+
+
+def test_multiple_components_without_temporal_evidence_are_unresolved():
+    row = box_row(0, (1, 1, 20, 20))
+    mask = _mask(rects=((2, 2, 12, 12), (25, 2, 32, 9)))
+
+    result = sanitize_temporal_bboxes([row], enabled(), masks_by_observation={"0:7": mask})
+
+    assert result.rows[0]["bbox_xyxy"] == [1, 1, 20, 20]
+    assert result.rows[0]["bbox_correction_method"] == "unresolved_mask"
+    assert result.rows[0]["bbox_unresolved"] is True
+    assert result.rows[0]["bbox_outlier_diagnostics"]["mask_cleanup"]["reason"] == "ambiguous_components_no_temporal_evidence"
+    assert result.unresolved_count == 1

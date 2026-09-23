@@ -154,6 +154,7 @@ def package_artifacts(
     output_dir: Path,
     observations: Iterable[Mapping[str, Any]],
     masks: Mapping[str, Any],
+    clean_masks: Mapping[str, Any] | None = None,
     *,
     input_fingerprint: str | None = None,
     video_metadata: Mapping[str, Any] | None = None,
@@ -173,6 +174,12 @@ def package_artifacts(
     keys = [str(row["observation_key"]) for row in rows]
     if len(keys) != len(set(keys)):
         raise ValueError("duplicate observation_key")
+
+    if clean_masks:
+        for row in rows:
+            key = str(row["observation_key"])
+            if key in clean_masks:
+                row["clean_mask_ref"] = f"masks_clean/{_mask_filename(key)}"
 
     tracks_path = output_dir / "tracks.jsonl"
     tracks_path.write_text(
@@ -201,6 +208,21 @@ def package_artifacts(
             raise OSError(f"could not write mask for {key!r}")
         mask_refs[key] = _artifact_ref(mask_path, f"{output_prefix}/masks/{filename}".lstrip("/"))
 
+    clean_mask_refs: dict[str, dict[str, Any]] = {}
+    if clean_masks:
+        clean_mask_dir = output_dir / "masks_clean"
+        clean_mask_dir.mkdir(exist_ok=True)
+        for key, value in clean_masks.items():
+            mask = np.asarray(value)
+            if mask.ndim != 2:
+                raise ValueError(f"clean mask for {key!r} must be a 2-D array")
+            mask = mask.astype(np.uint8, copy=False)
+            filename = _mask_filename(key)
+            mask_path = clean_mask_dir / filename
+            if not cv2.imwrite(str(mask_path), mask):
+                raise OSError(f"could not write clean mask for {key!r}")
+            clean_mask_refs[key] = _artifact_ref(mask_path, f"{output_prefix}/masks_clean/{filename}".lstrip("/"))
+
     prefix = output_prefix.strip("/")
     tracks_key = f"{prefix}/tracks.jsonl" if prefix else "tracks.jsonl"
     transfer_errors_list = list(transfer_errors)
@@ -221,7 +243,7 @@ def package_artifacts(
         "artifacts": {
             "manifest": {"key": f"{prefix}/manifest.json" if prefix else "manifest.json"},
             "tracks": {**_artifact_ref(tracks_path, tracks_key)},
-            "masks": {
+        "masks": {
                 "key": f"{prefix}/masks/" if prefix else "masks/",
                 "count": len(mask_refs),
                 "missing": missing_masks,
@@ -232,6 +254,12 @@ def package_artifacts(
         "truncated": incomplete,
         "complete": not incomplete,
     }
+    if clean_mask_refs:
+        manifest["artifacts"]["clean_masks"] = {
+            "key": f"{prefix}/masks_clean/" if prefix else "masks_clean/",
+            "count": len(clean_mask_refs),
+            "references": clean_mask_refs,
+        }
     manifest_path = output_dir / "manifest.json"
     manifest["artifacts"]["manifest"]["sha256"] = _manifest_hash(manifest)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")

@@ -137,6 +137,7 @@ class RunnerV2Result:
     acceptance: dict[str, Any] = field(default_factory=dict)
     acceptance_reasons: list[str] = field(default_factory=list)
     runtime_diagnostics: dict[str, Any] = field(default_factory=dict)
+    cleaned_masks_by_observation: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -561,9 +562,15 @@ class RunnerV2:
     ) -> RunnerV2Result:
         rows = _copy_observations(observations)
         sanitizer_report = None
+        downstream_masks = masks_by_observation
         if bbox_sanitizer_config is not None:
-            sanitizer_report = sanitize_temporal_bboxes(rows, bbox_sanitizer_config)
+            sanitizer_report = sanitize_temporal_bboxes(
+                rows, bbox_sanitizer_config, masks_by_observation=masks_by_observation
+            )
             rows = sanitizer_report.rows
+            if masks_by_observation is not None:
+                downstream_masks = dict(masks_by_observation)
+                downstream_masks.update(sanitizer_report.cleaned_masks_by_observation)
         reasons = _duplicate_observation_key_reasons(rows)
         structurally_valid = not reasons
         frames = frames_by_index or {}
@@ -575,7 +582,7 @@ class RunnerV2:
         stage_receipts = _mint_runtime_stage_receipts()
 
         appearance_requested = self.seams.reid is not None or self.seams.team_embedder is not None
-        if structurally_valid and appearance_requested and masks_by_observation is None:
+        if structurally_valid and appearance_requested and downstream_masks is None:
             reasons.extend(
                 f"missing_masks_by_observation:{row.get('observation_key', '')}" for row in rows
             )
@@ -584,11 +591,11 @@ class RunnerV2:
         prepared_crops: dict[str, MaskAppearanceCrop] = {}
         if structurally_valid and self.seams.reid is not None:
             downstream["reid_records"], prepared_crops, reid_receipts = _run_reid(
-                rows, self.seams.reid, frames, masks_by_observation
+                rows, self.seams.reid, frames, downstream_masks
             )
             stage_receipts = stage_receipts._with(reid=reid_receipts)
-        elif structurally_valid and self.seams.team_embedder is not None and masks_by_observation is not None:
-            prepared_crops = _prepare_masked_crops(rows, frames, masks_by_observation)
+        elif structurally_valid and self.seams.team_embedder is not None and downstream_masks is not None:
+            prepared_crops = _prepare_masked_crops(rows, frames, downstream_masks)
 
         if structurally_valid:
             reasons.extend(_resolve_identity(rows, self.seams.identity))
@@ -600,7 +607,7 @@ class RunnerV2:
 
         if structurally_valid and self.seams.team_embedder is not None:
             team_rows = rows
-            if masks_by_observation is not None:
+            if downstream_masks is not None:
                 team_rows = [
                     row
                     for row in rows
@@ -615,7 +622,7 @@ class RunnerV2:
                     self.seams.team_clusterer or KMeansTeamClusterer(),
                     self.seams.team_count,
                     frames,
-                    prepared_crops if masks_by_observation is not None else None,
+                    prepared_crops if downstream_masks is not None else None,
                 )
                 runtime_diagnostics.update({
                     "debug_runtime_only": True,
@@ -663,7 +670,14 @@ class RunnerV2:
             row.pop("bbox_coordinate_space", None)
         if not structurally_valid:
             acceptance_reasons = reasons
-        return RunnerV2Result(rows, downstream, acceptance, acceptance_reasons, runtime_diagnostics)
+        return RunnerV2Result(
+            rows,
+            downstream,
+            acceptance,
+            acceptance_reasons,
+            runtime_diagnostics,
+            {} if sanitizer_report is None else sanitizer_report.cleaned_masks_by_observation,
+        )
 
 
 def run_v2(

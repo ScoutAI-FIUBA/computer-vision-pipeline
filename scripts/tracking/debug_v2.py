@@ -86,13 +86,14 @@ def _mask_path(mask_ref: Any, masks_dir: Path) -> Path | None:
 
 
 def _load_mask(row: dict[str, Any], masks_dir: Path, shape: tuple[int, int]) -> np.ndarray | None:
-    path = _mask_path(row.get("mask_ref"), masks_dir)
-    if path is None or not path.is_file():
-        return None
-    mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if mask is None or mask.ndim != 2 or mask.shape != shape:
-        return None
-    return mask > 0
+    for reference in (row.get("clean_mask_ref"), row.get("mask_ref")):
+        path = _mask_path(reference, masks_dir)
+        if path is None or not path.is_file():
+            continue
+        mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if mask is not None and mask.ndim == 2 and mask.shape == shape:
+            return mask > 0
+    return None
 
 
 def _bbox_xyxy_in_pixels(raw_bbox: Any, shape: tuple[int, int]) -> list[int]:
