@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
+from collections.abc import Sequence
 from contextlib import nullcontext
+from numbers import Real
 from pathlib import Path
 from typing import Callable
 
@@ -663,7 +666,7 @@ def _attach_ball_evidence(
     evidence_path.write_text("".join(json.dumps(event) + "\n" for event in enriched), encoding="utf-8")
 
 
-def _normalize_v2_stats_rows(observations) -> list[dict]:
+def _normalize_v2_stats_rows(observations, *, width: int, height: int) -> list[dict]:
     rows = []
     for observation in observations:
         row = dict(observation)
@@ -671,6 +674,33 @@ def _normalize_v2_stats_rows(observations) -> list[dict]:
         bbox = row.get("bbox_xyxy", row.get("xyxy"))
         if track_id is None or bbox is None:
             continue
+        if (
+            isinstance(bbox, (str, bytes, bytearray))
+            or not isinstance(bbox, Sequence)
+            or len(bbox) != 4
+            or any(isinstance(value, bool) or not isinstance(value, Real) for value in bbox)
+        ):
+            continue
+        coordinate_space = row.get("bbox_coordinate_space")
+        if coordinate_space not in (None, "pixel", "normalized"):
+            continue
+        try:
+            coordinates = [float(value) for value in bbox]
+        except (TypeError, ValueError):
+            continue
+        if len(coordinates) != 4 or not all(math.isfinite(value) for value in coordinates):
+            continue
+        if coordinates[0] >= coordinates[2] or coordinates[1] >= coordinates[3]:
+            continue
+        if coordinate_space == "normalized":
+            if not all(0.0 <= value <= 1.0 for value in coordinates):
+                continue
+            coordinates = [
+                coordinates[0] * width,
+                coordinates[1] * height,
+                coordinates[2] * width,
+                coordinates[3] * height,
+            ]
         rows.append({
             "frame_index": int(row["frame_index"]),
             "track_id": int(track_id),
@@ -679,7 +709,7 @@ def _normalize_v2_stats_rows(observations) -> list[dict]:
             "track_state": row.get("track_state", "unknown"),
             "class_name": "player",
             "confidence": row.get("confidence"),
-            "xyxy": [float(value) for value in bbox],
+            "xyxy": coordinates,
         })
     return sorted(rows, key=lambda row: (row["frame_index"], row["track_id"]))
 
@@ -739,7 +769,10 @@ def run_stats_from_v2_observations(
     output_dir.mkdir(parents=True, exist_ok=True)
     emit("stats start")
     info = phase("probe", lambda: probe(video_path))
-    rows = phase("normalize observations", lambda: _normalize_v2_stats_rows(observations))
+    rows = phase(
+        "normalize observations",
+        lambda: _normalize_v2_stats_rows(observations, width=info.width, height=info.height),
+    )
     frame_indices = sorted({row["frame_index"] for row in rows})
     tracks_path = output_dir / TRACKS_FILENAME
     def write_tracks():

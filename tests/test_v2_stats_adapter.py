@@ -138,6 +138,102 @@ def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch, caps
     assert "[v2-stats] stats complete" in output
 
 
+def test_v2_stats_adapter_converts_normalized_boxes_for_pixel_ball_geometry(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner,
+        "probe",
+        lambda _path: SimpleNamespace(fps=4.0, frame_count=3, width=100, height=200, duration_seconds=3 / 4),
+    )
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    def collect(_video, *, output_path, **_kwargs):
+        output_path.write_text("".join(json.dumps({
+            "frame_index": frame,
+            "timestamp_seconds": frame / 4,
+            "track_id": 1,
+            "track_state": "detected",
+            "class_name": "ball",
+            "confidence": 0.9,
+            "xyxy": [19.0, 39.0, 21.0, 41.0],
+            "center_xy": [20.0, 40.0],
+        }) + "\n" for frame in range(3)))
+
+    monkeypatch.setattr(runner, "build_tracknet_detector", lambda _checkpoint: object())
+    monkeypatch.setattr(runner, "_collect_tracknet_rows", collect)
+    observations = [
+        {
+            "frame_index": frame,
+            "raw_track_id": 7,
+            "stable_player_id": "player-7",
+            "team_id": 1,
+            "bbox_xyxy": [0.1, 0.1, 0.3, 0.3],
+            "bbox_coordinate_space": "normalized",
+            "track_state": "tracked",
+        }
+        for frame in range(3)
+    ]
+
+    run_stats_from_v2_observations(
+        video,
+        PipelineConfig(
+            roboflow_api_key="test-key",
+            team_embedder_backend="none",
+            tracknet_enabled=True,
+            tracknet_checkpoint="checkpoint.pt",
+        ),
+        tmp_path / "stats",
+        observations,
+    )
+
+    tracks = [json.loads(line) for line in (tmp_path / "stats" / "tracks.jsonl").read_text().splitlines()]
+    assert tracks[0]["xyxy"] == [10.0, 20.0, 30.0, 60.0]
+    assert observations[0]["bbox_xyxy"] == [0.1, 0.1, 0.3, 0.3]
+    possession = [
+        json.loads(line)
+        for line in (tmp_path / "stats" / "possession_events.jsonl").read_text().splitlines()
+    ]
+    assert possession[-1]["status"] == "confirmed"
+    assert possession[-1]["stable_player_id"] == "player-7"
+
+
+def test_v2_stats_adapter_keeps_pixel_boxes_and_rejects_invalid_normalized_boxes(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner,
+        "probe",
+        lambda _path: SimpleNamespace(fps=30.0, frame_count=1, width=100, height=200, duration_seconds=1 / 30),
+    )
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    run_stats_from_v2_observations(
+        video,
+        PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none"),
+        tmp_path / "stats",
+        [
+            {"frame_index": 0, "raw_track_id": 1, "bbox_xyxy": [1, 2, 11, 22], "bbox_coordinate_space": "pixel"},
+            {"frame_index": 0, "raw_track_id": 2, "bbox_xyxy": [float("nan"), 0.1, 0.2, 0.3], "bbox_coordinate_space": "normalized"},
+            {"frame_index": 0, "raw_track_id": 3, "bbox_xyxy": [-0.1, 0.1, 0.2, 0.3], "bbox_coordinate_space": "normalized"},
+            {"frame_index": 0, "raw_track_id": 4, "bbox_xyxy": "1234", "bbox_coordinate_space": "pixel"},
+            {"frame_index": 0, "raw_track_id": 5, "bbox_xyxy": [3, 4, 13, 24]},
+            {"frame_index": 0, "raw_track_id": 6, "bbox_xyxy": [3, 4, 13, 24], "bbox_coordinate_space": "world"},
+            {"frame_index": 0, "raw_track_id": 7, "bbox_xyxy": [3, 4, 13, 24], "bbox_coordinate_space": "normalised"},
+        ],
+    )
+
+    tracks = [json.loads(line) for line in (tmp_path / "stats" / "tracks.jsonl").read_text().splitlines()]
+    assert [(row["track_id"], row["xyxy"]) for row in tracks] == [
+        (1, [1.0, 2.0, 11.0, 22.0]),
+        (5, [3.0, 4.0, 13.0, 24.0]),
+    ]
+
+
 def test_v2_stats_adapter_requires_checkpoint_when_tracknet_enabled(tmp_path, monkeypatch):
     import pipeline.runner as runner
 
