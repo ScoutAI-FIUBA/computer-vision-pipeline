@@ -162,6 +162,8 @@ def _mask_cleanup(
             following = _box(_raw_value(rows[indices[position + 1]]), coordinate_space) if position + 1 < len(indices) else None
             neighbor_boxes = [box for box in (previous, following) if box is not None]
             neighbor_areas = [(box[2] - box[0]) * (box[3] - box[1]) for box in neighbor_boxes]
+            if coordinate_space == "normalized":
+                neighbor_areas = [area * binary.shape[0] * binary.shape[1] for area in neighbor_areas]
             total_area = float(binary.sum())
             scored: list[tuple[float, tuple[int, int, int, int, int, int], dict[str, float]]] = []
             for component in components:

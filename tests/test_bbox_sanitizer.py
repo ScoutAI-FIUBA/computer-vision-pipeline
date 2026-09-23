@@ -344,6 +344,27 @@ def test_mask_cleanup_converts_pixel_bbox_to_normalized_coordinates():
     assert result.rows[0]["bbox_xyxy"] == [0.1, 0.25, 0.35, 0.75]
 
 
+def test_mask_cleanup_compares_normalized_neighbor_areas_in_mask_pixels():
+    rows = [
+        box_row(0, (0.25, 0.25, 0.5, 0.75), bbox_coordinate_space="normalized"),
+        box_row(1, (0.5, 0.5, 1.0, 1.0), bbox_coordinate_space="normalized"),
+        box_row(2, (0.3, 0.25, 0.55, 0.75), bbox_coordinate_space="normalized"),
+    ]
+    masks = {
+        row["observation_key"]: _mask(shape=(40, 40), rects=((11, 10, 21, 30), (35, 35, 38, 38)))
+        for row in rows
+    }
+
+    result = sanitize_temporal_bboxes(rows, enabled(), masks_by_observation=masks)
+
+    fixed = result.rows[1]
+    assert fixed["bbox_xyxy"] == [0.275, 0.25, 0.525, 0.75]
+    assert fixed["bbox_corrected"] is True
+    assert fixed["bbox_correction_method"] == "mask_cleanup"
+    assert result.cleaned_masks_by_observation["1:7"].sum() == 200
+    assert result.diagnostics["mask_cleanup_count"] == 3
+
+
 def test_mask_cleanup_falls_back_to_temporal_interpolation_when_mask_is_unusable():
     rows = [box_row(0, (10, 10, 20, 30)), box_row(1, (100, 100, 180, 190)), box_row(2, (12, 10, 22, 30))]
     masks = {"1:7": np.zeros((40, 40), dtype=np.uint8)}
