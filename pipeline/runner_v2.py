@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from pipeline.reid import Embedder
+from pipeline.bbox_sanitizer import sanitize_temporal_bboxes
 from pipeline.team_embedder import TeamEmbedder, TeamEmbeddingSample
 from pipeline.team_id import (
     STABLE_PLAYER_TEAM_VOTE_SHARE_THRESHOLD,
@@ -556,13 +557,20 @@ class RunnerV2:
         *,
         frames_by_index: Mapping[int, Any] | None = None,
         masks_by_observation: Mapping[str, Any] | None = None,
+        bbox_sanitizer_config: Any | None = None,
     ) -> RunnerV2Result:
         rows = _copy_observations(observations)
+        sanitizer_report = None
+        if bbox_sanitizer_config is not None:
+            sanitizer_report = sanitize_temporal_bboxes(rows, bbox_sanitizer_config)
+            rows = sanitizer_report.rows
         reasons = _duplicate_observation_key_reasons(rows)
         structurally_valid = not reasons
         frames = frames_by_index or {}
         downstream: dict[str, Any] = {}
         runtime_diagnostics: dict[str, Any] = {}
+        if sanitizer_report is not None and sanitizer_report.diagnostics:
+            runtime_diagnostics["bbox_sanitizer"] = sanitizer_report.diagnostics
         acceptance_reasons = reasons
         stage_receipts = _mint_runtime_stage_receipts()
 
@@ -609,10 +617,10 @@ class RunnerV2:
                     frames,
                     prepared_crops if masks_by_observation is not None else None,
                 )
-                runtime_diagnostics = {
+                runtime_diagnostics.update({
                     "debug_runtime_only": True,
                     "team_vote_diagnostics": vote_diagnostics,
-                }
+                })
                 reasons.extend(team_reasons)
                 if not team_reasons:
                     downstream["team_assignments"] = team_assignments
@@ -664,9 +672,11 @@ def run_v2(
     seams: RunnerV2Seams | None = None,
     frames_by_index: Mapping[int, Any] | None = None,
     masks_by_observation: Mapping[str, Any] | None = None,
+    bbox_sanitizer_config: Any | None = None,
 ) -> RunnerV2Result:
     return RunnerV2(seams).run(
         observations,
         frames_by_index=frames_by_index,
         masks_by_observation=masks_by_observation,
+        bbox_sanitizer_config=bbox_sanitizer_config,
     )

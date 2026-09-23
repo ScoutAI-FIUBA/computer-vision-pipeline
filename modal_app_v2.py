@@ -21,6 +21,7 @@ from pipeline.results import (
     _mask_filename,
     package_artifacts,
 )
+from pipeline.config import PipelineConfig
 from pipeline.runner import run_stats_from_v2_observations
 from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
@@ -244,8 +245,6 @@ def _load_video_frames(path: Path, frame_start: int, frame_end: int) -> dict[int
 
 def _run_v2_stats(video_path: Path, output_dir: Path, observations):
     """Run stats from SAM3.1 rows; never construct a legacy player tracker."""
-    from pipeline.config import PipelineConfig
-
     return run_stats_from_v2_observations(
         video_path, PipelineConfig.from_env(), output_dir, observations
     )
@@ -428,11 +427,17 @@ class PipelineV2:
                 )
                 _add_mask_references(rows, masks)
                 frames = _load_video_frames(video_path, frame_start, frame_end)
+                config = PipelineConfig.from_env()
                 runner_kwargs = {"frames_by_index": frames, "masks_by_observation": masks}
+                runner_kwargs["bbox_sanitizer_config"] = config
                 if hasattr(self, "seams"):
                     runner_kwargs["seams"] = self.seams
                 result = run_v2(rows, **runner_kwargs)
                 video_metadata = _video_metadata(video_path)
+                artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
+                sanitizer_metadata = getattr(result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
+                if sanitizer_metadata.get("corrected_count", 0) or sanitizer_metadata.get("unresolved_count", 0):
+                    artifact_config["bbox_sanitizer"] = sanitizer_metadata
                 artifact_manifest = package_artifacts(
                     output_dir,
                     result.observations,
@@ -441,7 +446,7 @@ class PipelineV2:
                     video_metadata=video_metadata,
                     frame_bounds=[frame_start, frame_end],
                     prompts=[prompt],
-                    config={"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end},
+                    config=artifact_config,
                     benchmark={"wall_seconds": time.perf_counter() - started},
                     acceptance=result.acceptance,
                     acceptance_reasons=result.acceptance_reasons,

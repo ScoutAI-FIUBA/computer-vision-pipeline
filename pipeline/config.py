@@ -105,6 +105,10 @@ DEFAULT_SAM31_FRAME_END = 130
 DEFAULT_SAM31_RETENTION_FRAMES = 2
 DEFAULT_SAM31_OUTPUT_PREFIX = None
 DEFAULT_SAM31_ACCEPTANCE_REQUIRED = True
+DEFAULT_BBOX_SANITIZER_ENABLED = False
+DEFAULT_BBOX_HISTORY_SIZE = 15
+DEFAULT_BBOX_MAX_INTERPOLATION_GAP = 2
+DEFAULT_BBOX_SIGNAL_THRESHOLD = 3.0
 
 
 
@@ -147,6 +151,13 @@ class PipelineConfig:
     sam31_retention_frames: int = DEFAULT_SAM31_RETENTION_FRAMES
     sam31_output_prefix: str | None = DEFAULT_SAM31_OUTPUT_PREFIX
     sam31_acceptance_required: bool = DEFAULT_SAM31_ACCEPTANCE_REQUIRED
+
+    # Conservative offline SAM3.1 temporal cleanup. Disabled preserves the
+    # existing V2 row contract exactly; enable for V2 sanitizer runs.
+    bbox_sanitizer_enabled: bool = DEFAULT_BBOX_SANITIZER_ENABLED
+    bbox_history_size: int = DEFAULT_BBOX_HISTORY_SIZE
+    max_interpolation_gap: int = DEFAULT_BBOX_MAX_INTERPOLATION_GAP
+    bbox_signal_threshold: float = DEFAULT_BBOX_SIGNAL_THRESHOLD
 
     # --- Sampling ---
     # COST: the biggest lever there is. SAM2's image encoder runs on every
@@ -317,6 +328,12 @@ class PipelineConfig:
             raise ValueError("sam31_frame_end must not precede sam31_frame_start")
         if self.sam31_retention_frames < 0:
             raise ValueError("sam31_retention_frames must be at least 0")
+        if self.bbox_history_size < 2:
+            raise ValueError("bbox_history_size must be at least 2")
+        if self.max_interpolation_gap < 1:
+            raise ValueError("max_interpolation_gap must be at least 1")
+        if self.bbox_signal_threshold <= 0:
+            raise ValueError("bbox_signal_threshold must be positive")
         if not self.roboflow_api_key:
             raise ValueError("roboflow_api_key is required")
 
@@ -362,6 +379,16 @@ class PipelineConfig:
             "sam31_output_prefix": os.getenv("SAM31_OUTPUT_PREFIX") or DEFAULT_SAM31_OUTPUT_PREFIX,
             "sam31_acceptance_required": _env_bool(
                 "SAM31_ACCEPTANCE_REQUIRED", DEFAULT_SAM31_ACCEPTANCE_REQUIRED
+            ),
+            "bbox_sanitizer_enabled": _env_bool(
+                "BBOX_SANITIZER_ENABLED", DEFAULT_BBOX_SANITIZER_ENABLED
+            ),
+            "bbox_history_size": _env_int("BBOX_HISTORY_SIZE", DEFAULT_BBOX_HISTORY_SIZE),
+            "max_interpolation_gap": _env_int(
+                "BBOX_MAX_INTERPOLATION_GAP", DEFAULT_BBOX_MAX_INTERPOLATION_GAP
+            ),
+            "bbox_signal_threshold": _env_float(
+                "BBOX_SIGNAL_THRESHOLD", DEFAULT_BBOX_SIGNAL_THRESHOLD
             ),
             "team_embedder_backend": os.getenv(
                 "TEAM_EMBEDDER_BACKEND", DEFAULT_TEAM_EMBEDDER_BACKEND

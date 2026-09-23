@@ -243,6 +243,10 @@ def render_frame(
             cv2.LINE_AA,
         )
         labels = []
+        if row.get("bbox_corrected"):
+            labels.append("TEMP_FIX")
+        elif row.get("bbox_outlier"):
+            labels.append("OUTLIER?")
         if row.get("stable_player_id"):
             labels.append(f"PLAYER: {row['stable_player_id']}")
         if row.get("team_id") is not None:
