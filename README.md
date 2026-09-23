@@ -20,7 +20,7 @@ High-level flow:
 
 `modal_app_v2.py` keeps its SAM3.1 observation artifact at the root of the returned bundle (`tracks.jsonl` and `manifest.json`). Its stats adapter consumes those same observations in `stats/`; it does not load SAM2, run a second player tracker, or call Roboflow to recreate V2 players.
 
-`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/shot_events.jsonl`, `stats/shot_evidence.jsonl`, `stats/possession_events.jsonl`, and `stats/ball_tracks.jsonl` use the legacy contracts and are referenced in the V2 manifest with relative paths, sizes, and hashes. The V2 adapter does not produce `numbers.json` because V2 observations contain no jersey-number evidence, so `numbers_file` remains nullable. The adapter carries through V2 raw/stable IDs, boxes, team IDs, confidence, state, and frame indices. For stats geometry, rows marked `bbox_coordinate_space: "normalized"` are converted to pixel `xyxy` using the probed video dimensions; pixel or unspecified legacy rows are preserved. Ball tracking remains an independent pass: the V2 Modal image enables TrackNet by default from the mounted `tracknet-data` Volume at `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`; local callers can enable it with `TRACKNET_ENABLED=1` and `TRACKNET_CHECKPOINT`. If TrackNet is disabled, exact V2 frames receive lost ball evidence rather than fabricated data. Shot detection keeps its own model pass, then shot evidence and possession join to the supplied V2 player rows.
+`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/shot_events.jsonl`, `stats/shot_evidence.jsonl`, `stats/possession_events.jsonl`, `stats/possession_transitions.jsonl`, and `stats/ball_tracks.jsonl` use the legacy contracts and are referenced in the V2 manifest with relative paths, sizes, and hashes. The V2 adapter does not produce `numbers.json` because V2 observations contain no jersey-number evidence, so `numbers_file` remains nullable. The adapter carries through V2 raw/stable IDs, boxes, team IDs, confidence, state, and frame indices. For stats geometry, rows marked `bbox_coordinate_space: "normalized"` are converted to pixel `xyxy` using the probed video dimensions; pixel or unspecified legacy rows are preserved. Ball tracking remains an independent pass: the V2 Modal image enables TrackNet by default from the mounted `tracknet-data` Volume at `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`; local callers can enable it with `TRACKNET_ENABLED=1` and `TRACKNET_CHECKPOINT`. If TrackNet is disabled, exact V2 frames receive lost ball evidence rather than fabricated data. Shot detection keeps its own model pass, then shot evidence, possession, and transitions join to the supplied V2 player rows.
 
 ### Conservative temporal BBox sanitizer
 
@@ -169,6 +169,7 @@ Expected local artifacts in `--output-dir`:
 - `shot_evidence.jsonl`
 - `ball_tracks.jsonl` when TrackNet or the ball fallback emits ball rows
 - `possession_events.jsonl` with one shared player-frame record per evaluated frame
+- `possession_transitions.jsonl` with conservative pass, steal, turnover, and lost-possession transitions
 - `annotated.mp4` when `--annotated` is set
 
 ### Possession contract
@@ -186,7 +187,18 @@ Statuses are `confirmed`, `unknown`, `lost`, and `unassigned`:
 - `unassigned`: one player matched, but its identity is missing or unresolved.
 
 Gaps reset confirmation. The stage never interpolates missing ball rows, infers
-possession from proximity when candidates are tied, or emits passes yet.
+possession from proximity when candidates are tied, or assigns a holder to a
+missing frame.
+
+`possession_transitions.jsonl` is schema version 1 and uses the event vocabulary
+`pass`, `steal`, `turnover`, and `lost_possession`. A `pass` requires different
+authoritative players with the same non-null team; a `steal` requires different
+authoritative players with different non-null teams. Both must be within
+`POSSESSION_TRANSITION_MAX_GAP` frames (default `15`) and retain source-row and
+evidence references. Same-player, team-null, ambiguous, and out-of-gap changes
+are not passes or steals. Loss rows are `uncertain` unless the source explicitly
+marks terminal loss metadata; a temporary `unknown` or `lost` row is never, by
+itself, proof of a turnover.
 
 Expected local artifacts for `--pipeline player-positions`:
 

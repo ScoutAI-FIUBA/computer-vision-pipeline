@@ -109,6 +109,7 @@ DEFAULT_BBOX_SANITIZER_ENABLED = False
 DEFAULT_BBOX_HISTORY_SIZE = 15
 DEFAULT_BBOX_MAX_INTERPOLATION_GAP = 2
 DEFAULT_BBOX_SIGNAL_THRESHOLD = 3.0
+DEFAULT_POSSESSION_TRANSITION_MAX_GAP = 15
 
 
 
@@ -158,6 +159,7 @@ class PipelineConfig:
     bbox_history_size: int = DEFAULT_BBOX_HISTORY_SIZE
     max_interpolation_gap: int = DEFAULT_BBOX_MAX_INTERPOLATION_GAP
     bbox_signal_threshold: float = DEFAULT_BBOX_SIGNAL_THRESHOLD
+    possession_transition_max_gap: int = DEFAULT_POSSESSION_TRANSITION_MAX_GAP
 
     # --- Sampling ---
     # COST: the biggest lever there is. SAM2's image encoder runs on every
@@ -334,6 +336,8 @@ class PipelineConfig:
             raise ValueError("max_interpolation_gap must be at least 1")
         if self.bbox_signal_threshold <= 0:
             raise ValueError("bbox_signal_threshold must be positive")
+        if self.possession_transition_max_gap < 1:
+            raise ValueError("possession_transition_max_gap must be at least 1")
         if not self.roboflow_api_key:
             raise ValueError("roboflow_api_key is required")
 
@@ -389,6 +393,9 @@ class PipelineConfig:
             ),
             "bbox_signal_threshold": _env_float(
                 "BBOX_SIGNAL_THRESHOLD", DEFAULT_BBOX_SIGNAL_THRESHOLD
+            ),
+            "possession_transition_max_gap": _env_int(
+                "POSSESSION_TRANSITION_MAX_GAP", DEFAULT_POSSESSION_TRANSITION_MAX_GAP
             ),
             "team_embedder_backend": os.getenv(
                 "TEAM_EMBEDDER_BACKEND", DEFAULT_TEAM_EMBEDDER_BACKEND

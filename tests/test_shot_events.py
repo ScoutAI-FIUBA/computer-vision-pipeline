@@ -704,6 +704,7 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
     assert results.shot_events_file == "shot_events.jsonl"
     assert results.shot_evidence_file == "shot_evidence.jsonl"
     assert results.possession_events_file == "possession_events.jsonl"
+    assert results.possession_transitions_file == "possession_transitions.jsonl"
     assert requested_model_ids == [
         "basketball-player-detection-3-ycjdo/16",
         config.shot_model_id,
@@ -714,7 +715,9 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
     assert results_payload["shot_events_file"] == "shot_events.jsonl"
     assert results_payload["shot_evidence_file"] == "shot_evidence.jsonl"
     assert results_payload["possession_events_file"] == "possession_events.jsonl"
+    assert results_payload["possession_transitions_file"] == "possession_transitions.jsonl"
     assert (tmp_path / "out" / "possession_events.jsonl").exists()
+    assert (tmp_path / "out" / "possession_transitions.jsonl").exists()
     assert results_payload["ball_provenance"]["backend"] == "hosted_detector"
     assert results_payload["ball_provenance"]["validation"]["valid"] is False
     assert results_payload["ball_provenance"]["validation"]["metadata"]["missing_frame_count"] == 2

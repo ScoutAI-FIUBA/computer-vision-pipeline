@@ -1068,8 +1068,9 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
     assert manifest["artifacts"]["legacy_stats"]["results"]["key"] == "stats/results.json"
     assert manifest["artifacts"]["legacy_stats"]["tracks"]["key"] == "stats/tracks.jsonl"
     assert manifest["artifacts"]["legacy_stats"]["possession_events"]["key"] == "stats/possession_events.jsonl"
+    assert manifest["artifacts"]["legacy_stats"]["possession_transitions"]["key"] == "stats/possession_transitions.jsonl"
     assert manifest["artifacts"]["legacy_stats"]["shot_evidence"]["key"] == "stats/shot_evidence.jsonl"
-    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/shot_events.jsonl", "stats/shot_evidence.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
+    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/shot_events.jsonl", "stats/shot_evidence.jsonl", "stats/possession_events.jsonl", "stats/possession_transitions.jsonl"} <= set(artifacts)
     results = json.loads(artifacts["stats/results.json"])
     assert results["schema_version"] == 5
     assert results["tracks_file"] == "tracks.jsonl"
@@ -1077,6 +1078,7 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
     assert results["numbers_file"] is None
     assert results["shot_events_file"] == "shot_events.jsonl"
     assert results["possession_events_file"] == "possession_events.jsonl"
+    assert results["possession_transitions_file"] == "possession_transitions.jsonl"
     assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/shot_events.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
     for name, reference in manifest["artifacts"]["legacy_stats"].items():
         data = artifacts[reference["key"]]

@@ -46,6 +46,7 @@ from pipeline.number_evidence import (
 )
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
 from pipeline.possession import resolve_possession_events
+from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
 from pipeline.results import RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter
@@ -89,6 +90,7 @@ SHOT_SIGNALS_FILENAME = "shot_signals.jsonl"
 SHOT_RAW_PREDICTIONS_FILENAME = "shot_raw_predictions.jsonl"
 BALL_TRACKS_FILENAME = "ball_tracks.jsonl"
 POSSESSION_EVENTS_FILENAME = "possession_events.jsonl"
+POSSESSION_TRANSITIONS_FILENAME = "possession_transitions.jsonl"
 PROJECTED_TRACKS_FILENAME = "projected_tracks.jsonl"
 PROJECTED_SHOTS_FILENAME = "projected_shots.json"
 PROJECTED_SHOTS_IMAGE_FILENAME = "projected_shots.png"
@@ -458,6 +460,34 @@ def _write_possession_events(
     path = output_dir / POSSESSION_EVENTS_FILENAME
     path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     return path
+
+
+def _write_possession_transitions(output_dir: Path, *, max_frame_gap: int) -> Path:
+    source_path = output_dir / POSSESSION_EVENTS_FILENAME
+    path = output_dir / POSSESSION_TRANSITIONS_FILENAME
+    possession_rows = mark_terminal_loss_rows(_load_jsonl_rows(source_path), max_frame_gap=max_frame_gap)
+    source_path.write_text("".join(json.dumps(row) + "\n" for row in possession_rows), encoding="utf-8")
+    transitions = resolve_possession_transitions(possession_rows, max_frame_gap=max_frame_gap)
+    path.write_text("".join(json.dumps(event) + "\n" for event in transitions), encoding="utf-8")
+    return path
+
+
+def _write_possession_artifacts(
+    output_dir: Path,
+    tracks: list[dict],
+    ball_rows: list[dict],
+    *,
+    fps: float | None,
+    frame_step: int = 1,
+    team_ids_by_track_id: dict[int, int] | None = None,
+    max_frame_gap: int = 15,
+) -> tuple[Path, Path]:
+    possession_path = _write_possession_events(
+        output_dir, tracks, ball_rows, fps=fps, frame_step=frame_step,
+        team_ids_by_track_id=team_ids_by_track_id,
+    )
+    transitions_path = _write_possession_transitions(output_dir, max_frame_gap=max_frame_gap)
+    return possession_path, transitions_path
 
 
 def _foot_point_for_bbox(xyxy) -> list[float]:
@@ -844,9 +874,10 @@ def run_stats_from_v2_observations(
         output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id
     ))
     emit("possession start")
-    possession_path = phase("possession", lambda: _write_possession_events(
+    possession_path, transitions_path = phase("possession", lambda: _write_possession_artifacts(
         output_dir, rows, ball_rows, fps=info.fps, frame_step=1,
         team_ids_by_track_id=team_by_track_id,
+        max_frame_gap=config.possession_transition_max_gap,
     ))
     (output_dir / NUMBERS_FILENAME).unlink(missing_ok=True)
     results = PipelineResults(
@@ -859,7 +890,14 @@ def run_stats_from_v2_observations(
         device="cpu", teams_file=TEAMS_FILENAME, shot_events_file=SHOT_EVENTS_FILENAME,
         shot_evidence_file=SHOT_EVIDENCE_FILENAME, ball_tracks_file=BALL_TRACKS_FILENAME,
         possession_events_file=POSSESSION_EVENTS_FILENAME,
-        artifact_references={"possession_events": {"file": possession_path.name, "schema_version": 1}},
+        possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
+        artifact_references={
+            "possession_events": {"file": possession_path.name, "schema_version": 1},
+            "possession_transitions": {
+                "file": transitions_path.name, "schema_version": 1,
+                "event_types": ["pass", "steal", "turnover", "lost_possession"],
+            },
+        },
     )
     emit("artifact writing start")
     phase("artifact writing", lambda: results.write(output_dir / RESULTS_FILENAME))
@@ -1363,6 +1401,7 @@ def run_pipeline(
         shot_evidence_file=SHOT_EVIDENCE_FILENAME,
         ball_tracks_file=BALL_TRACKS_FILENAME if ball_track_records > 0 else None,
         possession_events_file=POSSESSION_EVENTS_FILENAME,
+        possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
         projected_tracks_file=PROJECTED_TRACKS_FILENAME if projected_track_records > 0 else None,
         annotated_video_file=ANNOTATED_FILENAME if annotated_path else None,
     )
@@ -1464,20 +1503,22 @@ def run_pipeline(
         write_debug_artifacts(output_dir, team_evidence_by_track_id)
         write_number_debug_artifacts(output_dir, number_evidence_by_track_id)
 
-    possession_path = _write_possession_events(
-        output_dir,
-        _load_jsonl_rows(tracks_path),
-        ball_rows,
-        fps=info.fps,
-        frame_step=step,
-        team_ids_by_track_id=team_by_track_id,
+    possession_path, transitions_path = _write_possession_artifacts(
+        output_dir, _load_jsonl_rows(tracks_path), ball_rows, fps=info.fps,
+        frame_step=step, team_ids_by_track_id=team_by_track_id,
+        max_frame_gap=config.possession_transition_max_gap,
     )
     results.artifact_references = {
         "possession_events": {
             "file": possession_path.name,
             "schema_version": 1,
             "status_vocabulary": ["confirmed", "unknown", "lost", "unassigned"],
-        }
+        },
+        "possession_transitions": {
+            "file": transitions_path.name,
+            "schema_version": 1,
+            "event_types": ["pass", "steal", "turnover", "lost_possession"],
+        },
     }
 
     # One line per suspected swap, so a run can be reviewed without watching the

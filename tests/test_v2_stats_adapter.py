@@ -52,9 +52,11 @@ def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, m
     assert result.ball_tracks_file == "ball_tracks.jsonl"
     assert result.shot_evidence_file == "shot_evidence.jsonl"
     assert result.possession_events_file == "possession_events.jsonl"
+    assert result.possession_transitions_file == "possession_transitions.jsonl"
     assert (tmp_path / "stats" / "ball_tracks.jsonl").exists()
     assert (tmp_path / "stats" / "shot_evidence.jsonl").exists()
     assert (tmp_path / "stats" / "possession_events.jsonl").exists()
+    assert (tmp_path / "stats" / "possession_transitions.jsonl").exists()
     output = capsys.readouterr().out
     assert "[v2-stats] stats start" in output
     assert "[v2-stats] shot evidence start" in output
@@ -136,6 +138,37 @@ def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch, caps
     assert "[v2-stats] TrackNet progress: 0/3 frames (0%)" in output
     assert "[v2-stats] TrackNet progress: 3/3 frames (100%)" in output
     assert "[v2-stats] stats complete" in output
+
+
+def test_v2_stats_adapter_writes_transition_artifact_in_same_run(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner, "probe", lambda _path: SimpleNamespace(fps=30.0, frame_count=2, width=100, height=100, duration_seconds=2 / 30)
+    )
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    def write_possession(output_dir, *_args, **_kwargs):
+        path = output_dir / "possession_events.jsonl"
+        path.write_text("".join(json.dumps({
+            "schema_version": 1, "frame_index": frame, "status": "confirmed",
+            "player_track_id": player, "stable_player_id": player, "team_id": team,
+            "evidence_frame_indices": [frame],
+            "source_records": [f"possession_events.jsonl#frame={frame}"],
+        }) + "\n" for frame, player, team in ((0, "a", 1), (1, "b", 2))))
+        return path
+
+    monkeypatch.setattr(runner, "_write_possession_events", write_possession)
+    run_stats_from_v2_observations(
+        video, PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none"), tmp_path / "stats",
+        [{"frame_index": frame, "raw_track_id": 1, "stable_player_id": "p", "team_id": 1,
+          "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"} for frame in (0, 1)],
+    )
+
+    transitions = [json.loads(line) for line in (tmp_path / "stats" / "possession_transitions.jsonl").read_text().splitlines()]
+    assert transitions[0]["event_type"] == "steal"
 
 
 def test_v2_stats_adapter_converts_normalized_boxes_for_pixel_ball_geometry(tmp_path, monkeypatch):

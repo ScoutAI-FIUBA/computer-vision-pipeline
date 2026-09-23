@@ -64,6 +64,13 @@ def test_from_env_reads_v2_tracking_settings_without_changing_legacy_defaults(mo
     assert config.sam2_model_id == "facebook/sam2-hiera-small"
 
 
+def test_from_env_reads_possession_transition_gap(monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("POSSESSION_TRANSITION_MAX_GAP", "7")
+
+    assert PipelineConfig.from_env().possession_transition_max_gap == 7
+
+
 def test_from_env_defaults_main_and_shot_models_separately(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
     monkeypatch.setenv("PLAYER_MODEL_ID", "basketball-player-detection-3-ycjdo/16")

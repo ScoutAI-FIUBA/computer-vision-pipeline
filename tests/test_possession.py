@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from pipeline.possession import POSSESSION_CONTRACT_VERSION, resolve_possession_events
-from pipeline.runner import _write_possession_events
+from pipeline.runner import _write_possession_artifacts, _write_possession_events
 
 
 def ball(frame, center=(15.0, 15.0), state="detected", confidence=0.9):
@@ -146,3 +146,19 @@ def test_runner_writer_preserves_uncertain_transitions(tmp_path):
     assert rows[3]["rejection_reason"] == "ambiguous_player_candidates"
     assert rows[4]["rejection_reason"] == "ball_evidence_missing"
     assert rows[6]["rejection_reason"] == "confirmation_pending"
+
+
+def test_one_run_possession_artifacts_emit_terminal_loss_from_produced_rows(tmp_path):
+    tracks = [player(frame) for frame in range(21)]
+    balls = [ball(frame) for frame in (0, 1, 2)]
+
+    possession_path, transitions_path = _write_possession_artifacts(
+        tmp_path, tracks, balls, fps=4, max_frame_gap=3, team_ids_by_track_id={7: 1}
+    )
+
+    possession_rows = [json.loads(line) for line in possession_path.read_text().splitlines()]
+    transitions = [json.loads(line) for line in transitions_path.read_text().splitlines()]
+    assert possession_rows[-1]["status"] == "lost"
+    assert possession_rows[-1]["terminal_loss"] is True
+    assert transitions[-1]["event_type"] == "turnover"
+    assert transitions[-1]["status"] == "confirmed"

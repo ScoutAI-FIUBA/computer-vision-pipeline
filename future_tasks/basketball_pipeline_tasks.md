@@ -189,8 +189,11 @@ Implement the following in order during the next session:
    reviewable unknown events.
 4. Add possession only after player/team/ball evidence passes validation; the
    narrow `possession_events.jsonl` slice is now implemented. Keep passes deferred.
-5. Add passes only after possession and transfer evidence support them; do not
-   infer passes from proximity alone.
+5. The narrow possession-transition slice now emits `pass`, `steal`,
+   `turnover`, and `lost_possession` from confirmed possession rows. Keep the
+   bounded-gap and evidence-backed rules; do not infer passes or steals from
+   proximity alone, and keep uncertain losses separate from confirmed terminal
+   turnovers.
 6. Select a small evaluation clip set and define practical metrics for event
    precision/recall, outcome accuracy, and provenance coverage.
 7. Define and write the output artifacts, with references from `results.json`.
