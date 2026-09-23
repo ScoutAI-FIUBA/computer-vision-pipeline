@@ -75,12 +75,19 @@ def _mask_path(mask_ref: Any, masks_dir: Path) -> Path | None:
     if not isinstance(mask_ref, str) or not mask_ref:
         return None
     root = masks_dir.resolve()
-    references = [Path(mask_ref)]
-    if references[0].parts[:1] == ("masks",):
-        references.append(Path(*references[0].parts[1:]))
+    package_root = root.parent if root.name == "masks" else root
+    reference_path = Path(mask_ref)
+    references = [reference_path]
+    if reference_path.parts[:1] in (("masks",), ("masks_clean",)):
+        # render_debug_video receives the raw masks/ directory, while refs are
+        # rooted at the artifact package. Check that package root as well.
+        references.append(Path("..") / reference_path)
+        references.append(Path(*reference_path.parts[1:]))
     for reference in references:
         candidate = (root / reference).resolve()
-        if candidate != root and root in candidate.parents:
+        if (candidate == root or root in candidate.parents) and candidate.is_file():
+            return candidate
+        if candidate != package_root and package_root in candidate.parents and candidate.is_file():
             return candidate
     return None
 

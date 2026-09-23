@@ -955,6 +955,52 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     assert np.array_equal(decoded_mask, mask)
 
 
+def test_process_persists_clean_masks_without_replacing_raw_masks(monkeypatch):
+    import cv2
+    import numpy as np
+    import modal_app_v2
+    from pipeline.runner_v2 import run_v2
+
+    rows = [
+        {"observation_key": f"{frame}:3", "frame_index": frame, "raw_track_id": 3,
+         "bbox_xyxy": list(box), "track_state": "tracked"}
+        for frame, box in enumerate(((10, 10, 20, 30), (100, 100, 180, 190), (12, 10, 22, 30)))
+    ]
+    masks = {}
+    for row in rows:
+        mask = np.zeros((40, 40), dtype=np.uint8)
+        mask[10:30, 11:21] = 255
+        mask[35:38, 35:38] = 255
+        masks[row["observation_key"]] = mask
+
+    monkeypatch.setenv("BBOX_SANITIZER_ENABLED", "1")
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: (rows, masks))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", run_v2)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=0, frame_end=2, return_artifacts=True)
+    artifacts = payload["artifacts"]
+    tracks = [json.loads(line) for line in artifacts["tracks.jsonl"].decode().splitlines()]
+    manifest = json.loads(artifacts["manifest.json"])
+
+    middle = tracks[1]
+    assert middle["mask_ref"].startswith("masks/")
+    assert middle["clean_mask_ref"].startswith("masks_clean/")
+    assert middle["mask_ref"] != middle["clean_mask_ref"]
+    assert middle["raw_bbox"] == [100, 100, 180, 190]
+    assert middle["bbox_xyxy"] == [11.0, 10.0, 21.0, 30.0]
+    assert any(name.startswith("masks_clean/") for name in artifacts)
+    assert manifest["artifacts"]["clean_masks"]["count"] == 3
+    assert manifest["config"]["bbox_sanitizer"]["mask_cleanup_count"] == 3
+    raw = cv2.imdecode(np.frombuffer(artifacts[middle["mask_ref"]], dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    clean = cv2.imdecode(np.frombuffer(artifacts[middle["clean_mask_ref"]], dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    assert int(raw.sum()) > int(clean.sum())
+
+
 def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch):
     import numpy as np
     import modal_app_v2

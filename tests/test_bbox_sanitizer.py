@@ -300,6 +300,17 @@ def test_mask_cleanup_keeps_main_component_and_removes_remote_blob():
     assert masks["1:7"].sum() == 209
 
 
+def test_mask_cleanup_count_includes_mask_only_corrections():
+    row = box_row(0, (5, 5, 15, 15))
+    mask = _mask(rects=((5, 5, 15, 15), (30, 30, 32, 32)))
+
+    result = sanitize_temporal_bboxes([row], enabled(), masks_by_observation={"0:7": mask})
+
+    assert result.rows[0]["bbox_xyxy"] == [5.0, 5.0, 15.0, 15.0]
+    assert result.rows[0]["mask_cleanup_corrected"] is True
+    assert result.diagnostics["mask_cleanup_count"] == 1
+
+
 def test_mask_cleanup_does_not_choose_between_two_ambiguous_large_components():
     rows = [box_row(0, (8, 8, 20, 28)), box_row(1, (100, 100, 180, 190)), box_row(2, (22, 8, 34, 28))]
     masks = {row["observation_key"]: _mask(rects=((8, 8, 20, 28), (22, 8, 34, 28))) for row in rows}

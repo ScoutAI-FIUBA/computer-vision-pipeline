@@ -199,6 +199,32 @@ def test_render_frame_prefers_valid_clean_mask_over_raw_mask(tmp_path: Path):
     assert np.array_equal(rendered[16, 22], np.array([56, 89, 56], dtype=np.uint8))
 
 
+def test_render_frame_resolves_clean_mask_from_artifact_masks_directory(tmp_path: Path):
+    root = tmp_path / "artifacts"
+    (root / "masks").mkdir(parents=True)
+    (root / "masks_clean").mkdir()
+    raw = np.zeros((24, 32), dtype=np.uint8)
+    raw[14:18, 25:29] = 255
+    clean = np.zeros((24, 32), dtype=np.uint8)
+    clean[14:18, 20:24] = 255
+    cv2.imwrite(str(root / "masks" / "raw.png"), raw)
+    cv2.imwrite(str(root / "masks_clean" / "clean.png"), clean)
+
+    rendered = render_frame(
+        np.zeros((24, 32, 3), dtype=np.uint8),
+        [{
+            "raw_track_id": 7,
+            "bbox_xyxy": [0, 0, 32, 24],
+            "mask_ref": "masks/raw.png",
+            "clean_mask_ref": "masks_clean/clean.png",
+        }],
+        root / "masks",
+    )
+
+    assert np.array_equal(rendered[16, 27], np.zeros(3, dtype=np.uint8))
+    assert np.array_equal(rendered[16, 22], np.array([56, 89, 56], dtype=np.uint8))
+
+
 def test_render_frame_scales_all_bbox_corners_and_full_raw_label(tmp_path: Path):
     frame = np.zeros((80, 100, 3), dtype=np.uint8)
     root = tmp_path / "artifacts"

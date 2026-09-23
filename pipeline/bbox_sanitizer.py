@@ -222,6 +222,9 @@ def _mask_cleanup(
             clean[labels == best[5]] = True
             cleaned[key] = clean
             new_bbox = _mask_bbox(best[:4], binary.shape, coordinate_space)
+            mask_changed = not np.array_equal(clean, binary)
+            if mask_changed:
+                row["mask_cleanup_corrected"] = True
             if _box(_raw_value(row), coordinate_space) != tuple(new_bbox):
                 _preserve_raw_provenance(row)
                 if "mask_ref" in row:
@@ -320,7 +323,11 @@ def sanitize_temporal_bboxes(
                 candidates.add(index)
                 scores[index] = (score, signal_scores)
 
-    mask_cleanup_count = sum(row.get("bbox_correction_method") == "mask_cleanup" for row in rows)
+    mask_cleanup_count = sum(
+        row.get("bbox_correction_method") == "mask_cleanup"
+        or row.get("mask_cleanup_corrected", False)
+        for row in rows
+    )
     corrected = mask_cleanup_count
     unresolved = 0
     for indices in groups.values():
