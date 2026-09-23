@@ -109,6 +109,7 @@ def test_v2_image_mounts_and_enables_tracknet_without_sam2():
     assert '"TRACKNET_ENABLED": "1"' in source
     assert '"TRACKNET_CHECKPOINT": TRACKNET_CHECKPOINT' in source
     assert '"BALL_ALL_FRAMES": "1"' in source
+    assert '"BBOX_SANITIZER_ENABLED": "1"' in source
     assert '"tracknet-data", environment_name="main", create_if_missing=False' in source
     assert 'volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data}' in source
 

@@ -134,7 +134,7 @@ def test_runner_v2_sanitizes_before_downstream_without_changing_identity_fields(
     }
 
 
-def test_pipeline_config_env_activates_production_run_v2(monkeypatch):
+def test_v2_environment_config_reaches_sanitizer_before_reid(monkeypatch):
     monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
     monkeypatch.setenv("BBOX_SANITIZER_ENABLED", "1")
     monkeypatch.setenv("BBOX_HISTORY_SIZE", "7")
@@ -142,12 +142,30 @@ def test_pipeline_config_env_activates_production_run_v2(monkeypatch):
     monkeypatch.setenv("BBOX_SIGNAL_THRESHOLD", "2.5")
     config = PipelineConfig.from_env()
     rows = [box_row(10, (10, 10, 20, 30)), box_row(11, (100, 100, 180, 190)), box_row(12, (12, 10, 22, 30))]
+    frames = {index: np.full((40, 40, 3), index - 9, dtype=np.uint8) for index in (10, 11, 12)}
+    masks = {row["observation_key"]: np.ones((40, 40), dtype=bool) for row in rows}
+    reid_crops = []
 
-    result = run_v2(rows, seams=RunnerV2Seams(identity=lambda items: {item["observation_key"]: "player-007" for item in items}), bbox_sanitizer_config=config)
+    class FakeEmbedder:
+        def embed(self, image, boxes):
+            reid_crops.append((int(image[0, 0, 0]), boxes))
+            return [[3.0, 4.0]]
+
+    result = run_v2(
+        rows,
+        seams=RunnerV2Seams(
+            identity=lambda items: {item["observation_key"]: "player-007" for item in items},
+            reid=FakeEmbedder(),
+        ),
+        frames_by_index=frames,
+        masks_by_observation=masks,
+        bbox_sanitizer_config=config,
+    )
 
     assert config.bbox_sanitizer_enabled is True
     assert config.max_interpolation_gap == 2
     assert result.observations[1]["bbox_corrected"] is True
+    assert reid_crops[1] == (2, [[0.0, 0.0, 10.0, 20.0]])
 
 
 def test_explicit_disabled_pipeline_config_preserves_v2_rows(monkeypatch):
