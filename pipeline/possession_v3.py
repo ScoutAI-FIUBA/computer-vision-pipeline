@@ -151,6 +151,17 @@ class BallTransition:
     confidence: float | None = None
     profile: str = "default"
     thresholds: dict[str, float] = field(default_factory=dict)
+    source_team_id: int | None = None
+    destination_team_id: int | None = None
+    duration_seconds: float | None = None
+    loose_seconds: float = 0.0
+    proximity_distance: float | None = None
+    score: float | None = None
+    score_margin: float | None = None
+    release_evidence: bool = False
+    reception_evidence: bool = False
+    trajectory_evidence: bool = False
+    loss_of_control_evidence: bool = False
 
     def __post_init__(self) -> None:
         if type(self.transition_id) is not str or not self.transition_id.strip():
@@ -170,6 +181,15 @@ class BallTransition:
         if type(self.profile) is not str or not self.profile.strip():
             raise ValueError("profile must be a non-empty string")
         _thresholds(self.thresholds)
+        _identity(self.source_holder, None, self.source_team_id)
+        _identity(self.destination_holder, None, self.destination_team_id)
+        for value, name in ((self.duration_seconds, "duration_seconds"), (self.loose_seconds, "loose_seconds"), (self.proximity_distance, "proximity_distance")):
+            if value is not None and (type(value) not in {int, float} or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and non-negative")
+        _score(self.score, "score")
+        _score(self.score_margin, "score_margin")
+        if type(self.loss_of_control_evidence) is not bool:
+            raise ValueError("loss_of_control_evidence must be boolean")
         object.__setattr__(self, "primitive_types", list(self.primitive_types))
 @dataclass(frozen=True)
 class PossessionEvent:
@@ -179,6 +199,12 @@ class PossessionEvent:
     schema_version: int = V3_CONTRACT_VERSION
     transition_id: str | None = None
     reason_codes: list[str] = field(default_factory=list)
+    source_holder: str | None = None
+    destination_holder: str | None = None
+    source_team_id: int | None = None
+    destination_team_id: int | None = None
+    score: float | None = None
+    score_margin: float | None = None
 
     def __post_init__(self) -> None:
         _frame(self.frame_index, "frame_index")
@@ -189,6 +215,10 @@ class PossessionEvent:
         if self.transition_id is not None and (type(self.transition_id) is not str or not self.transition_id.strip()):
             raise ValueError("transition_id must be a non-empty string when set")
         _text_list(self.reason_codes, "reason_codes")
+        _identity(self.source_holder, None, self.source_team_id)
+        _identity(self.destination_holder, None, self.destination_team_id)
+        _score(self.score, "score")
+        _score(self.score_margin, "score_margin")
 def engine_name(config: PipelineConfig) -> str:
     """Return the validated selector; legacy remains the default."""
     return "v3" if config.possession_v3_enabled else "legacy"
@@ -463,6 +493,15 @@ def _holder_by_frame(states):
     return result
 
 
+def _team_by_frame(states):
+    result = {}
+    for state in states or []:
+        frame = state.frame_index if isinstance(state, PossessionObservation) else state.get("frame_index")
+        team = state.team_id if isinstance(state, PossessionObservation) else state.get("team_id")
+        result[frame] = team
+    return result
+
+
 def _reject_duplicate_ball_frames(rows):
     frames = [row.get("frame_index") for row in rows]
     if len(frames) != len(set(frames)):
@@ -496,6 +535,7 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
                    and "source_records" in row and "source_frame_indices" in row
                    and (row.get("timestamp_seconds") is None or (type(row.get("timestamp_seconds")) in {int, float} and math.isfinite(float(row["timestamp_seconds"]))))), key=lambda row: row["frame_index"])
     holders = _holder_by_frame(possession_states)
+    teams = _team_by_frame(possession_states)
     result = []
     i = 0
     while i < len(rows):
@@ -557,13 +597,80 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
     if not {item["primitive_type"] for item in grouped}.issuperset({"BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"}):
         return []
     holders = _holder_by_frame(possession_states)
+    teams = _team_by_frame(possession_states)
     release = next(item for item in grouped if item["primitive_type"] == "BALL_RELEASE")
     reception = next(item for item in grouped if item["primitive_type"] == "BALL_RECEPTION")
     refs = sorted({ref for item in grouped for ref in item["provenance"]["source_records"]})
-    return [BallTransition(f"ball-transition-{release['frame_index']}", holders.get(release["frame_index"] - 1), holders.get(reception["frame_index"]),
-                          [item["primitive_type"] for item in grouped],
-                          Provenance(refs, sorted({frame for item in grouped for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
-                          frame_start=release["frame_index"], frame_end=reception["frame_index"], confidence=.5)]
+    start_holder = holders.get(release["frame_index"] - 1)
+    end_holder = holders.get(reception["frame_index"])
+    start_row = next(row for row in ball_rows if row.get("frame_index") == release["frame_index"])
+    end_row = next(row for row in ball_rows if row.get("frame_index") == reception["frame_index"])
+    start_time, end_time = start_row.get("timestamp_seconds"), end_row.get("timestamp_seconds")
+    duration = (float(end_time) - float(start_time)) if start_time is not None and end_time is not None else (reception["frame_index"] - release["frame_index"]) / float(real_fps)
+    return [BallTransition(f"ball-transition-{release['frame_index']}", start_holder, end_holder,
+                           [item["primitive_type"] for item in grouped],
+                           Provenance(refs, sorted({frame for item in grouped for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
+                           frame_start=release["frame_index"], frame_end=reception["frame_index"], confidence=.5,
+                           source_team_id=teams.get(release["frame_index"] - 1), destination_team_id=teams.get(reception["frame_index"]),
+                           duration_seconds=duration, release_evidence=True, reception_evidence=True,
+                           trajectory_evidence=True, score_margin=None)]
+
+
+def classify_transition(transition, *, rapid_seconds=.3, proximity_threshold=80.0,
+                        loose_threshold=.3, minimum_margin=0.1):
+    """Classify one transition without upgrading ambiguous evidence to fact."""
+    if not isinstance(transition, BallTransition):
+        raise TypeError("transition must be BallTransition")
+    frame = transition.frame_end if transition.frame_end is not None else transition.frame_start
+    frame = frame if frame is not None else (transition.provenance.frame_indices[-1] if transition.provenance.frame_indices else 0)
+    common = dict(transition_id=transition.transition_id, provenance=transition.provenance,
+                  source_holder=transition.source_holder, destination_holder=transition.destination_holder,
+                  source_team_id=transition.source_team_id, destination_team_id=transition.destination_team_id,
+                  score=transition.score, score_margin=transition.score_margin)
+    def event(kind, reasons):
+        return PossessionEvent(kind, frame, transition.provenance, transition_id=transition.transition_id,
+                                reason_codes=list(reasons), **{key: value for key, value in common.items() if key != "transition_id" and key != "provenance"})
+
+    aliases = {"RELEASE": "BALL_RELEASE", "TRANSIT": "BALL_IN_TRANSIT",
+               "RECEPTION": "BALL_RECEPTION", "LOOSE": "LOOSE_BALL"}
+    primitives = {aliases.get(str(value).upper(), str(value).upper()) for value in transition.primitive_types}
+    complete = ({"BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"} <= primitives and
+                transition.release_evidence and transition.reception_evidence and transition.trajectory_evidence)
+    if "OUT_OF_BOUNDS" in primitives:
+        return [event(EventType.UNKNOWN, ("out_of_bounds_deferred",))]
+    if transition.source_holder is None or transition.source_team_id is None:
+        return [event(EventType.UNKNOWN, ("missing_source_identity_or_team",))]
+    if not complete:
+        if transition.destination_holder is None and transition.release_evidence:
+            if transition.loss_of_control_evidence:
+                return [event(EventType.LOSS_OF_CONTROL, ("release_without_unique_reception",))]
+            return [event(EventType.UNKNOWN, ("release_without_explicit_loss",))]
+        return [event(EventType.UNKNOWN, ("incomplete_transition_evidence",))]
+    if transition.destination_holder is None:
+        if transition.loss_of_control_evidence:
+            return [event(EventType.LOSS_OF_CONTROL, ("missing_destination_reception",))]
+        return [event(EventType.UNKNOWN, ("missing_destination_reception",))]
+    if transition.destination_team_id is None:
+        return [event(EventType.UNKNOWN, ("missing_destination_team",))]
+    if transition.source_holder == transition.destination_holder:
+        return [event(EventType.UNKNOWN, ("unchanged_holder",))]
+    same_team = transition.source_team_id == transition.destination_team_id
+    if same_team:
+        reasons = ("same_team_possession_transfer",)
+        transfer = event(EventType.TRANSFER, reasons + (("loose_ball_recovery",) if transition.loose_seconds > loose_threshold or "LOOSE_BALL" in primitives else ()))
+        if transition.loose_seconds <= loose_threshold and "LOOSE_BALL" not in primitives:
+            return [transfer, event(EventType.PASS, ("release_trajectory_reception",))]
+        return [transfer]
+    rapid = transition.duration_seconds is not None and transition.duration_seconds <= rapid_seconds
+    local = transition.proximity_distance is not None and transition.proximity_distance <= proximity_threshold
+    margin_ok = transition.score_margin is not None and transition.score_margin >= minimum_margin
+    transfer = event(EventType.TRANSFER, ("opponent_possession_change",))
+    if rapid and local and margin_ok and transition.loose_seconds <= loose_threshold:
+        return [transfer, event(EventType.STEAL, ("rapid_local_opponent_transfer",))]
+    confirmed_loss = transition.loss_of_control_evidence or "LOSS_OF_CONTROL" in primitives or "TURNOVER" in primitives
+    if confirmed_loss:
+        return [transfer, event(EventType.TURNOVER, ("confirmed_loss_opponent_recovery",))]
+    return [transfer, event(EventType.UNKNOWN, ("opponent_change_without_turnover_evidence",))]
 
 
 extract_ball_primitives = derive_ball_primitives

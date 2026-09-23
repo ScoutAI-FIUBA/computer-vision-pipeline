@@ -13,6 +13,7 @@ from pipeline.possession_v3 import (
     engine_name,
     score_candidates, PossessionResolver,
     normalize_ball_rows, derive_ball_primitives, derive_ball_transitions,
+    classify_transition,
 )
 from pipeline.results import PipelineResults, RunSummary
 from pipeline.runner import _possession_result_config
@@ -35,6 +36,79 @@ def test_vocabulary_and_event_contract_are_explicit():
     event = asdict(PossessionEvent(EventType.TRANSFER, 8, Provenance(frame_indices=[8])))
     assert event["event_type"] == "possession_transfer"
     assert event["provenance"]["frame_indices"] == [8]
+
+
+def _semantic_transition(**overrides):
+    values = dict(
+        transition_id="semantic-1", source_holder="p1", destination_holder="p2",
+        primitive_types=["BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"],
+        provenance=Provenance(source_records=["ball#1"], frame_indices=[1, 2, 3]),
+        source_team_id=1, destination_team_id=1, duration_seconds=.2,
+        loose_seconds=0.0, proximity_distance=12.0, score=.9, score_margin=.4,
+        release_evidence=True, reception_evidence=True, trajectory_evidence=True,
+        loss_of_control_evidence=False,
+    )
+    values.update(overrides)
+    return BallTransition(**values)
+
+
+def test_semantics_clean_pass_emits_transfer_then_pass_with_identity_and_scores():
+    events = classify_transition(_semantic_transition())
+    assert [event.event_type for event in events] == [EventType.TRANSFER, EventType.PASS]
+    assert events[-1].source_holder == "p1" and events[-1].destination_holder == "p2"
+    assert events[-1].source_team_id == events[-1].destination_team_id == 1
+    assert events[-1].score == .9 and events[-1].score_margin == .4
+    assert events[-1].transition_id == "semantic-1"
+    assert events[-1].provenance.source_records == ["ball#1"]
+    assert events[-1].provenance.frame_indices == [1, 2, 3]
+
+
+def test_same_team_loose_ball_recovery_is_transfer_not_pass():
+    events = classify_transition(_semantic_transition(loose_seconds=.4, primitive_types=["BALL_RELEASE", "BALL_IN_TRANSIT", "LOOSE_BALL", "BALL_RECEPTION"]))
+    assert [event.event_type for event in events] == [EventType.TRANSFER]
+    assert "loose_ball_recovery" in events[0].reason_codes
+
+
+def test_direct_steal_requires_rapid_local_cross_team_evidence():
+    events = classify_transition(_semantic_transition(source_team_id=1, destination_team_id=2, duration_seconds=.1, proximity_distance=20))
+    assert [event.event_type for event in events] == [EventType.TRANSFER, EventType.STEAL]
+
+
+def test_missing_score_margin_cannot_pass_steal_gate():
+    events = classify_transition(_semantic_transition(source_team_id=1, destination_team_id=2, duration_seconds=.1, proximity_distance=20, score_margin=None))
+    assert events[-1].event_type is EventType.UNKNOWN
+    assert EventType.STEAL not in [event.event_type for event in events]
+
+
+def test_insufficient_score_margin_blocks_steal():
+    events = classify_transition(_semantic_transition(source_team_id=1, destination_team_id=2, duration_seconds=.1, proximity_distance=20, score_margin=.05))
+    assert events[-1].event_type is EventType.UNKNOWN
+
+
+def test_delayed_opponent_recovery_without_confirmed_loss_is_unknown():
+    events = classify_transition(_semantic_transition(source_team_id=1, destination_team_id=2, duration_seconds=.8, loose_seconds=.5))
+    assert [event.event_type for event in events] == [EventType.TRANSFER, EventType.UNKNOWN]
+    assert EventType.STEAL not in [event.event_type for event in events]
+
+
+def test_confirmed_delayed_opponent_recovery_is_turnover():
+    events = classify_transition(_semantic_transition(source_team_id=1, destination_team_id=2, duration_seconds=.8, loose_seconds=.5, loss_of_control_evidence=True))
+    assert [event.event_type for event in events] == [EventType.TRANSFER, EventType.TURNOVER]
+
+
+def test_loss_unknown_and_out_of_bounds_fail_closed():
+    loss = classify_transition(_semantic_transition(destination_holder=None, destination_team_id=None, reception_evidence=False, loss_of_control_evidence=True))
+    assert loss[0].event_type is EventType.LOSS_OF_CONTROL
+    unknown = classify_transition(_semantic_transition(source_holder=None, source_team_id=None, release_evidence=False, trajectory_evidence=False))
+    assert unknown[0].event_type is EventType.UNKNOWN
+    boundary = classify_transition(_semantic_transition(primitive_types=["BALL_RELEASE", "OUT_OF_BOUNDS"]))
+    assert boundary[0].event_type is EventType.UNKNOWN
+
+
+def test_known_destination_without_destination_team_is_unknown():
+    events = classify_transition(_semantic_transition(source_team_id=1, destination_team_id=None))
+    assert events[-1].event_type is EventType.UNKNOWN
+    assert EventType.LOSS_OF_CONTROL not in [event.event_type for event in events]
 
 
 def test_engine_is_opt_in_and_legacy_metadata_is_unchanged():
