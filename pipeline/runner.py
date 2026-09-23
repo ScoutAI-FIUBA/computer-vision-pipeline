@@ -78,6 +78,17 @@ from scripts.ball.tracknet import padded_window
 
 logger = logging.getLogger(__name__)
 
+
+def _possession_result_config(config: PipelineConfig, base: dict) -> dict:
+    """Keep legacy result metadata byte-for-byte compatible; add V3 only when enabled."""
+    if not config.possession_v3_enabled:
+        return base
+    return {
+        **base,
+        "possession_engine": "v3",
+        "possession_v3_schema_version": 1,
+    }
+
 TRACKS_FILENAME = "tracks.jsonl"
 RESULTS_FILENAME = "results.json"
 ANNOTATED_FILENAME = "annotated.mp4"
@@ -884,7 +895,9 @@ def run_stats_from_v2_observations(
         schema_version=RESULTS_SCHEMA_VERSION,
         video={"filename": video_path.name, "fps": info.fps, "frame_count": info.frame_count,
                "width": info.width, "height": info.height, "duration_seconds": info.duration_seconds},
-        config={"source": "sam31_v2_observations", "tracknet_enabled": config.tracknet_enabled},
+         config=_possession_result_config(
+             config, {"source": "sam31_v2_observations", "tracknet_enabled": config.tracknet_enabled}
+         ),
         summary=RunSummary(frames_processed=len(frame_indices), track_records=len(rows),
                            distinct_track_ids=len({row["track_id"] for row in rows})),
         device="cpu", teams_file=TEAMS_FILENAME, shot_events_file=SHOT_EVENTS_FILENAME,
@@ -1405,6 +1418,7 @@ def run_pipeline(
         projected_tracks_file=PROJECTED_TRACKS_FILENAME if projected_track_records > 0 else None,
         annotated_video_file=ANNOTATED_FILENAME if annotated_path else None,
     )
+    results.config = _possession_result_config(config, results.config)
 
     _write_shot_events(
         video_path,

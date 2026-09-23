@@ -1,0 +1,1 @@
+{"schema_version":1,"input_contract_version":1,"profile":"default","engine":"legacy","observations":[{"frame_index":0,"state":"NO_POSSESSION","evidence_kind":"unknown"},{"frame_index":4,"state":"OBSERVED","evidence_kind":"observed"},{"frame_index":8,"state":"CONTESTED","evidence_kind":"contested"}]}

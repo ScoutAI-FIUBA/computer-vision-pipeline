@@ -66,6 +66,8 @@ class PipelineResults:
     ball_provenance: dict[str, Any] | None = None
     possession_events_file: str | None = None
     possession_transitions_file: str | None = None
+    possession_v3_file: str | None = None
+    possession_v3_schema_version: int | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -90,6 +92,10 @@ class PipelineResults:
             payload.pop("possession_events_file", None)
         if payload.get("possession_transitions_file") is None:
             payload.pop("possession_transitions_file", None)
+        if payload.get("possession_v3_file") is None:
+            payload.pop("possession_v3_file", None)
+        if payload.get("possession_v3_schema_version") is None:
+            payload.pop("possession_v3_schema_version", None)
         return payload
 
     def write(self, path: Path) -> None:

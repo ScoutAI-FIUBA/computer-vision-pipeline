@@ -11,6 +11,7 @@ Cost-relevant defaults are marked COST. Read those comments before changing them
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass
 
 from pipeline.court_projection import DEFAULT_COURT_MODEL_ID
@@ -110,6 +111,13 @@ DEFAULT_BBOX_HISTORY_SIZE = 15
 DEFAULT_BBOX_MAX_INTERPOLATION_GAP = 2
 DEFAULT_BBOX_SIGNAL_THRESHOLD = 3.0
 DEFAULT_POSSESSION_TRANSITION_MAX_GAP = 15
+DEFAULT_POSSESSION_ENGINE = "legacy"
+DEFAULT_POSSESSION_V3_GRACE_SECONDS = 0.6
+DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN = 0.05
+DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS = 0.2
+DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS = 1.0
+DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE = "default"
+DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION = 1
 
 
 
@@ -131,6 +139,12 @@ def _env_optional_float(name: str) -> float | None:
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     return default if value in (None, "") else value.lower() in {"1", "true", "yes"}
+
+
+def _finite_v3(value: object, name: str) -> float:
+    if type(value) not in {int, float} or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -160,6 +174,17 @@ class PipelineConfig:
     max_interpolation_gap: int = DEFAULT_BBOX_MAX_INTERPOLATION_GAP
     bbox_signal_threshold: float = DEFAULT_BBOX_SIGNAL_THRESHOLD
     possession_transition_max_gap: int = DEFAULT_POSSESSION_TRANSITION_MAX_GAP
+    possession_engine: str = DEFAULT_POSSESSION_ENGINE
+    possession_v3_grace_seconds: float = DEFAULT_POSSESSION_V3_GRACE_SECONDS
+    possession_v3_hysteresis_margin: float = DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN
+    possession_v3_persistence_seconds: float = DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS
+    possession_v3_event_window_seconds: float = DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS
+    possession_v3_calibration_profile: str = DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE
+    possession_v3_input_contract_version: int = DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION
+
+    @property
+    def possession_v3_enabled(self) -> bool:
+        return self.possession_engine == "v3"
 
     # --- Sampling ---
     # COST: the biggest lever there is. SAM2's image encoder runs on every
@@ -288,6 +313,24 @@ class PipelineConfig:
     prefetch_detections: bool = True
 
     def __post_init__(self) -> None:
+        if self.possession_engine not in {"legacy", "v3"}:
+            raise ValueError("Unknown possession_engine: expected 'legacy' or 'v3'")
+        grace = _finite_v3(self.possession_v3_grace_seconds, "possession_v3_grace_seconds")
+        hysteresis = _finite_v3(self.possession_v3_hysteresis_margin, "possession_v3_hysteresis_margin")
+        persistence = _finite_v3(self.possession_v3_persistence_seconds, "possession_v3_persistence_seconds")
+        event_window = _finite_v3(self.possession_v3_event_window_seconds, "possession_v3_event_window_seconds")
+        if not 0 < grace <= 0.6:
+            raise ValueError("possession_v3_grace_seconds must be between 0 and 0.6")
+        if hysteresis < 0:
+            raise ValueError("possession_v3_hysteresis_margin must be non-negative")
+        if persistence < 0:
+            raise ValueError("possession_v3_persistence_seconds must be non-negative")
+        if event_window <= 0:
+            raise ValueError("possession_v3_event_window_seconds must be positive")
+        if type(self.possession_v3_calibration_profile) is not str or not self.possession_v3_calibration_profile.strip():
+            raise ValueError("possession_v3_calibration_profile must not be empty")
+        if type(self.possession_v3_input_contract_version) is not int or self.possession_v3_input_contract_version < 1:
+            raise ValueError("possession_v3_input_contract_version must be at least 1")
         if self.frame_stride < 1:
             raise ValueError("frame_stride must be at least 1")
         if self.shot_frame_stride < 1:
@@ -396,6 +439,25 @@ class PipelineConfig:
             ),
             "possession_transition_max_gap": _env_int(
                 "POSSESSION_TRANSITION_MAX_GAP", DEFAULT_POSSESSION_TRANSITION_MAX_GAP
+            ),
+            "possession_engine": os.getenv("POSSESSION_ENGINE", DEFAULT_POSSESSION_ENGINE),
+            "possession_v3_grace_seconds": _env_float(
+                "POSSESSION_V3_GRACE_SECONDS", DEFAULT_POSSESSION_V3_GRACE_SECONDS
+            ),
+            "possession_v3_hysteresis_margin": _env_float(
+                "POSSESSION_V3_HYSTERESIS_MARGIN", DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN
+            ),
+            "possession_v3_persistence_seconds": _env_float(
+                "POSSESSION_V3_PERSISTENCE_SECONDS", DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS
+            ),
+            "possession_v3_event_window_seconds": _env_float(
+                "POSSESSION_V3_EVENT_WINDOW_SECONDS", DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS
+            ),
+            "possession_v3_calibration_profile": os.getenv(
+                "POSSESSION_V3_CALIBRATION_PROFILE", DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE
+            ),
+            "possession_v3_input_contract_version": _env_int(
+                "POSSESSION_V3_INPUT_CONTRACT_VERSION", DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION
             ),
             "team_embedder_backend": os.getenv(
                 "TEAM_EMBEDDER_BACKEND", DEFAULT_TEAM_EMBEDDER_BACKEND

@@ -168,6 +168,11 @@ def test_new_result_fields_follow_existing_positional_optional_fields():
     assert results.shot_evidence_file is None
 
 
+def test_v3_result_pointers_are_additive_when_present():
+    payload = PipelineResults(5, {}, {}, RunSummary(), "cpu", possession_v3_file="possession_v3.jsonl", possession_v3_schema_version=1).to_dict()
+    assert payload["possession_v3_file"] == "possession_v3.jsonl" and payload["possession_v3_schema_version"] == 1
+
+
 def test_package_rejects_duplicate_observation_keys(tmp_path: Path):
     observations = _observations() * 2
 
