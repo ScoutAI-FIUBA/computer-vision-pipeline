@@ -190,7 +190,16 @@ def test_v2_stats_adapter_converts_normalized_boxes_for_pixel_ball_geometry(tmp_
     )
 
     tracks = [json.loads(line) for line in (tmp_path / "stats" / "tracks.jsonl").read_text().splitlines()]
-    assert tracks[0]["xyxy"] == [10.0, 20.0, 30.0, 60.0]
+    assert [track["xyxy"] for track in tracks] == [
+        [10.0, 20.0, 30.0, 60.0],
+        [10.0, 20.0, 30.0, 60.0],
+        [10.0, 20.0, 30.0, 60.0],
+    ]
+    assert [(track["stable_player_id"], track["team_id"]) for track in tracks] == [
+        ("player-7", 1),
+        ("player-7", 1),
+        ("player-7", 1),
+    ]
     assert observations[0]["bbox_xyxy"] == [0.1, 0.1, 0.3, 0.3]
     possession = [
         json.loads(line)

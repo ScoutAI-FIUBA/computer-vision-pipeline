@@ -179,7 +179,7 @@ def test_explicit_disabled_pipeline_config_preserves_v2_rows(monkeypatch):
         bbox_sanitizer_config=PipelineConfig.from_env(),
     )
 
-    assert result.observations == [{key: value for key, value in row.items() if key != "bbox_coordinate_space"}]
+    assert result.observations == [row]
 
 
 def test_sanitizer_preserves_raw_bbox_and_coordinate_metadata_for_alternate_and_malformed_boxes():

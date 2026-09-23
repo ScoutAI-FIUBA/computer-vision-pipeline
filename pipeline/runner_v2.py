@@ -666,8 +666,6 @@ class RunnerV2:
         elif authority_decision is not None:
             acceptance.update(dict(authority_decision.metadata))
             acceptance["tracking_identity"] = "accepted"
-        for row in rows:
-            row.pop("bbox_coordinate_space", None)
         if not structurally_valid:
             acceptance_reasons = reasons
         return RunnerV2Result(

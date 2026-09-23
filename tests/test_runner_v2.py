@@ -165,6 +165,18 @@ def test_explicit_identity_authority_accepts_complete_runtime_evidence():
     assert result.observations[0]["team_id"] == 0
 
 
+def test_runner_preserves_coordinate_space_without_changing_identity_fields():
+    observation = {**row(), "bbox_coordinate_space": "normalized", "team_id": 1}
+
+    result = RunnerV2(
+        RunnerV2Seams(identity=lambda items: {item["observation_key"]: "player-003" for item in items})
+    ).run([observation])
+
+    assert result.observations[0]["bbox_coordinate_space"] == "normalized"
+    assert result.observations[0]["stable_player_id"] == "player-003"
+    assert result.observations[0]["team_id"] == 1
+
+
 def test_explicit_identity_authority_rejection_scrubs_derived_fields_atomically():
     def reject(_rows, _receipts):
         return IdentityAuthorityDecision(
