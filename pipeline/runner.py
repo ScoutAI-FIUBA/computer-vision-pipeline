@@ -47,9 +47,13 @@ from pipeline.number_evidence import (
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
 from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
+from pipeline.possession_v3 import (
+    PossessionResolver, derive_ball_primitives, derive_ball_transitions, classify_transition,
+    normalize_ball_rows, score_candidates,
+)
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
-from pipeline.results import RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter
+from pipeline.results import RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter, write_v3_artifacts
 from pipeline.shot_events import (
     flush_open_shot_event,
     shot_frame_signals,
@@ -102,6 +106,10 @@ SHOT_RAW_PREDICTIONS_FILENAME = "shot_raw_predictions.jsonl"
 BALL_TRACKS_FILENAME = "ball_tracks.jsonl"
 POSSESSION_EVENTS_FILENAME = "possession_events.jsonl"
 POSSESSION_TRANSITIONS_FILENAME = "possession_transitions.jsonl"
+POSSESSION_V3_FILENAME = "possession_v3.jsonl"
+BALL_TRANSITIONS_V3_FILENAME = "ball_transitions_v3.jsonl"
+POSSESSION_EVENTS_V3_FILENAME = "possession_events_v3.jsonl"
+POSSESSION_V3_MANIFEST_FILENAME = "possession_v3_manifest.json"
 PROJECTED_TRACKS_FILENAME = "projected_tracks.jsonl"
 PROJECTED_SHOTS_FILENAME = "projected_shots.json"
 PROJECTED_SHOTS_IMAGE_FILENAME = "projected_shots.png"
@@ -118,6 +126,41 @@ def _build_detector_for_model(config: PipelineConfig, *, model_id: str | None = 
 
 def _frame_timestamp_seconds(frame_index: int, fps: float) -> float | None:
     return None if fps <= 0 else frame_index / fps
+
+
+def _write_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig) -> dict:
+    """Run the additive V3 path; legacy files are never read or rewritten."""
+    if not config.possession_v3_enabled:
+        return {}
+    by_frame: dict[int, list[dict]] = {}
+    for row in rows:
+        item = dict(row)
+        item["box"] = item.get("bbox", item.get("xyxy"))
+        by_frame.setdefault(int(item["frame_index"]), []).append(item)
+    balls = {int(row["frame_index"]): row for row in ball_rows if isinstance(row, dict) and type(row.get("frame_index")) is int}
+    resolver = PossessionResolver(real_fps=fps, grace_seconds=config.possession_v3_grace_seconds,
+                                  hysteresis_margin=config.possession_v3_hysteresis_margin,
+                                  persistence_seconds=config.possession_v3_persistence_seconds,
+                                  profile=config.possession_v3_calibration_profile)
+    observations = []
+    for frame in sorted(set(by_frame) | set(balls)):
+        ball = balls.get(frame)
+        candidates = score_candidates(by_frame.get(frame, []), ball, previous_holder=resolver.holder_stable,
+                                      ambiguity_margin=config.possession_v3_hysteresis_margin)
+        observation = resolver.resolve(frame, candidates, missing=ball is None,
+                                       invalid=ball is not None and ball.get("track_state") == "lost",
+                                       ball_lost=ball is not None and ball.get("track_state") == "lost",
+                                       timestamp=ball.get("timestamp_seconds") if ball else None)
+        observations.append(observation)
+    normalized = normalize_ball_rows(ball_rows, real_fps=fps, config=config)
+    primitives = derive_ball_primitives(normalized, observations, real_fps=fps)
+    transitions = derive_ball_transitions(normalized, observations, real_fps=fps)
+    events = [event for transition in transitions for event in classify_transition(transition)]
+    manifest = write_v3_artifacts(output_dir, observations, primitives, transitions, events,
+                                  {"profile": config.possession_v3_calibration_profile,
+                                   "input_contract_version": config.possession_v3_input_contract_version,
+                                   "engine": "v3"})
+    return manifest
 
 
 def _split_detection_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -890,6 +933,7 @@ def run_stats_from_v2_observations(
         team_ids_by_track_id=team_by_track_id,
         max_frame_gap=config.possession_transition_max_gap,
     ))
+    v3_manifest = phase("possession V3", lambda: _write_v3_artifacts(output_dir, rows, ball_rows, fps=info.fps, config=config))
     (output_dir / NUMBERS_FILENAME).unlink(missing_ok=True)
     results = PipelineResults(
         schema_version=RESULTS_SCHEMA_VERSION,
@@ -903,13 +947,20 @@ def run_stats_from_v2_observations(
         device="cpu", teams_file=TEAMS_FILENAME, shot_events_file=SHOT_EVENTS_FILENAME,
         shot_evidence_file=SHOT_EVIDENCE_FILENAME, ball_tracks_file=BALL_TRACKS_FILENAME,
         possession_events_file=POSSESSION_EVENTS_FILENAME,
-        possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
-        artifact_references={
+         possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
+         possession_v3_file=POSSESSION_V3_FILENAME if v3_manifest else None,
+         possession_v3_transitions_file=BALL_TRANSITIONS_V3_FILENAME if v3_manifest else None,
+         possession_v3_events_file=POSSESSION_EVENTS_V3_FILENAME if v3_manifest else None,
+         possession_v3_manifest_file=POSSESSION_V3_MANIFEST_FILENAME if v3_manifest else None,
+         possession_v3_schema_version=1 if v3_manifest else None,
+         artifact_references={
             "possession_events": {"file": possession_path.name, "schema_version": 1},
             "possession_transitions": {
                 "file": transitions_path.name, "schema_version": 1,
                 "event_types": ["pass", "steal", "turnover", "lost_possession"],
             },
+            **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
+                                  "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest else {}),
         },
     )
     emit("artifact writing start")
@@ -1522,6 +1573,13 @@ def run_pipeline(
         frame_step=step, team_ids_by_track_id=team_by_track_id,
         max_frame_gap=config.possession_transition_max_gap,
     )
+    v3_manifest = _write_v3_artifacts(output_dir, _load_jsonl_rows(tracks_path), ball_rows, fps=info.fps, config=config)
+    if v3_manifest:
+        results.possession_v3_file = POSSESSION_V3_FILENAME
+        results.possession_v3_transitions_file = BALL_TRANSITIONS_V3_FILENAME
+        results.possession_v3_events_file = POSSESSION_EVENTS_V3_FILENAME
+        results.possession_v3_manifest_file = POSSESSION_V3_MANIFEST_FILENAME
+        results.possession_v3_schema_version = 1
     results.artifact_references = {
         "possession_events": {
             "file": possession_path.name,
@@ -1533,6 +1591,8 @@ def run_pipeline(
             "schema_version": 1,
             "event_types": ["pass", "steal", "turnover", "lost_possession"],
         },
+        **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
+                              "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest else {}),
     }
 
     # One line per suspected swap, so a run can be reviewed without watching the

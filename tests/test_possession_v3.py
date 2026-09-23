@@ -38,6 +38,11 @@ def test_vocabulary_and_event_contract_are_explicit():
     assert event["provenance"]["frame_indices"] == [8]
 
 
+def test_event_rejects_reversed_timestamp_range():
+    with pytest.raises(ValueError, match="timestamp_end"):
+        PossessionEvent(EventType.PASS, 8, Provenance(frame_indices=[8]), timestamp_start=2.0, timestamp_end=1.0)
+
+
 def _semantic_transition(**overrides):
     values = dict(
         transition_id="semantic-1", source_holder="p1", destination_holder="p2",
@@ -435,6 +440,14 @@ def test_release_requires_persistent_separation_and_transit_has_trajectory():
     assert [item["primitive_type"] for item in primitives] == ["BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"]
     assert primitives[1]["provenance"]["frame_indices"] == [1, 2]
     assert derive_ball_transitions(rows, [_pos(0, "a"), _pos(1, None), _pos(2, None), _pos(3, "b"), _pos(4, "b")], real_fps=10)
+
+
+def test_primitives_preserve_available_source_timestamp_ranges():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(5)], real_fps=10, max_gap_frames=1)
+    primitives = derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, None), _pos(3, "b"), _pos(4, "b")], real_fps=10)
+    assert all(item["timestamp_start"] is not None and item["timestamp_end"] is not None for item in primitives)
+    assert primitives[0]["timestamp_start"] == 0.0
+    assert primitives[-1]["timestamp_end"] == 0.4
 
 
 def test_single_destination_frame_does_not_confirm_reception():

@@ -1,7 +1,9 @@
 .atl/
 .venv/
 .script-exp/
-docs/
+docs/*
+!docs/
+!docs/possession-engine-v3.md
 openspec/
 
 .env

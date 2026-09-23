@@ -68,6 +68,9 @@ class PipelineResults:
     possession_transitions_file: str | None = None
     possession_v3_file: str | None = None
     possession_v3_schema_version: int | None = None
+    possession_v3_transitions_file: str | None = None
+    possession_v3_events_file: str | None = None
+    possession_v3_manifest_file: str | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -94,6 +97,9 @@ class PipelineResults:
             payload.pop("possession_transitions_file", None)
         if payload.get("possession_v3_file") is None:
             payload.pop("possession_v3_file", None)
+        for key in ("possession_v3_transitions_file", "possession_v3_events_file", "possession_v3_manifest_file"):
+            if payload.get(key) is None:
+                payload.pop(key, None)
         if payload.get("possession_v3_schema_version") is None:
             payload.pop("possession_v3_schema_version", None)
         return payload
@@ -101,6 +107,63 @@ class PipelineResults:
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+
+def _json_record(value: Any, config: Mapping[str, Any]) -> dict[str, Any]:
+    if hasattr(value, "__dataclass_fields__"):
+        value = asdict(value)
+    record = dict(value)
+    record.setdefault("schema", "possession-engine-v3")
+    record.setdefault("schema_version", 1)
+    frame = record.get("frame_index")
+    if record.get("frame_start") is None:
+        record["frame_start"] = frame
+    if record.get("frame_end") is None:
+        record["frame_end"] = frame
+    timestamp = record.get("timestamp_seconds")
+    if record.get("timestamp_start") is None:
+        record["timestamp_start"] = timestamp
+    if record.get("timestamp_end") is None:
+        record["timestamp_end"] = timestamp
+    if config:
+        record.setdefault("config", dict(config))
+    return record
+
+
+def write_v3_artifacts(
+    output_dir: Path,
+    possession: Iterable[Any],
+    primitives: Iterable[Mapping[str, Any]],
+    transitions: Iterable[Any],
+    events: Iterable[Any],
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write deterministic, additive V3 artifacts and a self-hashed manifest."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config = dict(config or {})
+    datasets = {
+        "possession": [_json_record(row, config) for row in possession],
+        "primitives": [_json_record(row, config) for row in primitives],
+        "transitions": [_json_record(row, config) for row in transitions],
+        "events": [_json_record(row, config) for row in events],
+    }
+    filenames = {
+        "possession": "possession_v3.jsonl",
+        "primitives": "possession_primitives_v3.jsonl",
+        "transitions": "ball_transitions_v3.jsonl",
+        "events": "possession_events_v3.jsonl",
+    }
+    artifacts: dict[str, Any] = {}
+    for name, rows in datasets.items():
+        path = output_dir / filenames[name]
+        path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
+        artifacts[name] = {"path": filenames[name], "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "count": len(rows)}
+    manifest: dict[str, Any] = {"schema": "possession-engine-v3", "schema_version": 1, "config": config, "artifacts": artifacts}
+    manifest["artifacts"]["manifest"] = {"path": "possession_v3_manifest.json"}
+    manifest_hash = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    manifest["artifacts"]["manifest"]["sha256"] = manifest_hash
+    (output_dir / "possession_v3_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest
 
 
 class TrackWriter:

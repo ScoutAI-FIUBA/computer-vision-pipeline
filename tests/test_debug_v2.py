@@ -712,3 +712,34 @@ def test_cli_passes_allow_incomplete_to_render_flow(tmp_path: Path, monkeypatch)
     debug_v2.main()
 
     assert captured["kwargs"]["allow_incomplete"] is True
+
+
+def test_render_frame_shows_v3_state_scores_transition_and_event(tmp_path: Path, monkeypatch):
+    calls = []
+    original = cv2.putText
+    monkeypatch.setattr(cv2, "putText", lambda image, text, *args, **kwargs: (calls.append(text), original(image, text, *args, **kwargs))[1])
+    render_frame(np.zeros((80, 120, 3), dtype=np.uint8), [], tmp_path,
+                 v3_observation={"state": "GRACE", "stable_player_id": "p1", "score": .8,
+                                 "score_margin": .04, "profile": "pilot", "thresholds": {"hysteresis_margin": .1},
+                                 "candidates": [{"score": .8, "contributions": {"mask": .3}, "rejected_reasons": ["outside_bbox"]}, {"score": .76}],
+                                 "provenance": {"frame_indices": [4], "reason_codes": ["insufficient_margin"]}},
+                 v3_transition={"source_holder": "p1", "destination_holder": "p2", "score": .7,
+                                "score_margin": .2, "primitive_types": ["BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"],
+                                "frame_start": 4, "frame_end": 8, "timestamp_start": .4, "timestamp_end": .8,
+                                "provenance": {"source_records": ["ball#4"]}},
+                 v3_events=[{"event_type": "PASS", "frame_index": 8, "frame_start": 4, "frame_end": 8,
+                             "reason_codes": ["release_trajectory_reception"],
+                             "provenance": {"source_records": ["t1"], "frame_indices": [4, 8]}}])
+    assert any("STATE: GRACE" in call for call in calls)
+    assert any("CANDIDATES" in call for call in calls)
+    assert any("CONTRIBUTIONS" in call for call in calls)
+    assert any("THRESHOLDS" in call and "pilot" in call for call in calls)
+    assert any("REJECTED" in call and "outside_bbox" in call for call in calls)
+    assert any("REASONS" in call and "insufficient_margin" in call for call in calls)
+    assert any("MARGIN" in call for call in calls)
+    assert any("RELEASE" in call and "RECEPTION" in call for call in calls)
+    assert any("WINDOW: 4-8" in call and "0.4-0.8" in call for call in calls)
+    assert any("EVENT: PASS" in call for call in calls)
+    assert any("EVENT WINDOW: 4-8" in call for call in calls)
+    assert any("EVENT PROVENANCE: t1" in call for call in calls)
+    assert any("EVENT REASONS: release_trajectory_reception" in call for call in calls)

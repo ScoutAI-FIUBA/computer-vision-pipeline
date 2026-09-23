@@ -121,6 +121,7 @@ class PossessionObservation:
     provenance: Provenance = field(default_factory=Provenance)
     profile: str = "default"
     thresholds: dict[str, float] = field(default_factory=dict)
+    timestamp_seconds: float | None = None
 
     def __post_init__(self) -> None:
         _frame(self.frame_index, "frame_index")
@@ -135,6 +136,8 @@ class PossessionObservation:
         if type(self.profile) is not str or not self.profile.strip():
             raise ValueError("profile must be a non-empty string")
         _thresholds(self.thresholds)
+        if self.timestamp_seconds is not None and (type(self.timestamp_seconds) not in {int, float} or not math.isfinite(self.timestamp_seconds)):
+            raise ValueError("timestamp_seconds must be finite when set")
         if not isinstance(self.candidates, (list, tuple)) or any(not isinstance(x, CandidateEvidence) for x in self.candidates):
             raise ValueError("candidates must contain CandidateEvidence")
 @dataclass(frozen=True)
@@ -162,6 +165,8 @@ class BallTransition:
     reception_evidence: bool = False
     trajectory_evidence: bool = False
     loss_of_control_evidence: bool = False
+    timestamp_start: float | None = None
+    timestamp_end: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.transition_id) is not str or not self.transition_id.strip():
@@ -188,6 +193,11 @@ class BallTransition:
                 raise ValueError(f"{name} must be finite and non-negative")
         _score(self.score, "score")
         _score(self.score_margin, "score_margin")
+        for value, name in ((self.timestamp_start, "timestamp_start"), (self.timestamp_end, "timestamp_end")):
+            if value is not None and (type(value) not in {int, float} or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.timestamp_start is not None and self.timestamp_end is not None and self.timestamp_end < self.timestamp_start:
+            raise ValueError("timestamp_end must not precede timestamp_start")
         if type(self.loss_of_control_evidence) is not bool:
             raise ValueError("loss_of_control_evidence must be boolean")
         object.__setattr__(self, "primitive_types", list(self.primitive_types))
@@ -205,6 +215,11 @@ class PossessionEvent:
     destination_team_id: int | None = None
     score: float | None = None
     score_margin: float | None = None
+    timestamp_seconds: float | None = None
+    frame_start: int | None = None
+    frame_end: int | None = None
+    timestamp_start: float | None = None
+    timestamp_end: float | None = None
 
     def __post_init__(self) -> None:
         _frame(self.frame_index, "frame_index")
@@ -219,6 +234,15 @@ class PossessionEvent:
         _identity(self.destination_holder, None, self.destination_team_id)
         _score(self.score, "score")
         _score(self.score_margin, "score_margin")
+        for value, name in ((self.timestamp_seconds, "timestamp_seconds"), (self.timestamp_start, "timestamp_start"), (self.timestamp_end, "timestamp_end")):
+            if value is not None and (type(value) not in {int, float} or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.timestamp_start is not None and self.timestamp_end is not None and self.timestamp_end < self.timestamp_start:
+            raise ValueError("timestamp_end must not precede timestamp_start")
+        if self.frame_start is not None: _frame(self.frame_start, "frame_start")
+        if self.frame_end is not None: _frame(self.frame_end, "frame_end")
+        if self.frame_start is not None and self.frame_end is not None and self.frame_end < self.frame_start:
+            raise ValueError("frame_end must not precede frame_start")
 def engine_name(config: PipelineConfig) -> str:
     """Return the validated selector; legacy remains the default."""
     return "v3" if config.possession_v3_enabled else "legacy"
@@ -298,7 +322,7 @@ class PossessionResolver:
         self.profile = profile; self.holder = None; self.last_frame = None; self.last_time = None
         self.pending = None; self.gap_seconds = 0.0
         self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
-        self.history = []
+        self.history = []; self.last_timestamp = None
 
     def _observation(self, frame, state, candidate=None, candidates=(), reason=()):
         stable = candidate.stable_player_id if candidate else self.holder_stable
@@ -312,6 +336,7 @@ class PossessionResolver:
                                     team_id=team, score=candidate.score if candidate else None,
                                     score_margin=(candidates[0].score - candidates[1].score if len(candidates) > 1 else None),
                                     candidates=list(candidates), provenance=prov, profile=self.profile,
+                                    timestamp_seconds=self.last_timestamp,
                                     thresholds={"hysteresis_margin": self.hysteresis, "grace_seconds": self.grace})
         self.history.append(obs); return obs
 
@@ -323,6 +348,7 @@ class PossessionResolver:
         candidates = sorted(candidates or [], key=lambda c: (-c.score, c.stable_player_id or "", c.raw_track_id or 0))
         elapsed = 0.0 if self.last_frame is None else (timestamp - self.last_time if timestamp is not None and self.last_time is not None else (frame_index - self.last_frame) / self.fps)
         self.last_frame, self.last_time = frame_index, timestamp
+        self.last_timestamp = timestamp
         invalid_input = invalid or authoritative_loss or duplicate or missing
         if candidates and not invalid_input:
             self.gap_seconds = 0.0
@@ -517,6 +543,11 @@ def _reject_duplicate_ball_frames(rows):
         raise ValueError("ball rows must be monotonic")
 
 
+def _timestamp_range(rows):
+    values = [row["timestamp_seconds"] for row in rows if type(row.get("timestamp_seconds")) in {int, float} and math.isfinite(float(row["timestamp_seconds"]))]
+    return (min(values), max(values)) if values else (None, None)
+
+
 def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seconds=.3, release_persistence_frames=2, reception_persistence_frames=2):
     """Derive only conservative, provenance-bearing primitive ball events."""
     if type(real_fps) not in {int, float} or not math.isfinite(float(real_fps)) or real_fps <= 0:
@@ -562,10 +593,13 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
                     moved = len(points) > 1 and any(points[n] != points[n - 1] for n in range(1, len(points)))
                     refs = sorted({ref for row in [rows[i], *gap, rows[j]] for ref in row.get("source_records", [])})
                     base = {"frame_index": gap[0]["frame_index"], "source_frame_indices": sorted({row["frame_index"] for row in [rows[i], *gap, rows[j]]}), "provenance": {"source_records": refs, "frame_indices": sorted({row["frame_index"] for row in [rows[i], *gap, rows[j]]}), "reason_codes": []}}
-                    result.append(dict(base, primitive_type="BALL_RELEASE", reason_codes=["holder_separation"]))
+                    start, end = _timestamp_range([rows[i], *gap])
+                    result.append(dict(base, primitive_type="BALL_RELEASE", reason_codes=["holder_separation"], timestamp_start=start, timestamp_end=end))
                     if moved:
-                        result.append(dict(base, primitive_type="BALL_IN_TRANSIT", frame_index=gap[0]["frame_index"], reason_codes=["trajectory"] , provenance=dict(base["provenance"], frame_indices=[row["frame_index"] for row in gap])))
-                        result.append(dict(base, primitive_type="BALL_RECEPTION", frame_index=rows[destination_end]["frame_index"], reason_codes=["unique_reception"], provenance=dict(base["provenance"], frame_indices=[rows[destination_end]["frame_index"]])))
+                        start, end = _timestamp_range(gap)
+                        result.append(dict(base, primitive_type="BALL_IN_TRANSIT", frame_index=gap[0]["frame_index"], reason_codes=["trajectory"], timestamp_start=start, timestamp_end=end, provenance=dict(base["provenance"], frame_indices=[row["frame_index"] for row in gap])))
+                        start, end = _timestamp_range(rows[j:destination_end + 1])
+                        result.append(dict(base, primitive_type="BALL_RECEPTION", frame_index=rows[destination_end]["frame_index"], reason_codes=["unique_reception"], timestamp_start=start, timestamp_end=end, provenance=dict(base["provenance"], frame_indices=[rows[destination_end]["frame_index"]])))
                 i = destination_end
                 continue
         i += 1
@@ -578,7 +612,8 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
             end += 1
         if (empty[end]["frame_index"] - empty[start]["frame_index"]) / float(real_fps) >= loose_seconds:
             refs = sorted({ref for row in empty[start:end + 1] for ref in row.get("source_records", [])})
-            result.append({"primitive_type": "LOOSE_BALL", "frame_index": empty[start]["frame_index"] + int(loose_seconds * real_fps),
+            timestamp_start, timestamp_end = _timestamp_range(empty[start:end + 1])
+            result.append({"primitive_type": "LOOSE_BALL", "frame_index": empty[start]["frame_index"] + int(loose_seconds * real_fps), "timestamp_start": timestamp_start, "timestamp_end": timestamp_end,
                            "source_frame_indices": [row["frame_index"] for row in empty[start:end + 1]],
                            "provenance": {"source_records": refs, "frame_indices": [row["frame_index"] for row in empty[start:end + 1]], "reason_codes": ["unpossessed_duration"]},
                            "reason_codes": ["unpossessed_duration"]})
@@ -612,7 +647,8 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
                            Provenance(refs, sorted({frame for item in grouped for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
                            frame_start=release["frame_index"], frame_end=reception["frame_index"], confidence=.5,
                            source_team_id=teams.get(release["frame_index"] - 1), destination_team_id=teams.get(reception["frame_index"]),
-                           duration_seconds=duration, release_evidence=True, reception_evidence=True,
+                            duration_seconds=duration, timestamp_start=start_time, timestamp_end=end_time,
+                            release_evidence=True, reception_evidence=True,
                            trajectory_evidence=True, score_margin=None)]
 
 
@@ -626,7 +662,9 @@ def classify_transition(transition, *, rapid_seconds=.3, proximity_threshold=80.
     common = dict(transition_id=transition.transition_id, provenance=transition.provenance,
                   source_holder=transition.source_holder, destination_holder=transition.destination_holder,
                   source_team_id=transition.source_team_id, destination_team_id=transition.destination_team_id,
-                  score=transition.score, score_margin=transition.score_margin)
+                  score=transition.score, score_margin=transition.score_margin,
+                  frame_start=transition.frame_start, frame_end=transition.frame_end,
+                  timestamp_start=transition.timestamp_start, timestamp_end=transition.timestamp_end)
     def event(kind, reasons):
         return PossessionEvent(kind, frame, transition.provenance, transition_id=transition.transition_id,
                                 reason_codes=list(reasons), **{key: value for key, value in common.items() if key != "transition_id" and key != "provenance"})

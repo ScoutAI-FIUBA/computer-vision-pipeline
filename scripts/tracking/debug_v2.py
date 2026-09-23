@@ -21,6 +21,7 @@ TEAM_COLORS = {
 }
 NEUTRAL_COLOR = (160, 255, 160)
 POSSESSION_STATUSES = {"confirmed", "unknown", "lost", "unassigned"}
+V3_STATES = {"OBSERVED", "INFERRED", "GRACE", "CONTESTED", "NO_POSSESSION", "UNKNOWN", "CANDIDATE", "TRANSITIONING"}
 
 
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
@@ -58,6 +59,21 @@ def load_possession_events(possession_jsonl: Path) -> dict[int, dict[str, Any]]:
                 raise ValueError(f"duplicate possession frame_index {frame_index}")
             by_frame[frame_index] = row
     return by_frame
+
+
+def load_v3_jsonl(path: Path | None) -> dict[int, list[dict[str, Any]]]:
+    """Load optional V3 rows without making legacy debug input mandatory."""
+    if path is None or not path.is_file():
+        return {}
+    rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        frame = row.get("frame_index", row.get("frame_start"))
+        if type(frame) is int:
+            rows[frame].append(row)
+    return dict(rows)
 
 
 def color_for_track(raw_track_id: int) -> tuple[int, int, int]:
@@ -214,6 +230,60 @@ def render_possession_overlay(
     return rendered
 
 
+def render_v3_overlay(frame: np.ndarray, observation: Mapping[str, Any] | None = None,
+                      transition: Mapping[str, Any] | None = None,
+                      events: Iterable[Mapping[str, Any]] = ()) -> np.ndarray:
+    """Render V3 diagnostics as labels; transition windows remain window facts."""
+    rendered = frame.copy()
+    labels: list[str] = []
+    if observation:
+        state = str(observation.get("state", "NO_POSSESSION"))
+        state = state if state in V3_STATES else "NO_POSSESSION"
+        holder = observation.get("stable_player_id") or observation.get("raw_track_id") or "NONE"
+        labels.append(f"HOLDER: {holder} STATE: {state}")
+        if observation.get("score") is not None or observation.get("score_margin") is not None:
+            labels.append(f"SCORE: {observation.get('score', 'NA')} MARGIN: {observation.get('score_margin', 'NA')}")
+        candidates = observation.get("candidates") or []
+        if candidates:
+            labels.append("CANDIDATES: " + ",".join(str(c.get("score", "NA")) for c in candidates))
+            contributions = [c.get("contributions", {}) for c in candidates if c.get("contributions")]
+            rejected = [reason for c in candidates for reason in c.get("rejected_reasons", [])]
+            if contributions:
+                labels.append("CONTRIBUTIONS: " + str(contributions))
+            if rejected:
+                labels.append("REJECTED: " + ",".join(map(str, rejected)))
+        if observation.get("profile") or observation.get("thresholds"):
+            labels.append(f"THRESHOLDS: {observation.get('profile', 'NA')} {observation.get('thresholds', {})}")
+        provenance = observation.get("provenance", {})
+        if provenance.get("frame_indices"):
+            labels.append(f"PROVENANCE: {provenance['frame_indices']}")
+        if provenance.get("reason_codes"):
+            labels.append("REASONS: " + ",".join(map(str, provenance["reason_codes"])))
+    if transition:
+        primitives = "/".join(str(value).replace("BALL_", "") for value in transition.get("primitive_types", []))
+        labels.append(f"TRANSITION: {transition.get('source_holder') or 'NONE'} -> {transition.get('destination_holder') or 'NONE'} {primitives}")
+        labels.append(f"TRANSITION SCORE: {transition.get('score', 'NA')} MARGIN: {transition.get('score_margin', 'NA')}")
+        if transition.get("frame_start") is not None or transition.get("frame_end") is not None:
+            labels.append(f"WINDOW: {transition.get('frame_start', 'NA')}-{transition.get('frame_end', 'NA')} "
+                          f"{transition.get('timestamp_start', 'NA')}-{transition.get('timestamp_end', 'NA')}")
+        sources = transition.get("provenance", {}).get("source_records", [])
+        if sources:
+            labels.append("SOURCE: " + ",".join(map(str, sources)))
+    for event in events:
+        labels.append(f"EVENT: {event.get('event_type', 'UNKNOWN')}")
+        if event.get("frame_start") is not None or event.get("frame_end") is not None:
+            labels.append(f"EVENT WINDOW: {event.get('frame_start', 'NA')}-{event.get('frame_end', 'NA')}")
+        provenance = event.get("provenance", {})
+        if provenance.get("source_records") or provenance.get("frame_indices"):
+            labels.append("EVENT PROVENANCE: " + ",".join(map(str, provenance.get("source_records", ()))))
+        if event.get("reason_codes"):
+            labels.append("EVENT REASONS: " + ",".join(map(str, event["reason_codes"])))
+    for offset, label in enumerate(labels):
+        cv2.putText(rendered, label, (6, min(rendered.shape[0] - 4, 20 + offset * 16)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    return rendered
+
+
 def render_frame(
     frame: np.ndarray,
     rows: Iterable[dict[str, Any]],
@@ -221,6 +291,9 @@ def render_frame(
     *,
     possession_event: Mapping[str, Any] | None = None,
     possession_rows: Iterable[dict[str, Any]] = (),
+    v3_observation: Mapping[str, Any] | None = None,
+    v3_transition: Mapping[str, Any] | None = None,
+    v3_events: Iterable[Mapping[str, Any]] = (),
 ) -> np.ndarray:
     """Draw masks and provenance labels without running identity logic."""
     rendered = frame.copy()
@@ -272,8 +345,11 @@ def render_frame(
                 2,
                 cv2.LINE_AA,
             )
+    v3_events = list(v3_events)
     if possession_event is not None:
         rendered = render_possession_overlay(rendered, possession_event, possession_rows)
+    if v3_observation is not None or v3_transition is not None or v3_events:
+        rendered = render_v3_overlay(rendered, v3_observation, v3_transition, v3_events)
     return rendered
 
 
@@ -288,6 +364,7 @@ def render_debug_video(
     allow_incomplete: bool = False,
     possession_jsonl: Path | None = None,
     stats_tracks_jsonl: Path | None = None,
+    v3_dir: Path | None = None,
 ) -> dict[str, int | None]:
     """Render the selected inclusive source-frame range to an MP4."""
     if start_frame is not None and start_frame < 0:
@@ -307,6 +384,9 @@ def render_debug_video(
     observations = load_observations(tracks_jsonl)
     possession_events = load_possession_events(possession_jsonl) if possession_jsonl else {}
     stats_observations = load_observations(stats_tracks_jsonl) if stats_tracks_jsonl else {}
+    v3_observations = load_v3_jsonl(v3_dir / "possession_v3.jsonl") if v3_dir else {}
+    v3_transitions = load_v3_jsonl(v3_dir / "ball_transitions_v3.jsonl") if v3_dir else {}
+    v3_events = load_v3_jsonl(v3_dir / "possession_events_v3.jsonl") if v3_dir else {}
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -339,6 +419,9 @@ def render_debug_video(
                 masks_dir,
                 possession_event=possession_events.get(frame_index),
                 possession_rows=stats_observations.get(frame_index, ()),
+                v3_observation=(v3_observations.get(frame_index) or [None])[0],
+                v3_transition=(v3_transitions.get(frame_index) or [None])[0],
+                v3_events=v3_events.get(frame_index, ()),
             ))
             first_written = frame_index if first_written is None else first_written
             last_written = frame_index
@@ -359,6 +442,7 @@ def main() -> None:
     parser.add_argument("--stats-dir", type=Path, help="V2 bundle stats/ directory containing possession and tracks JSONL")
     parser.add_argument("--possession-jsonl", type=Path)
     parser.add_argument("--stats-tracks-jsonl", type=Path)
+    parser.add_argument("--v3-dir", type=Path, help="Optional directory containing versioned V3 artifacts")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--start-frame", type=int)
     parser.add_argument("--end-frame", type=int)
@@ -395,6 +479,7 @@ def main() -> None:
         allow_incomplete=args.allow_incomplete,
         possession_jsonl=possession_jsonl,
         stats_tracks_jsonl=stats_tracks_jsonl,
+        v3_dir=args.v3_dir,
     )
     print(f"Wrote {stats['frames_written']} frames to {args.output}")
 

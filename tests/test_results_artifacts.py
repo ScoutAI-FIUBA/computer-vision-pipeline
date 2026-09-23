@@ -10,7 +10,13 @@ import cv2
 import numpy as np
 import pytest
 
-from pipeline.results import PipelineResults, RunSummary, package_artifacts
+from pipeline.results import PipelineResults, RunSummary, package_artifacts, write_v3_artifacts
+from pipeline.possession_v3 import (
+    BallTransition, EventType, PossessionEvent, PossessionObservation,
+    PossessionState, EvidenceKind, Provenance,
+)
+from pipeline.config import PipelineConfig
+from pipeline.runner import _write_v3_artifacts
 
 
 def _observations() -> list[dict]:
@@ -178,3 +184,50 @@ def test_package_rejects_duplicate_observation_keys(tmp_path: Path):
 
     with pytest.raises(ValueError, match="duplicate observation_key"):
         package_artifacts(tmp_path, observations, {})
+
+
+def test_v3_artifacts_are_versioned_hashed_and_deterministic(tmp_path: Path):
+    observation = PossessionObservation(2, PossessionState.OBSERVED, EvidenceKind.OBSERVED,
+                                        stable_player_id="p1", raw_track_id=7, team_id=0,
+                                        score=.9, provenance=Provenance(["tracks#2"], [2], ["candidate"]))
+    transition = BallTransition("t1", "p1", "p2", ["BALL_RELEASE", "BALL_RECEPTION"],
+                                Provenance(["ball#2"], [2], ["release"]), frame_start=2,
+                                frame_end=4, source_team_id=0, destination_team_id=0)
+    event = PossessionEvent(EventType.TRANSFER, 4, transition.provenance, transition_id="t1",
+                            source_holder="p1", destination_holder="p2", source_team_id=0,
+                            destination_team_id=0, reason_codes=["same_team_possession_transfer"])
+    first = write_v3_artifacts(tmp_path, [observation], [{"primitive_type": "BALL_RELEASE", "frame_index": 2, "timestamp_seconds": 1.0}], [transition], [event], {"profile": "default"})
+    second = write_v3_artifacts(tmp_path / "repeat", [observation], [{"primitive_type": "BALL_RELEASE", "frame_index": 2, "timestamp_seconds": 1.0}], [transition], [event], {"profile": "default"})
+    assert first["schema_version"] == 1
+    assert first["artifacts"]["possession"]["path"] == "possession_v3.jsonl"
+    assert first["artifacts"]["possession"]["sha256"] == second["artifacts"]["possession"]["sha256"]
+    assert first["artifacts"]["manifest"]["sha256"] == second["artifacts"]["manifest"]["sha256"]
+    assert json.loads((tmp_path / "possession_events_v3.jsonl").read_text())["event_type"] == "possession_transfer"
+    possession = json.loads((tmp_path / "possession_v3.jsonl").read_text())
+    primitive = json.loads((tmp_path / "possession_primitives_v3.jsonl").read_text())
+    transition_row = json.loads((tmp_path / "ball_transitions_v3.jsonl").read_text())
+    event_row = json.loads((tmp_path / "possession_events_v3.jsonl").read_text())
+    for row in (possession, primitive, transition_row, event_row):
+        assert {"frame_start", "frame_end", "timestamp_start", "timestamp_end"} <= row.keys()
+    assert (possession["frame_start"], possession["frame_end"]) == (2, 2)
+    assert (primitive["timestamp_start"], primitive["timestamp_end"]) == (1.0, 1.0)
+    assert (transition_row["frame_start"], transition_row["frame_end"]) == (2, 4)
+    assert (event_row["frame_start"], event_row["frame_end"]) == (4, 4)
+
+
+def test_v3_results_pointers_are_additive_only_when_set():
+    payload = PipelineResults(5, {}, {}, RunSummary(), "cpu", possession_v3_file="possession_v3.jsonl",
+                              possession_v3_schema_version=1, possession_v3_manifest_file="possession_v3_manifest.json",
+                              possession_v3_events_file="possession_events_v3.jsonl").to_dict()
+    assert payload["possession_v3_manifest_file"] == "possession_v3_manifest.json"
+    assert payload["possession_v3_events_file"] == "possession_events_v3.jsonl"
+
+
+def test_v3_writer_is_feature_flag_isolated(tmp_path: Path):
+    base = PipelineConfig(roboflow_api_key="test-key")
+    assert _write_v3_artifacts(tmp_path / "legacy", [], [], fps=30, config=base) == {}
+    assert not (tmp_path / "legacy" / "possession_v3.jsonl").exists()
+    enabled = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3")
+    manifest = _write_v3_artifacts(tmp_path / "v3", [], [], fps=30, config=enabled)
+    assert manifest["schema"] == "possession-engine-v3"
+    assert (tmp_path / "v3" / "ball_transitions_v3.jsonl").exists()
