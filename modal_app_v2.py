@@ -472,9 +472,10 @@ class PipelineV2:
                     json.dumps(artifact_manifest, indent=2, sort_keys=True), encoding="utf-8"
                 )
             except Exception as error:
-                print(f"[v2] error={type(error).__name__}: {error}")
+                print(f"[v2] error={type(error).__name__}: {error}", flush=True)
                 raise
             print("[v2] progress=100")
+            print("[v2] overall V2 complete", flush=True)
             payload = {"acceptance": result.acceptance}
             if return_diagnostics:
                 payload["debug_diagnostics"] = result.runtime_diagnostics

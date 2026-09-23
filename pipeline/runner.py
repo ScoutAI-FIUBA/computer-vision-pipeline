@@ -284,6 +284,7 @@ def _collect_tracknet_rows(
     tracker=None,
     player_step: int,
     output_path: Path,
+    on_progress: Callable[[int, int | None], None] | None = None,
 ) -> None:
     """Run TrackNet plus bounded ball-only SAM2 fallback on a dense stream."""
     from scripts.ball.candidates import extract_candidates
@@ -302,6 +303,8 @@ def _collect_tracknet_rows(
     next_track_id = 1
     fallback_remaining = 0
     records = 0
+    if on_progress is not None:
+        on_progress(0, info.frame_count if info.frame_count > 0 else None)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as output:
         for segment in iter_segments(
@@ -360,6 +363,8 @@ def _collect_tracknet_rows(
                 )
                 output.write(json.dumps(record) + "\n")
                 records += 1
+                if on_progress is not None:
+                    on_progress(records, info.frame_count if info.frame_count > 0 else None)
 
                 # The temporal window is causal; discard frames older than it.
                 previous_frame = frame
@@ -566,13 +571,24 @@ def _render_annotated_video(
         raise RuntimeError(
             f"tracks.jsonl has extra frame rows starting at frame {pending[0]}"
         )
-def _write_shot_events(video_path: Path, output_path: Path, *, info, step: int, config: PipelineConfig) -> None:
+def _write_shot_events(
+    video_path: Path,
+    output_path: Path,
+    *,
+    info,
+    step: int,
+    config: PipelineConfig,
+    on_progress: Callable[[int, int | None], None] | None = None,
+) -> None:
     detector = _build_detector_for_model(config, model_id=config.shot_model_id)
     active_shot_event = None
     next_shot_event_id = 1
     last_emitted_frame_index = 0
     signals_path = output_path.with_name(SHOT_SIGNALS_FILENAME)
     raw_predictions_path = output_path.with_name(SHOT_RAW_PREDICTIONS_FILENAME)
+    processed = 0
+    if on_progress is not None:
+        on_progress(0, info.frame_count if info.frame_count > 0 else None)
 
     with output_path.open("w", encoding="utf-8") as shot_events_file, signals_path.open(
         "w", encoding="utf-8"
@@ -616,6 +632,9 @@ def _write_shot_events(video_path: Path, output_path: Path, *, info, step: int, 
             if resolved_shot_event is not None:
                 write_shot_event_record(shot_events_file, resolved_shot_event)
             last_emitted_frame_index = frame_index
+            processed += 1
+            if on_progress is not None:
+                on_progress(processed, info.frame_count if info.frame_count > 0 else None)
 
         final_shot_event = flush_open_shot_event(
             active_shot_event,
@@ -665,24 +684,71 @@ def _normalize_v2_stats_rows(observations) -> list[dict]:
     return sorted(rows, key=lambda row: (row["frame_index"], row["track_id"]))
 
 
+class _BoundedProgress:
+    """Turn frame counts into sparse progress messages without division hazards."""
+
+    def __init__(self, emit: Callable[[str], None], label: str) -> None:
+        self.emit = emit
+        self.label = label
+        self.next_percent = 0
+        self.processed = 0
+
+    def __call__(self, processed: int, total: int | None) -> None:
+        self.processed = processed
+        if total is None or total <= 0:
+            if processed == 0 or processed == total:
+                self.emit(f"{self.label} progress: {processed} frames")
+            return
+        percent = min(100, int(processed * 100 / total))
+        while percent >= self.next_percent and self.next_percent <= 100:
+            self.emit(f"{self.label} progress: {processed}/{total} frames ({self.next_percent}%)")
+            self.next_percent += 25
+
+    def complete(self, total: int | None) -> None:
+        if total is None or total <= 0:
+            self.emit(f"{self.label} progress: phase complete (100%; processed {self.processed} frames)")
+        elif self.processed == total:
+            self.emit(f"{self.label} progress: phase complete (100%; processed {self.processed}/{total} frames)")
+        else:
+            self.emit(
+                f"{self.label} progress: phase complete (100%; processed {self.processed} frames; "
+                f"source progress {self.processed}/{total})"
+            )
+
+
 def run_stats_from_v2_observations(
     video_path: Path,
     config: PipelineConfig,
     output_dir: Path,
     observations,
+    *,
+    on_progress: Callable[[str], None] | None = None,
 ) -> PipelineResults:
     """Run stats stages from authoritative V2 player rows without player tracking."""
+    emit = on_progress or (lambda message: print(f"[v2-stats] {message}", flush=True))
+
+    def phase(name: str, operation):
+        try:
+            return operation()
+        except Exception as error:
+            emit(f"{name} failed: {type(error).__name__}: {error}")
+            raise
+
     video_path = Path(video_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    info = probe(video_path)
-    rows = _normalize_v2_stats_rows(observations)
+    emit("stats start")
+    info = phase("probe", lambda: probe(video_path))
+    rows = phase("normalize observations", lambda: _normalize_v2_stats_rows(observations))
     frame_indices = sorted({row["frame_index"] for row in rows})
     tracks_path = output_dir / TRACKS_FILENAME
-    with tracks_path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            record = {key: value for key, value in row.items() if value is not None}
-            handle.write(json.dumps(record) + "\n")
+    def write_tracks():
+        with tracks_path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                record = {key: value for key, value in row.items() if value is not None}
+                handle.write(json.dumps(record) + "\n")
+
+    phase("TrackNet/player artifact writing", write_tracks)
 
     team_by_track_id: dict[int, int] = {}
     team_values: dict[int, set[int]] = {}
@@ -692,38 +758,63 @@ def run_stats_from_v2_observations(
     team_by_track_id = {
         track_id: next(iter(values)) for track_id, values in team_values.items() if len(values) == 1
     }
-    (output_dir / TEAMS_FILENAME).write_text(
+    phase("team artifact writing", lambda: (output_dir / TEAMS_FILENAME).write_text(
         json.dumps({
             "assignments_by_track_id": {str(key): value for key, value in team_by_track_id.items()},
             "unassigned_track_ids": sorted({row["track_id"] for row in rows} - set(team_by_track_id)),
             "source": "sam31_v2_observations",
         }, indent=2), encoding="utf-8"
-    )
+    ))
 
     ball_path = output_dir / BALL_TRACKS_FILENAME
     if config.tracknet_enabled:
         if not config.tracknet_checkpoint:
-            raise RuntimeError("TrackNet is enabled but TRACKNET_CHECKPOINT is not configured")
-        _collect_tracknet_rows(
-            video_path, info=info, config=config,
-            detector=build_tracknet_detector(config.tracknet_checkpoint),
-            tracker=None, player_step=1, output_path=ball_path,
-        )
-        ball_rows = [row for row in load_ball_track_rows(ball_path) if row["frame_index"] in frame_indices]
-        ball_path.write_text("".join(json.dumps(row) + "\n" for row in ball_rows), encoding="utf-8")
+            error = RuntimeError("TrackNet is enabled but TRACKNET_CHECKPOINT is not configured")
+            emit(f"TrackNet failed: {type(error).__name__}: {error}")
+            raise error
+        emit("TrackNet start")
+        tracknet_progress = _BoundedProgress(emit, "TrackNet")
+
+        def collect_tracknet():
+            _collect_tracknet_rows(
+                video_path, info=info, config=config,
+                detector=build_tracknet_detector(config.tracknet_checkpoint),
+                tracker=None, player_step=1, output_path=ball_path,
+                on_progress=tracknet_progress,
+            )
+
+        phase("TrackNet", collect_tracknet)
+        tracknet_progress.complete(info.frame_count if info.frame_count > 0 else None)
+        ball_rows = phase("TrackNet artifact filtering", lambda: [
+            row for row in load_ball_track_rows(ball_path) if row["frame_index"] in frame_indices
+        ])
+        phase("TrackNet artifact writing", lambda: ball_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in ball_rows), encoding="utf-8"
+        ))
     else:
         # No ball model is silently substituted: exact V2 frames remain explicit lost evidence.
         ball_rows = [ball_track_record(frame, {"track_state": "lost", "class_name": "ball"},
                                        timestamp_seconds=_frame_timestamp_seconds(frame, info.fps))
                      for frame in frame_indices]
-        ball_path.write_text("".join(json.dumps(row) + "\n" for row in ball_rows), encoding="utf-8")
+        phase("ball artifact writing", lambda: ball_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in ball_rows), encoding="utf-8"
+        ))
 
-    _write_shot_events(video_path, output_dir / SHOT_EVENTS_FILENAME, info=info, step=1, config=config)
-    _attach_ball_evidence(output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id)
-    possession_path = _write_possession_events(
+    emit("shot evidence start")
+    shot_progress = _BoundedProgress(emit, "shot detection")
+    phase("shot detection", lambda: _write_shot_events(
+        video_path, output_dir / SHOT_EVENTS_FILENAME, info=info, step=1, config=config,
+        on_progress=shot_progress,
+    ))
+    shot_progress.complete(info.frame_count if info.frame_count > 0 else None)
+    phase("shot evidence", lambda: _attach_ball_evidence(
+        output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id
+    ))
+    emit("possession start")
+    possession_path = phase("possession", lambda: _write_possession_events(
         output_dir, rows, ball_rows, fps=info.fps, frame_step=1,
         team_ids_by_track_id=team_by_track_id,
-    )
+    ))
     (output_dir / NUMBERS_FILENAME).unlink(missing_ok=True)
     results = PipelineResults(
         schema_version=RESULTS_SCHEMA_VERSION,
@@ -737,7 +828,9 @@ def run_stats_from_v2_observations(
         possession_events_file=POSSESSION_EVENTS_FILENAME,
         artifact_references={"possession_events": {"file": possession_path.name, "schema_version": 1}},
     )
-    results.write(output_dir / RESULTS_FILENAME)
+    emit("artifact writing start")
+    phase("artifact writing", lambda: results.write(output_dir / RESULTS_FILENAME))
+    emit("stats complete")
     return results
 
 

@@ -1326,6 +1326,27 @@ def test_process_size_limit_fails_before_returning_partial_artifacts(monkeypatch
         )
 
 
+def test_process_flushes_top_level_failure_log(monkeypatch, capsys):
+    import modal_app_v2
+
+    monkeypatch.setattr(
+        modal_app_v2,
+        "_track_video",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("propagation failed")),
+    )
+    cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    with pytest.raises(RuntimeError, match="propagation failed"):
+        process(cls(), video_bytes=b"fake-video", frame_start=0, frame_end=0)
+
+    assert "[v2] error=RuntimeError: propagation failed" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("ids", "boxes", "message"),
     [([1, 2], [[0, 0, 1, 1]], "object ids and boxes"), ([1], [[0, 0, 1, 1]], "probabilities")],

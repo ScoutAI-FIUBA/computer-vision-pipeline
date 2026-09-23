@@ -6,10 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from pipeline.config import PipelineConfig
-from pipeline.runner import run_stats_from_v2_observations
+from pipeline.runner import _BoundedProgress, run_stats_from_v2_observations
 
 
-def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, monkeypatch):
+def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, monkeypatch, capsys):
     import pipeline.runner as runner
 
     video = tmp_path / "input.mp4"
@@ -55,9 +55,15 @@ def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, m
     assert (tmp_path / "stats" / "ball_tracks.jsonl").exists()
     assert (tmp_path / "stats" / "shot_evidence.jsonl").exists()
     assert (tmp_path / "stats" / "possession_events.jsonl").exists()
+    output = capsys.readouterr().out
+    assert "[v2-stats] stats start" in output
+    assert "[v2-stats] shot evidence start" in output
+    assert "[v2-stats] possession start" in output
+    assert "[v2-stats] artifact writing start" in output
+    assert "[v2-stats] stats complete" in output
 
 
-def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch):
+def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch, capsys):
     import pipeline.runner as runner
 
     video = tmp_path / "input.mp4"
@@ -74,7 +80,8 @@ def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch):
         builder_calls.append(checkpoint)
         return object()
 
-    def collect(_video, *, output_path, **_kwargs):
+    def collect(_video, *, output_path, on_progress, **_kwargs):
+        on_progress(0, 3)
         output_path.write_text("".join(json.dumps({
             "frame_index": frame,
             "timestamp_seconds": frame / 4,
@@ -85,6 +92,7 @@ def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch):
             "xyxy": [10.0, 10.0, 20.0, 20.0],
             "center_xy": [15.0, 15.0],
         }) + "\n" for frame in range(3)))
+        on_progress(3, 3)
 
     monkeypatch.setattr(runner, "build_tracknet_detector", build)
     monkeypatch.setattr(runner, "_collect_tracknet_rows", collect)
@@ -123,6 +131,11 @@ def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch):
     assert possession[-1]["status"] == "confirmed"
     assert possession[-1]["stable_player_id"] == "player-7"
     assert possession[-1]["team_id"] == 1
+    output = capsys.readouterr().out
+    assert "[v2-stats] TrackNet start" in output
+    assert "[v2-stats] TrackNet progress: 0/3 frames (0%)" in output
+    assert "[v2-stats] TrackNet progress: 3/3 frames (100%)" in output
+    assert "[v2-stats] stats complete" in output
 
 
 def test_v2_stats_adapter_requires_checkpoint_when_tracknet_enabled(tmp_path, monkeypatch):
@@ -143,3 +156,44 @@ def test_v2_stats_adapter_requires_checkpoint_when_tracknet_enabled(tmp_path, mo
             tmp_path / "stats",
             [{"frame_index": 0, "raw_track_id": 7, "bbox_xyxy": [1, 1, 30, 40], "track_state": "tracked"}],
         )
+
+
+def test_v2_stats_adapter_reports_failing_phase(tmp_path, monkeypatch, capsys):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner,
+        "probe",
+        lambda _path: SimpleNamespace(
+            fps=30.0, frame_count=1, width=100, height=100, duration_seconds=1 / 30
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_write_shot_events",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("shot model unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="shot model unavailable"):
+        run_stats_from_v2_observations(
+            video,
+            PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none"),
+            tmp_path / "stats",
+            [{"frame_index": 0, "raw_track_id": 7, "bbox_xyxy": [1, 1, 30, 40]}],
+        )
+
+    assert "[v2-stats] shot detection failed: RuntimeError: shot model unavailable" in capsys.readouterr().out
+
+
+def test_bounded_progress_marks_capped_phase_complete_without_fake_source_percent(capsys):
+    progress = _BoundedProgress(lambda message: print(message), "TrackNet")
+
+    progress(0, 10)
+    progress(3, 10)
+    progress.complete(10)
+
+    output = capsys.readouterr().out
+    assert "TrackNet progress: phase complete (100%; processed 3 frames; source progress 3/10)" in output
+    assert "3/10 frames (100%)" not in output
