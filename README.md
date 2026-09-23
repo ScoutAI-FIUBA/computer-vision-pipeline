@@ -1,6 +1,6 @@
 # computer-vision-pipeline
 
-GPU-first basketball pipeline for Roboflow player detection, SAM2 tracking, end-of-run team identification, and conservative jersey-number confirmation.
+GPU-first basketball pipeline for SAM3.1 player observations, independent ball evidence, team identification, and conservative shot/possession attribution.
 
 ## Current pipeline
 
@@ -18,9 +18,9 @@ High-level flow:
 
 ## SAM3.1 V2 boundary
 
-`modal_app_v2.py` keeps its SAM3.1 observation artifact at the root of the returned bundle (`tracks.jsonl` and `manifest.json`). It then delegates the same input video to `pipeline.runner.run_pipeline` in `stats/`, so the returned statistics artifacts are produced by the existing orchestration rather than translated from V2 rows.
+`modal_app_v2.py` keeps its SAM3.1 observation artifact at the root of the returned bundle (`tracks.jsonl` and `manifest.json`). Its stats adapter consumes those same observations in `stats/`; it does not load SAM2, run a second player tracker, or call Roboflow to recreate V2 players.
 
-`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/numbers.json`, `stats/shot_events.jsonl`, and `stats/possession_events.jsonl` therefore use the legacy contract and are referenced in the V2 manifest with relative paths, sizes, and hashes. This performs a second, independent stats run; it does not claim that SAM3.1 rows are already legacy stats rows. The stats pass uses its own `PipelineConfig`/environment scope rather than V2's `frame_start`/`frame_end`, so configure its frame limits explicitly when cost matters. The V2 image consequently also requires the legacy SAM2/Roboflow runtime and `ROBOFLOW_API_KEY`.
+`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/shot_events.jsonl`, `stats/shot_evidence.jsonl`, `stats/possession_events.jsonl`, and `stats/ball_tracks.jsonl` use the legacy contracts and are referenced in the V2 manifest with relative paths, sizes, and hashes. The V2 adapter does not produce `numbers.json` because V2 observations contain no jersey-number evidence, so `numbers_file` remains nullable. The adapter carries through V2 raw/stable IDs, boxes, team IDs, confidence, state, and frame indices. Ball tracking remains an independent pass: the V2 Modal image enables TrackNet by default from the mounted `tracknet-data` Volume at `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`; local callers can enable it with `TRACKNET_ENABLED=1` and `TRACKNET_CHECKPOINT`. If TrackNet is disabled, exact V2 frames receive lost ball evidence rather than fabricated data. Shot detection keeps its own model pass, then shot evidence and possession join to the supplied V2 player rows.
 
 Render possession from a saved V2 bundle with the root SAM3.1 video overlay and the legacy stats events/tracks:
 

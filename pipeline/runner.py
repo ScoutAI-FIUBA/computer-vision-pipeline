@@ -281,7 +281,7 @@ def _collect_tracknet_rows(
     info,
     config: PipelineConfig,
     detector,
-    tracker,
+    tracker=None,
     player_step: int,
     output_path: Path,
 ) -> None:
@@ -337,7 +337,7 @@ def _collect_tracknet_rows(
                     rows, next_track_id = reconcile_ball_track_id(rows, active_rows, next_track_id)
                     active_rows = rows
                     fallback_remaining = config.tracknet_fallback_budget
-                elif active_rows and previous_frame is not None and fallback_remaining > 0:
+                elif tracker is not None and active_rows and previous_frame is not None and fallback_remaining > 0:
                     fallback_seed = {**active_rows[0], "track_state": "fallback"}
                     propagated = tracker.propagate_segment([previous_frame, frame], [fallback_seed])
                     rows = filter_ball_rows(propagated.get(1, []))
@@ -642,6 +642,103 @@ def _attach_ball_evidence(
         team_ids_by_track_id=team_ids_by_track_id,
     )
     evidence_path.write_text("".join(json.dumps(event) + "\n" for event in enriched), encoding="utf-8")
+
+
+def _normalize_v2_stats_rows(observations) -> list[dict]:
+    rows = []
+    for observation in observations:
+        row = dict(observation)
+        track_id = row.get("raw_track_id", row.get("track_id"))
+        bbox = row.get("bbox_xyxy", row.get("xyxy"))
+        if track_id is None or bbox is None:
+            continue
+        rows.append({
+            "frame_index": int(row["frame_index"]),
+            "track_id": int(track_id),
+            "stable_player_id": row.get("stable_player_id"),
+            "team_id": row.get("team_id"),
+            "track_state": row.get("track_state", "unknown"),
+            "class_name": "player",
+            "confidence": row.get("confidence"),
+            "xyxy": [float(value) for value in bbox],
+        })
+    return sorted(rows, key=lambda row: (row["frame_index"], row["track_id"]))
+
+
+def run_stats_from_v2_observations(
+    video_path: Path,
+    config: PipelineConfig,
+    output_dir: Path,
+    observations,
+) -> PipelineResults:
+    """Run stats stages from authoritative V2 player rows without player tracking."""
+    video_path = Path(video_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    info = probe(video_path)
+    rows = _normalize_v2_stats_rows(observations)
+    frame_indices = sorted({row["frame_index"] for row in rows})
+    tracks_path = output_dir / TRACKS_FILENAME
+    with tracks_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            record = {key: value for key, value in row.items() if value is not None}
+            handle.write(json.dumps(record) + "\n")
+
+    team_by_track_id: dict[int, int] = {}
+    team_values: dict[int, set[int]] = {}
+    for row in rows:
+        if row.get("team_id") is not None:
+            team_values.setdefault(row["track_id"], set()).add(int(row["team_id"]))
+    team_by_track_id = {
+        track_id: next(iter(values)) for track_id, values in team_values.items() if len(values) == 1
+    }
+    (output_dir / TEAMS_FILENAME).write_text(
+        json.dumps({
+            "assignments_by_track_id": {str(key): value for key, value in team_by_track_id.items()},
+            "unassigned_track_ids": sorted({row["track_id"] for row in rows} - set(team_by_track_id)),
+            "source": "sam31_v2_observations",
+        }, indent=2), encoding="utf-8"
+    )
+
+    ball_path = output_dir / BALL_TRACKS_FILENAME
+    if config.tracknet_enabled:
+        if not config.tracknet_checkpoint:
+            raise RuntimeError("TrackNet is enabled but TRACKNET_CHECKPOINT is not configured")
+        _collect_tracknet_rows(
+            video_path, info=info, config=config,
+            detector=build_tracknet_detector(config.tracknet_checkpoint),
+            tracker=None, player_step=1, output_path=ball_path,
+        )
+        ball_rows = [row for row in load_ball_track_rows(ball_path) if row["frame_index"] in frame_indices]
+        ball_path.write_text("".join(json.dumps(row) + "\n" for row in ball_rows), encoding="utf-8")
+    else:
+        # No ball model is silently substituted: exact V2 frames remain explicit lost evidence.
+        ball_rows = [ball_track_record(frame, {"track_state": "lost", "class_name": "ball"},
+                                       timestamp_seconds=_frame_timestamp_seconds(frame, info.fps))
+                     for frame in frame_indices]
+        ball_path.write_text("".join(json.dumps(row) + "\n" for row in ball_rows), encoding="utf-8")
+
+    _write_shot_events(video_path, output_dir / SHOT_EVENTS_FILENAME, info=info, step=1, config=config)
+    _attach_ball_evidence(output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id)
+    possession_path = _write_possession_events(
+        output_dir, rows, ball_rows, fps=info.fps, frame_step=1,
+        team_ids_by_track_id=team_by_track_id,
+    )
+    (output_dir / NUMBERS_FILENAME).unlink(missing_ok=True)
+    results = PipelineResults(
+        schema_version=RESULTS_SCHEMA_VERSION,
+        video={"filename": video_path.name, "fps": info.fps, "frame_count": info.frame_count,
+               "width": info.width, "height": info.height, "duration_seconds": info.duration_seconds},
+        config={"source": "sam31_v2_observations", "tracknet_enabled": config.tracknet_enabled},
+        summary=RunSummary(frames_processed=len(frame_indices), track_records=len(rows),
+                           distinct_track_ids=len({row["track_id"] for row in rows})),
+        device="cpu", teams_file=TEAMS_FILENAME, shot_events_file=SHOT_EVENTS_FILENAME,
+        shot_evidence_file=SHOT_EVIDENCE_FILENAME, ball_tracks_file=BALL_TRACKS_FILENAME,
+        possession_events_file=POSSESSION_EVENTS_FILENAME,
+        artifact_references={"possession_events": {"file": possession_path.name, "schema_version": 1}},
+    )
+    results.write(output_dir / RESULTS_FILENAME)
+    return results
 
 
 def run_pipeline(

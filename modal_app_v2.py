@@ -21,12 +21,12 @@ from pipeline.results import (
     _mask_filename,
     package_artifacts,
 )
+from pipeline.runner import run_stats_from_v2_observations
 from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
 
 SAM31_REPOSITORY = "git+https://github.com/facebookresearch/sam3.git"
 SAM31_COMMIT = "2345a4a"
-SAM2_COMMIT = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
 SAM31_SMOKE_MODULES = (
     "pycocotools.mask",
     "PIL",
@@ -37,9 +37,17 @@ SAM31_SMOKE_MODULES = (
     "sam3.model_builder",
 )
 CACHE_DIR = "/cache"
+TRACKNET_VOLUME_DIR = "/tracknet-data"
+TRACKNET_CHECKPOINT = (
+    f"{TRACKNET_VOLUME_DIR}/tracknet-finetune/runs/"
+    "basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt"
+)
 
 app = modal.App("scoutai-pipeline-v2")
 model_cache = modal.Volume.from_name("scoutai-model-cache", create_if_missing=True)
+tracknet_data = modal.Volume.from_name(
+    "tracknet-data", environment_name="main", create_if_missing=False
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -65,9 +73,14 @@ image = (
         "supervision==0.29.1",
         "python-dotenv==1.2.2",
     )
-    .pip_install(f"git+https://github.com/facebookresearch/sam2.git@{SAM2_COMMIT}")
     .pip_install(f"{SAM31_REPOSITORY}@{SAM31_COMMIT}")
-    .env({"HF_HOME": f"{CACHE_DIR}/huggingface", "HF_HUB_CACHE": f"{CACHE_DIR}/huggingface/hub"})
+    .env({
+        "HF_HOME": f"{CACHE_DIR}/huggingface",
+        "HF_HUB_CACHE": f"{CACHE_DIR}/huggingface/hub",
+        "TRACKNET_ENABLED": "1",
+        "TRACKNET_CHECKPOINT": TRACKNET_CHECKPOINT,
+        "BALL_ALL_FRAMES": "1",
+    })
     .add_local_python_source("pipeline")
     .add_local_file("scripts/ball/tracknet.py", remote_path="/root/scripts/ball/tracknet.py")
     .add_local_file("scripts/ball/candidates.py", remote_path="/root/scripts/ball/candidates.py")
@@ -229,12 +242,13 @@ def _load_video_frames(path: Path, frame_start: int, frame_end: int) -> dict[int
         capture.release()
 
 
-def _run_legacy_stats(video_path: Path, output_dir: Path):
-    """Run the production stats orchestration in its own output namespace."""
+def _run_v2_stats(video_path: Path, output_dir: Path, observations):
+    """Run stats from SAM3.1 rows; never construct a legacy player tracker."""
     from pipeline.config import PipelineConfig
-    from pipeline.runner import run_pipeline
 
-    return run_pipeline(video_path, PipelineConfig.from_env(), output_dir)
+    return run_stats_from_v2_observations(
+        video_path, PipelineConfig.from_env(), output_dir, observations
+    )
 
 
 def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
@@ -342,7 +356,7 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
 @app.cls(
     image=image,
     gpu="A100-80GB",
-    volumes={CACHE_DIR: model_cache},
+    volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data},
     secrets=[hf_secret, roboflow_secret],
     timeout=1800,
 )
@@ -432,7 +446,7 @@ class PipelineV2:
                     acceptance=result.acceptance,
                     acceptance_reasons=result.acceptance_reasons,
                 )
-                stats_result = _run_legacy_stats(video_path, output_dir / "stats")
+                stats_result = _run_v2_stats(video_path, output_dir / "stats", result.observations)
                 stats_payload = stats_result.to_dict()
                 artifact_manifest["artifacts"]["legacy_stats"] = {
                     name: _artifact_ref(output_dir / "stats" / filename, f"stats/{filename}")
@@ -442,6 +456,7 @@ class PipelineV2:
                         "teams": stats_payload["teams_file"],
                         "numbers": stats_payload["numbers_file"],
                         "shot_events": stats_payload["shot_events_file"],
+                        "shot_evidence": stats_payload.get("shot_evidence_file"),
                         "possession_events": stats_payload.get("possession_events_file"),
                         "ball_tracks": stats_payload.get("ball_tracks_file"),
                         "projected_tracks": stats_payload.get("projected_tracks_file"),

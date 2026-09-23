@@ -44,6 +44,37 @@ The dense ball pass keeps only its 8-frame TrackNet window and previous fallback
 frame in memory. Dense misses use a separate two-frame, ball-only SAM2
 fallback; the player SAM2/output stream remains at its separate 15 FPS default.
 
+### V2 Modal stats
+
+`modal_app_v2.py` uses the existing `tracknet-data` Modal Volume, mounted at
+`/tracknet-data`, and enables TrackNet with this checkpoint path:
+
+```text
+/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt
+```
+
+The V2 stats path does not load SAM2 or rerun player tracking. The Volume must
+already contain that checkpoint; a missing file fails the job clearly.
+`BALL_ALL_FRAMES=1` keeps the dense TrackNet pass independent of the V2 player
+observation cadence. After a short run, inspect the returned
+`stats/results.json` and `stats/ball_tracks.jsonl`:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("outputs/v2-bundle/stats")
+results = json.loads((root / "results.json").read_text())
+rows = [json.loads(line) for line in (root / "ball_tracks.jsonl").read_text().splitlines() if line.strip()]
+print("tracknet_enabled:", results["config"]["tracknet_enabled"])
+print("non_lost_ball_rows:", sum(row["track_state"] != "lost" for row in rows))
+PY
+```
+
+The expected values are `tracknet_enabled: True` and at least one non-lost
+ball row for a clip where TrackNet detects the ball.
+
 How to get the pipeline running on Modal GPUs. Follow it in order — each step
 gets cheaper to debug if the previous one worked.
 

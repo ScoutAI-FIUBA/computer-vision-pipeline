@@ -11,12 +11,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def fake_legacy_stats(monkeypatch, request):
+def fake_v2_stats(monkeypatch, request):
     if request.node.name == "test_process_exercises_real_stats_adapter_and_manifest_contract":
         return
     import modal_app_v2
 
-    def run(_video_path, output_dir):
+    def run(_video_path, output_dir, _observations):
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "results.json").write_text("{}", encoding="utf-8")
         (output_dir / "tracks.jsonl").write_text("", encoding="utf-8")
@@ -29,7 +29,7 @@ def fake_legacy_stats(monkeypatch, request):
             }
         )
 
-    monkeypatch.setattr(modal_app_v2, "_run_legacy_stats", run)
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", run)
 
 
 def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
@@ -93,7 +93,7 @@ def test_v2_image_isolated_and_uses_only_modal_model_storage():
 
     assert "modal_app.py" not in source
     assert "facebookresearch/sam3" in source
-    assert "facebookresearch/sam2" in source
+    assert "facebookresearch/sam2" not in source
     assert "R2" not in source
     assert "r2_key" not in source
     assert "output_prefix" not in source
@@ -101,6 +101,16 @@ def test_v2_image_isolated_and_uses_only_modal_model_storage():
     assert '"HF_HOME":' in source
     assert "HF_TOKEN" in source
     assert source.count("modal.Image") == 1
+
+
+def test_v2_image_mounts_and_enables_tracknet_without_sam2():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+
+    assert '"TRACKNET_ENABLED": "1"' in source
+    assert '"TRACKNET_CHECKPOINT": TRACKNET_CHECKPOINT' in source
+    assert '"BALL_ALL_FRAMES": "1"' in source
+    assert '"tracknet-data", environment_name="main", create_if_missing=False' in source
+    assert 'volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data}' in source
 
 
 def test_v2_image_pins_sam31_runtime_dependencies():
@@ -1011,15 +1021,16 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
     assert manifest["artifacts"]["legacy_stats"]["results"]["key"] == "stats/results.json"
     assert manifest["artifacts"]["legacy_stats"]["tracks"]["key"] == "stats/tracks.jsonl"
     assert manifest["artifacts"]["legacy_stats"]["possession_events"]["key"] == "stats/possession_events.jsonl"
-    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
+    assert manifest["artifacts"]["legacy_stats"]["shot_evidence"]["key"] == "stats/shot_evidence.jsonl"
+    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/shot_events.jsonl", "stats/shot_evidence.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
     results = json.loads(artifacts["stats/results.json"])
     assert results["schema_version"] == 5
     assert results["tracks_file"] == "tracks.jsonl"
     assert results["teams_file"] == "teams.json"
-    assert results["numbers_file"] == "numbers.json"
+    assert results["numbers_file"] is None
     assert results["shot_events_file"] == "shot_events.jsonl"
     assert results["possession_events_file"] == "possession_events.jsonl"
-    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/numbers.json", "stats/shot_events.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
+    assert {"stats/results.json", "stats/tracks.jsonl", "stats/teams.json", "stats/shot_events.jsonl", "stats/possession_events.jsonl"} <= set(artifacts)
     for name, reference in manifest["artifacts"]["legacy_stats"].items():
         data = artifacts[reference["key"]]
         assert reference["size_bytes"] == len(data)
