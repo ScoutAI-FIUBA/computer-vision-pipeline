@@ -213,6 +213,28 @@ def test_scoring_fails_closed_for_non_finite_confidence(value):
     assert "non_finite_confidence" in result[0].rejected_reasons
 
 
+@pytest.mark.parametrize("confidence", [None, "missing"])
+def test_scoring_treats_missing_or_null_player_confidence_as_unavailable(confidence):
+    player = _player("a", (0, 0, 20, 20))
+    if confidence == "missing":
+        player.pop("confidence")
+    else:
+        player["confidence"] = None
+    result = score_candidates([player], {"center_xy": [10, 10], "xyxy": [9, 9, 11, 11]})
+    assert result[0].score > 0
+    assert result[0].contributions["player_confidence"] == 0
+    assert "non_finite_confidence" not in result[0].rejected_reasons
+
+
+def test_scoring_uses_tracknet_center_and_player_xyxy_shapes():
+    result = score_candidates(
+        [{"stable_player_id": "a", "raw_track_id": 7, "team_id": 1,
+          "xyxy": [0, 0, 20, 20], "confidence": None}],
+        {"center_xy": [10, 10], "xyxy": [9, 9, 11, 11]},
+    )
+    assert result[0].score > 0
+
+
 def test_scoring_wires_ambiguity_margin_into_candidate_reasons():
     result = score_candidates([_player("a", (0, 0, 20, 20)), _player("b", (0, 0, 20, 20))],
                                {"x": 10, "y": 10}, ambiguity_margin=1.0)

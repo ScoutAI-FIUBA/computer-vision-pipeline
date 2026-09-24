@@ -135,7 +135,7 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
     by_frame: dict[int, list[dict]] = {}
     for row in rows:
         item = dict(row)
-        item["box"] = item.get("bbox", item.get("xyxy"))
+        item["xyxy"] = item.get("xyxy", item.get("bbox", item.get("box")))
         by_frame.setdefault(int(item["frame_index"]), []).append(item)
     balls = {int(row["frame_index"]): row for row in ball_rows if isinstance(row, dict) and type(row.get("frame_index")) is int}
     resolver = PossessionResolver(real_fps=fps, grace_seconds=config.possession_v3_grace_seconds,

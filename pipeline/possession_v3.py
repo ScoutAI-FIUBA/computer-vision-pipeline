@@ -260,10 +260,19 @@ def engine_name(config: PipelineConfig) -> str:
 def _point(ball):
     if not isinstance(ball, dict):
         return None
-    center = ball.get("center", ball.get("ball_center"))
+    center = ball.get("center_xy", ball.get("center", ball.get("ball_center")))
+    if not isinstance(center, (list, tuple)) or len(center) < 2:
+        box = ball.get("xyxy")
+        center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) if (
+            isinstance(box, (list, tuple)) and len(box) == 4
+            and all(type(value) in {int, float} and math.isfinite(float(value)) for value in box)
+        ) else None
     x = ball.get("x", ball.get("center_x", center[0] if isinstance(center, (list, tuple)) and len(center) >= 2 else None))
     y = ball.get("y", ball.get("center_y", center[1] if isinstance(center, (list, tuple)) and len(center) >= 2 else None))
-    return (float(x), float(y)) if isinstance(x, (int, float)) and isinstance(y, (int, float)) else None
+    return (float(x), float(y)) if (
+        type(x) in {int, float} and type(y) in {int, float}
+        and math.isfinite(float(x)) and math.isfinite(float(y))
+    ) else None
 
 
 def _inside_box(point, box, margin=0.0):
@@ -291,7 +300,7 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
     for row in players or []:
         stable, raw = _identity_key(row if isinstance(row, dict) else {})
         team = row.get("team_id") if isinstance(row, dict) else None
-        box = row.get("bbox", row.get("box")) if isinstance(row, dict) else None
+        box = row.get("xyxy", row.get("bbox", row.get("box"))) if isinstance(row, dict) else None
         reasons = []
         if stable is None and raw is None: reasons.append("missing_authoritative_identity")
         if type(team) is not int or team < 0: reasons.append("invalid_team")
@@ -307,9 +316,13 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
         elif box_hit: geometry, mask = .7, 0.0
         else: geometry, mask = 0.0, 0.0
         if not geometry: reasons.append("outside_dynamic_player_region")
-        confidence_value = row.get("confidence", row.get("player_confidence", 0.0)) if isinstance(row, dict) else 0.0
-        confidence_valid = type(confidence_value) in {int, float} and math.isfinite(float(confidence_value))
-        confidence = float(confidence_value) if confidence_valid else 0.0
+        confidence_value = row.get("confidence", row.get("player_confidence")) if isinstance(row, dict) else None
+        confidence_available = confidence_value is not None
+        confidence_valid = (
+            not confidence_available
+            or (type(confidence_value) in {int, float} and math.isfinite(float(confidence_value)))
+        )
+        confidence = float(confidence_value) if confidence_available and confidence_valid else 0.0
         confidence = max(0.0, min(1.0, confidence))
         if not confidence_valid:
             reasons.append("non_finite_confidence")

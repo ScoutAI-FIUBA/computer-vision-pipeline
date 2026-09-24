@@ -140,6 +140,55 @@ def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch, caps
     assert "[v2-stats] stats complete" in output
 
 
+def test_v2_stats_adapter_v3_uses_actual_tracknet_and_player_shapes(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner, "probe",
+        lambda _path: SimpleNamespace(fps=4.0, frame_count=3, width=100, height=100, duration_seconds=3 / 4),
+    )
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    def collect(_video, *, output_path, **_kwargs):
+        output_path.write_text("".join(json.dumps({
+            "frame_index": frame,
+            "timestamp_seconds": frame / 4,
+            "track_id": 1,
+            "track_state": "detected",
+            "class_name": "ball",
+            "confidence": 0.9,
+            "xyxy": [10.0, 10.0, 20.0, 20.0],
+            "center_xy": [15.0, 15.0],
+        }) + "\n" for frame in range(3)))
+
+    monkeypatch.setattr(runner, "build_tracknet_detector", lambda _checkpoint: object())
+    monkeypatch.setattr(runner, "_collect_tracknet_rows", collect)
+    run_stats_from_v2_observations(
+        video,
+        PipelineConfig(
+            roboflow_api_key="test-key", team_embedder_backend="none",
+            tracknet_enabled=True, tracknet_checkpoint="checkpoint.pt", possession_engine="v3",
+        ),
+        tmp_path / "stats",
+        [{
+            "frame_index": frame, "raw_track_id": 7, "stable_player_id": "player-7",
+            "team_id": 1, "xyxy": [10.0, 10.0, 30.0, 40.0], "track_state": "tracked",
+            "confidence": None,
+        } for frame in range(3)],
+    )
+
+    observations = [
+        json.loads(line)
+        for line in (tmp_path / "stats" / "possession_v3" / "generations").glob("*/possession_v3.jsonl").__next__().read_text().splitlines()
+    ]
+    assert observations[-1]["candidates"][0]["score"] > 0
+    assert observations[-1]["stable_player_id"] == "player-7"
+    legacy = [json.loads(line) for line in (tmp_path / "stats" / "possession_events.jsonl").read_text().splitlines()]
+    assert legacy[-1]["status"] == "confirmed"
+
+
 def test_v2_stats_adapter_writes_transition_artifact_in_same_run(tmp_path, monkeypatch):
     import pipeline.runner as runner
 
