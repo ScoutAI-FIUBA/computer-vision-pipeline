@@ -180,6 +180,19 @@ class PossessionAudit:
     authority: str = "unknown"
     grace_eligible: bool = False
     grace_elapsed_seconds: float = 0.0
+    previous_holder_id: str | None = None
+    previous_holder_team: int | None = None
+    new_holder_id: str | None = None
+    new_holder_team: int | None = None
+    previous_holder_score: float | None = None
+    new_holder_score: float | None = None
+    challenger_start_frame: int | None = None
+    challenger_confirmation_frame: int | None = None
+    frame_start: int | None = None
+    frame_end: int | None = None
+    timestamp_start: float | None = None
+    timestamp_end: float | None = None
+    provenance: Provenance = field(default_factory=Provenance)
 
     def __post_init__(self) -> None:
         _holder(self.last_holder_id)
@@ -200,6 +213,21 @@ class PossessionAudit:
                 or not math.isfinite(self.grace_elapsed_seconds)
                 or self.grace_elapsed_seconds < 0):
             raise ValueError("grace_elapsed_seconds must be finite and non-negative")
+        _score(self.previous_holder_score, "previous_holder_score")
+        _score(self.new_holder_score, "new_holder_score")
+        for value, name in ((self.challenger_start_frame, "challenger_start_frame"),
+                            (self.challenger_confirmation_frame, "challenger_confirmation_frame"),
+                            (self.frame_start, "frame_start"), (self.frame_end, "frame_end")):
+            _optional_nonnegative_frame(value, name)
+        for value, name in ((self.timestamp_start, "timestamp_start"), (self.timestamp_end, "timestamp_end")):
+            if value is not None and (type(value) not in {int, float} or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.frame_start is not None and self.frame_end is not None and self.frame_end < self.frame_start:
+            raise ValueError("frame_end must not precede frame_start")
+        if self.timestamp_start is not None and self.timestamp_end is not None and self.timestamp_end < self.timestamp_start:
+            raise ValueError("timestamp_end must not precede timestamp_start")
+        if not isinstance(self.provenance, Provenance):
+            raise ValueError("provenance must be Provenance")
 @dataclass(frozen=True)
 class PossessionObservation:
     frame_index: int
@@ -481,7 +509,9 @@ class PossessionResolver:
         self.pending = None; self.gap_seconds = 0.0
         self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
         self.last_observed_frame = self.last_observed_score = None
+        self.last_observed_timestamp = None
         self.history = []; self.last_timestamp = None
+        self._audit_for_last_transition = PossessionAudit()
 
     def _observation(self, frame, state, candidate=None, candidates=(), reason=(), observed=None,
                      challenger=None, clear_reason=None, switch_confirmed=False):
@@ -509,11 +539,18 @@ class PossessionResolver:
                                     last_observed_holder_score=self.last_observed_score)
         authority = "stable" if (direct and direct.stable_player_id) else "raw" if direct else "unknown"
         audit = PossessionAudit(last_holder_id=effective if state is PossessionState.LOST_NO_DETECTION else None,
-                                last_holder_team=self.holder_team if state is PossessionState.LOST_NO_DETECTION else None,
-                                clear_reason=clear_reason, switch_confirmed=switch_confirmed,
+                                 last_holder_team=self.holder_team if state is PossessionState.LOST_NO_DETECTION else None,
+                                 clear_reason=clear_reason or self._audit_for_last_transition.clear_reason,
+                                 switch_confirmed=switch_confirmed or self._audit_for_last_transition.new_holder_id is not None,
                                 observation_quality=quality.value, observation_source="resolver",
-                                authority=authority, grace_eligible=bool(effective and self.gap_seconds < self.grace),
-                                grace_elapsed_seconds=self.gap_seconds)
+                                 authority=authority, grace_eligible=bool(effective and self.gap_seconds < self.grace),
+                                 grace_elapsed_seconds=self.gap_seconds)
+        audit = replace(audit, **{name: getattr(self._audit_for_last_transition, name)
+                                  for name in ("previous_holder_id", "previous_holder_team", "new_holder_id",
+                                               "new_holder_team", "previous_holder_score", "new_holder_score",
+                                               "challenger_start_frame", "challenger_confirmation_frame",
+                                               "frame_start", "frame_end", "timestamp_start", "timestamp_end",
+                                               "provenance")})
         obs = PossessionObservation(frame, state, quality, stable_player_id=stable, raw_track_id=raw,
                                      team_id=team, score=(candidate or direct).score if (candidate or direct) else None,
                                     score_margin=(candidates[0].score - candidates[1].score if len(candidates) > 1 else None),
@@ -529,9 +566,11 @@ class PossessionResolver:
 
     def resolve(self, frame_index, candidates, *, missing=False, invalid=False, ball_lost=False,
                 authoritative_loss=False, duplicate=False, timestamp=None):
+        self._audit_for_last_transition = PossessionAudit()
         candidates = sorted(candidates or [], key=lambda c: (-c.score, c.stable_player_id or "", c.raw_track_id or 0))
         timestamp_valid = (timestamp is None or
-                           (type(timestamp) in {int, float} and math.isfinite(float(timestamp))))
+                           (type(timestamp) in {int, float} and math.isfinite(float(timestamp))
+                            and float(timestamp) >= 0))
         timestamp_reversed = (timestamp_valid and timestamp is not None and self.last_time is not None
                               and timestamp < self.last_time)
         timestamp_invalid = not timestamp_valid or timestamp_reversed
@@ -552,8 +591,10 @@ class PossessionResolver:
         if invalid_input:
             last = self.holder_stable or self.holder_fallback or (f"raw:{self.holder_raw}" if self.holder_raw else None)
             team = self.holder_team
-            self.holder = None; self.pending = None; self.gap_seconds = 0.0
-            self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
+            previous = self.holder
+            self.clear_effective_holder(ClearReason.EXPLICIT_RESET, frame_index=frame_index, timestamp=timestamp,
+                                        frame_start=self.last_observed_frame,
+                                        timestamp_start=self.last_observed_timestamp)
             reason = ("invalid_timestamp" if not timestamp_valid else "reverse_timestamp" if timestamp_reversed
                       else "missing_authoritative_frame" if missing else "invalid_evidence")
             observation = self._observation(frame_index, PossessionState.UNKNOWN, candidates=candidates,
@@ -578,10 +619,13 @@ class PossessionResolver:
                 self.gap_seconds = 0.0
                 self.pending = None
                 self.last_observed_frame, self.last_observed_score = frame_index, top.score
+                self.last_observed_timestamp = timestamp
                 return self._observation(frame_index, PossessionState.OBSERVED, top, candidates)
             top = candidates[0]
             if top.score <= 0:
-                self._clear_holder()
+                self.clear_effective_holder(ClearReason.LOOSE_BALL_CONFIRMED, frame_index=frame_index,
+                                            timestamp=timestamp, frame_start=self.last_observed_frame,
+                                            timestamp_start=self.last_observed_timestamp)
                 return self._observation(frame_index, PossessionState.NO_POSSESSION, candidates=candidates, reason=("no_valid_candidate",))
             if len(candidates) > 1 and candidates[0].score - candidates[1].score < self.hysteresis:
                 if self.holder:
@@ -595,9 +639,9 @@ class PossessionResolver:
             if top.score < self.keep_threshold and self.holder is None:
                 return self._observation(frame_index, PossessionState.CANDIDATE, top, candidates, ("weak_candidate",))
             if self.holder is None:
-                self.holder = self._key(top); self.holder_stable, self.holder_raw = top.stable_player_id, top.raw_track_id
-                self.holder_team, self.holder_fallback = top.team_id, top.fallback_identity; self.pending = None
+                self.confirm_switch(top, frame_index=frame_index, timestamp=timestamp)
                 self.last_observed_frame, self.last_observed_score = frame_index, top.score
+                self.last_observed_timestamp = timestamp
                 return self._observation(frame_index, PossessionState.OBSERVED, top, candidates)
             if self.holder_stable is not None and top.stable_player_id is None:
                 self.pending = None
@@ -618,13 +662,15 @@ class PossessionResolver:
                 key = self._key(top)
                 accumulated = self.pending[1] + elapsed if self.pending and self.pending[0] == key else elapsed
                 if self.pending and self.pending[0] == key and accumulated >= self.persistence:
-                    self.holder = self._key(top); self.holder_stable, self.holder_raw = top.stable_player_id, top.raw_track_id
-                    self.holder_team, self.holder_fallback = top.team_id, top.fallback_identity; self.pending = None
+                    self.confirm_switch(top, frame_index=frame_index, timestamp=timestamp)
                     self.gap_seconds = 0.0
                     self.last_observed_frame, self.last_observed_score = frame_index, top.score
+                    self.last_observed_timestamp = timestamp
                     return self._observation(frame_index, PossessionState.OBSERVED, top, candidates,
                                              ("stable_switch",), switch_confirmed=True)
-                self.pending = (key, accumulated, self.pending[2] if self.pending and self.pending[0] == key else frame_index)
+                start_frame = self.pending[2] if self.pending and self.pending[0] == key else frame_index
+                start_timestamp = self.pending[3] if self.pending and self.pending[0] == key else timestamp
+                self.pending = (key, accumulated, start_frame, start_timestamp)
                 self.gap_seconds += elapsed
                 if self.gap_seconds >= self.grace:
                     return self._lost_no_detection(frame_index, candidates, "grace_expired")
@@ -637,14 +683,67 @@ class PossessionResolver:
             return self._observation(frame_index, PossessionState.UNKNOWN, candidates=candidates,
                                      observed=top, reason=("challenger_rejected",))
 
-    def _clear_holder(self):
+    def confirm_switch(self, candidate, *, frame_index=None, timestamp=None):
+        """The sole mutation path for an effective holder change."""
+        if not isinstance(candidate, CandidateEvidence) or self._key(candidate) is None:
+            raise ValueError("confirmed switch requires an identified candidate")
+        if self.holder_stable is not None and candidate.stable_player_id is None:
+            raise ValueError("confirmed switch requires stable identity")
+        if candidate.score < self.keep_threshold:
+            raise ValueError("confirmed switch requires keep_threshold score")
+        previous = self.holder
+        previous_team = self.holder_team
+        start_frame = self.pending[2] if self.pending and self.pending[0] == self._key(candidate) else frame_index
+        start_time = self.pending[3] if self.pending and self.pending[0] == self._key(candidate) else timestamp
+        self.holder = self._key(candidate)
+        self.holder_stable, self.holder_raw = candidate.stable_player_id, candidate.raw_track_id
+        self.holder_team, self.holder_fallback = candidate.team_id, candidate.fallback_identity
+        self.pending = None
+        self._audit_for_last_transition = PossessionAudit(
+            previous_holder_id=previous, previous_holder_team=previous_team,
+            new_holder_id=self.holder, new_holder_team=self.holder_team,
+            previous_holder_score=self.last_observed_score,
+            new_holder_score=candidate.score,
+            challenger_start_frame=start_frame,
+            challenger_confirmation_frame=frame_index,
+            frame_start=start_frame, frame_end=frame_index,
+            timestamp_start=start_time, timestamp_end=timestamp,
+            provenance=Provenance(frame_indices=[x for x in (start_frame, frame_index) if x is not None],
+                                  reason_codes=["confirmed_switch"]),
+        )
+        return self.holder
+
+    def clear_effective_holder(self, reason, *, frame_index=None, timestamp=None,
+                               frame_start=None, timestamp_start=None):
+        """The sole mutation path for removing an effective holder."""
+        reason = _enum(reason, ClearReason, "clear reason")
+        if reason not in {ClearReason.GRACE_EXPIRED, ClearReason.LOOSE_BALL_CONFIRMED,
+                          ClearReason.OUT_OF_BOUNDS, ClearReason.END_OF_SEGMENT,
+                          ClearReason.EXPLICIT_RESET}:
+            raise ValueError(f"unsupported clear reason: {reason.value}")
+        previous, team = self.holder, self.holder_team
+        frame_start = self.last_frame if frame_start is None else frame_start
+        timestamp_start = self.last_timestamp if timestamp_start is None else timestamp_start
+        valid_end = (timestamp if type(timestamp) in {int, float} and math.isfinite(float(timestamp))
+                     and (timestamp_start is None or timestamp >= timestamp_start) else None)
+        self._audit_for_last_transition = PossessionAudit(
+            previous_holder_id=previous, previous_holder_team=team,
+            frame_start=frame_start, frame_end=frame_index,
+            timestamp_start=timestamp_start, timestamp_end=valid_end,
+            clear_reason=reason,
+            provenance=Provenance(frame_indices=[x for x in (frame_start, frame_index) if x is not None],
+                                  reason_codes=[reason.value]),
+        )
         self.holder = None; self.pending = None; self.gap_seconds = 0.0
         self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
 
     def _lost_no_detection(self, frame, candidates, reason):
         prior, team = self.holder, self.holder_team
         elapsed = self.gap_seconds
-        self._clear_holder()
+        self.clear_effective_holder(ClearReason.GRACE_EXPIRED, frame_index=frame,
+                                    timestamp=self.last_timestamp,
+                                    frame_start=self.last_observed_frame,
+                                    timestamp_start=self.last_observed_timestamp)
         observation = self._observation(frame, PossessionState.LOST_NO_DETECTION,
                                         candidates=candidates, reason=(reason,),
                                         clear_reason=ClearReason.LOST_NO_DETECTION)
