@@ -31,6 +31,7 @@ class PossessionState(_ValueEnum):
     UNKNOWN = "UNKNOWN"
     INFERRED = "INFERRED"
     TRANSITIONING = "TRANSITIONING"
+    LOST_NO_DETECTION = "LOST_NO_DETECTION"
 class EvidenceKind(_ValueEnum):
     OBSERVED = "observed"
     INFERRED = "inferred"
@@ -49,6 +50,7 @@ class ClearReason(_ValueEnum):
     OUT_OF_BOUNDS = "OUT_OF_BOUNDS"
     END_OF_SEGMENT = "END_OF_SEGMENT"
     EXPLICIT_RESET = "EXPLICIT_RESET"
+    LOST_NO_DETECTION = "LOST_NO_DETECTION"
 def _frame(value: int, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -134,6 +136,7 @@ class PossessionContext:
     observed_candidate_id: str | None = None
     challenger_id: str | None = None
     challenger_start_frame: int | None = None
+    challenger_elapsed_seconds: float = 0.0
     challenger_confirmation_frame: int | None = None
     grace_start_frame: int | None = None
     grace_remaining_seconds: float = 0.0
@@ -156,6 +159,12 @@ class PossessionContext:
             raise ValueError("challenger confirmation must not precede challenger start")
         if self.challenger_id is None and (self.challenger_start_frame is not None or self.challenger_confirmation_frame is not None):
             raise ValueError("challenger frames require challenger_id")
+        if (type(self.challenger_elapsed_seconds) not in {int, float}
+                or not math.isfinite(self.challenger_elapsed_seconds)
+                or self.challenger_elapsed_seconds < 0):
+            raise ValueError("challenger_elapsed_seconds must be finite and non-negative")
+        if self.challenger_id is None and self.challenger_elapsed_seconds != 0:
+            raise ValueError("challenger elapsed time requires challenger_id")
         if type(self.grace_remaining_seconds) not in {int, float} or not math.isfinite(self.grace_remaining_seconds) or self.grace_remaining_seconds < 0:
             raise ValueError("grace_remaining_seconds must be finite and non-negative")
         _optional_nonnegative_frame(self.last_observed_holder_frame, "last_observed_holder_frame")
@@ -460,29 +469,59 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
 class PossessionResolver:
     """Small deterministic temporal resolver; no ball/event semantics live here."""
     def __init__(self, *, real_fps, grace_seconds=.6, hysteresis_margin=.1, persistence_seconds=0.0,
-                 profile="default"):
+                 keep_threshold=MIN_CANDIDATE_SCORE, profile="default"):
         if not isinstance(real_fps, (int, float)) or real_fps <= 0: raise ValueError("real_fps must be positive")
         self.fps = float(real_fps); self.grace = min(.6, max(0.0, grace_seconds))
         self.hysteresis = max(0.0, hysteresis_margin); self.persistence = max(0.0, persistence_seconds)
+        if (type(keep_threshold) not in {int, float} or not math.isfinite(float(keep_threshold))
+                or not 0 <= float(keep_threshold) <= 1):
+            raise ValueError("keep_threshold must be finite and between 0 and 1")
+        self.keep_threshold = float(keep_threshold)
         self.profile = profile; self.holder = None; self.last_frame = None; self.last_time = None
         self.pending = None; self.gap_seconds = 0.0
         self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
+        self.last_observed_frame = self.last_observed_score = None
         self.history = []; self.last_timestamp = None
 
-    def _observation(self, frame, state, candidate=None, candidates=(), reason=()):
-        stable = candidate.stable_player_id if candidate else self.holder_stable
-        raw = candidate.raw_track_id if candidate else self.holder_raw
-        team = candidate.team_id if candidate else self.holder_team
+    def _observation(self, frame, state, candidate=None, candidates=(), reason=(), observed=None,
+                     challenger=None, clear_reason=None, switch_confirmed=False):
+        effective = self.holder_stable or self.holder_fallback or (f"raw:{self.holder_raw}" if self.holder_raw else None)
+        direct = observed or candidate
+        stable = self.holder_stable if state not in {PossessionState.OBSERVED} else (direct.stable_player_id if direct else None)
+        raw = self.holder_raw if state not in {PossessionState.OBSERVED} else (direct.raw_track_id if direct else None)
+        team = self.holder_team if state not in {PossessionState.OBSERVED} else (direct.team_id if direct else None)
+        if state is PossessionState.LOST_NO_DETECTION:
+            stable = raw = team = None
+        challenger_id = self._key(challenger) if challenger else None
+        observed_id = self._key(direct) if direct else None
         prov = Provenance(frame_indices=[frame], reason_codes=list(reason))
-        obs = PossessionObservation(frame, state, EvidenceKind.OBSERVED if state is PossessionState.OBSERVED else
-                                    EvidenceKind.INFERRED if state is PossessionState.INFERRED else
-                                    EvidenceKind.CONTESTED if state is PossessionState.CONTESTED else EvidenceKind.UNKNOWN,
-                                    stable_player_id=stable, raw_track_id=raw,
-                                    team_id=team, score=candidate.score if candidate else None,
+        quality = (EvidenceKind.OBSERVED if state is PossessionState.OBSERVED else
+                   EvidenceKind.INFERRED if state is PossessionState.INFERRED else
+                   EvidenceKind.CONTESTED if state is PossessionState.CONTESTED else EvidenceKind.UNKNOWN)
+        context = PossessionContext(effective_holder_id=None if state is PossessionState.LOST_NO_DETECTION else effective,
+                                    effective_holder_team=None if state is PossessionState.LOST_NO_DETECTION else self.holder_team,
+                                    observed_candidate_id=observed_id, challenger_id=challenger_id,
+                                    challenger_start_frame=self.pending[2] if self.pending else None,
+                                    challenger_elapsed_seconds=self.pending[1] if self.pending else 0.0,
+                                    grace_start_frame=self.last_frame - int(self.gap_seconds * self.fps) if self.gap_seconds else None,
+                                    grace_remaining_seconds=max(0.0, self.grace - self.gap_seconds),
+                                    last_observed_holder_frame=self.last_observed_frame,
+                                    last_observed_holder_score=self.last_observed_score)
+        authority = "stable" if (direct and direct.stable_player_id) else "raw" if direct else "unknown"
+        audit = PossessionAudit(last_holder_id=effective if state is PossessionState.LOST_NO_DETECTION else None,
+                                last_holder_team=self.holder_team if state is PossessionState.LOST_NO_DETECTION else None,
+                                clear_reason=clear_reason, switch_confirmed=switch_confirmed,
+                                observation_quality=quality.value, observation_source="resolver",
+                                authority=authority, grace_eligible=bool(effective and self.gap_seconds < self.grace),
+                                grace_elapsed_seconds=self.gap_seconds)
+        obs = PossessionObservation(frame, state, quality, stable_player_id=stable, raw_track_id=raw,
+                                     team_id=team, score=(candidate or direct).score if (candidate or direct) else None,
                                     score_margin=(candidates[0].score - candidates[1].score if len(candidates) > 1 else None),
                                     candidates=list(candidates), provenance=prov, profile=self.profile,
                                     timestamp_seconds=self.last_timestamp,
-                                    thresholds={"hysteresis_margin": self.hysteresis, "grace_seconds": self.grace})
+                                     thresholds={"hysteresis_margin": self.hysteresis, "grace_seconds": self.grace,
+                                                 "keep_threshold": self.keep_threshold},
+                                     context=context, audit=audit)
         self.history.append(obs); return obs
 
     def _key(self, candidate):
@@ -491,49 +530,129 @@ class PossessionResolver:
     def resolve(self, frame_index, candidates, *, missing=False, invalid=False, ball_lost=False,
                 authoritative_loss=False, duplicate=False, timestamp=None):
         candidates = sorted(candidates or [], key=lambda c: (-c.score, c.stable_player_id or "", c.raw_track_id or 0))
-        elapsed = 0.0 if self.last_frame is None else (timestamp - self.last_time if timestamp is not None and self.last_time is not None else (frame_index - self.last_frame) / self.fps)
-        self.last_frame, self.last_time = frame_index, timestamp
-        self.last_timestamp = timestamp
-        invalid_input = invalid or authoritative_loss or duplicate or missing
-        if candidates and not invalid_input:
-            self.gap_seconds = 0.0
+        timestamp_valid = (timestamp is None or
+                           (type(timestamp) in {int, float} and math.isfinite(float(timestamp))))
+        timestamp_reversed = (timestamp_valid and timestamp is not None and self.last_time is not None
+                              and timestamp < self.last_time)
+        timestamp_invalid = not timestamp_valid or timestamp_reversed
+        if self.last_frame is None:
+            elapsed = 0.0
+        elif timestamp_invalid:
+            elapsed = 0.0
+        elif timestamp is not None and self.last_time is not None:
+            elapsed = timestamp - self.last_time
+        else:
+            elapsed = (frame_index - self.last_frame) / self.fps
+        self.last_frame = frame_index
+        if not timestamp_invalid:
+            if timestamp is not None:
+                self.last_time = timestamp
+            self.last_timestamp = timestamp
+        invalid_input = invalid or authoritative_loss or duplicate or missing or timestamp_invalid
+        if invalid_input:
+            last = self.holder_stable or self.holder_fallback or (f"raw:{self.holder_raw}" if self.holder_raw else None)
+            team = self.holder_team
+            self.holder = None; self.pending = None; self.gap_seconds = 0.0
+            self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
+            reason = ("invalid_timestamp" if not timestamp_valid else "reverse_timestamp" if timestamp_reversed
+                      else "missing_authoritative_frame" if missing else "invalid_evidence")
+            observation = self._observation(frame_index, PossessionState.UNKNOWN, candidates=candidates,
+                                            reason=(reason,))
+            observation = replace(observation, audit=replace(observation.audit, last_holder_id=last,
+                                                              last_holder_team=team))
+            self.history[-1] = observation
+            return observation
+        if ball_lost or not candidates:
+            if self.holder:
+                self.gap_seconds += elapsed
+                if self.gap_seconds < self.grace:
+                    self.pending = None
+                    return self._observation(frame_index, PossessionState.INFERRED,
+                                             reason=("ball_lost" if ball_lost else "unknown",))
+                return self._lost_no_detection(frame_index, candidates, "grace_expired")
+            return self._observation(frame_index, PossessionState.NO_POSSESSION, candidates=candidates,
+                                     reason=("no_detection" if ball_lost else "evidence_loss",))
+        if candidates:
+            top = candidates[0]
+            if self._key(top) == self.holder and top.score >= self.keep_threshold:
+                self.gap_seconds = 0.0
+                self.pending = None
+                self.last_observed_frame, self.last_observed_score = frame_index, top.score
+                return self._observation(frame_index, PossessionState.OBSERVED, top, candidates)
             top = candidates[0]
             if top.score <= 0:
-                self.holder = None; self.pending = None; self.gap_seconds = 0.0
-                self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
+                self._clear_holder()
                 return self._observation(frame_index, PossessionState.NO_POSSESSION, candidates=candidates, reason=("no_valid_candidate",))
             if len(candidates) > 1 and candidates[0].score - candidates[1].score < self.hysteresis:
-                return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates, reason=("insufficient_margin",))
-            if top.score < MIN_CANDIDATE_SCORE and self.holder is None:
+                if self.holder:
+                    self.gap_seconds += elapsed
+                    if self.gap_seconds >= self.grace:
+                        return self._lost_no_detection(frame_index, candidates, "grace_expired")
+                    return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
+                                             observed=top, reason=("insufficient_margin",))
+                return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
+                                         observed=top, reason=("insufficient_margin",))
+            if top.score < self.keep_threshold and self.holder is None:
                 return self._observation(frame_index, PossessionState.CANDIDATE, top, candidates, ("weak_candidate",))
             if self.holder is None:
                 self.holder = self._key(top); self.holder_stable, self.holder_raw = top.stable_player_id, top.raw_track_id
                 self.holder_team, self.holder_fallback = top.team_id, top.fallback_identity; self.pending = None
-                return self._observation(frame_index, PossessionState.OBSERVED, top, candidates)
-            if self._key(top) == self.holder:
-                self.pending = None
+                self.last_observed_frame, self.last_observed_score = frame_index, top.score
                 return self._observation(frame_index, PossessionState.OBSERVED, top, candidates)
             if self.holder_stable is not None and top.stable_player_id is None:
                 self.pending = None
-                return self._observation(frame_index, PossessionState.CONTESTED,
-                                         candidates=candidates, reason=("raw_fallback_cannot_replace_stable",))
+                self.gap_seconds += elapsed
+                if self.gap_seconds >= self.grace:
+                    return self._lost_no_detection(frame_index, candidates, "grace_expired")
+                return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
+                                         observed=top, reason=("raw_fallback_cannot_replace_stable",))
+            if top.score < self.keep_threshold:
+                self.pending = None
+                self.gap_seconds += elapsed
+                if self.gap_seconds >= self.grace:
+                    return self._lost_no_detection(frame_index, candidates, "grace_expired")
+                return self._observation(frame_index, PossessionState.TRANSITIONING,
+                                         candidates=candidates, observed=top,
+                                         reason=("below_keep_threshold",))
             if top.score - next((c.score for c in candidates if self._key(c) == self.holder), 0.0) >= self.hysteresis:
-                if self.pending and self.pending[0] == self._key(top) and elapsed + self.pending[1] >= self.persistence:
+                key = self._key(top)
+                accumulated = self.pending[1] + elapsed if self.pending and self.pending[0] == key else elapsed
+                if self.pending and self.pending[0] == key and accumulated >= self.persistence:
                     self.holder = self._key(top); self.holder_stable, self.holder_raw = top.stable_player_id, top.raw_track_id
                     self.holder_team, self.holder_fallback = top.team_id, top.fallback_identity; self.pending = None
-                    return self._observation(frame_index, PossessionState.OBSERVED, top, candidates, ("stable_switch",))
-                self.pending = (self._key(top), elapsed)
-                return self._observation(frame_index, PossessionState.TRANSITIONING, candidates=candidates, reason=("switch_persistence",))
-        if self.holder and not invalid_input and ball_lost:
+                    self.gap_seconds = 0.0
+                    self.last_observed_frame, self.last_observed_score = frame_index, top.score
+                    return self._observation(frame_index, PossessionState.OBSERVED, top, candidates,
+                                             ("stable_switch",), switch_confirmed=True)
+                self.pending = (key, accumulated, self.pending[2] if self.pending and self.pending[0] == key else frame_index)
+                self.gap_seconds += elapsed
+                if self.gap_seconds >= self.grace:
+                    return self._lost_no_detection(frame_index, candidates, "grace_expired")
+                return self._observation(frame_index, PossessionState.TRANSITIONING, candidates=candidates,
+                                         observed=top, challenger=top, reason=("switch_persistence",))
+            self.pending = None
             self.gap_seconds += elapsed
-        if self.holder and not invalid_input and ball_lost and self.gap_seconds < self.grace:
-            return self._observation(frame_index, PossessionState.INFERRED, reason=("bounded_grace",))
-        prior = self.holder
+            if self.gap_seconds >= self.grace:
+                return self._lost_no_detection(frame_index, candidates, "grace_expired")
+            return self._observation(frame_index, PossessionState.UNKNOWN, candidates=candidates,
+                                     observed=top, reason=("challenger_rejected",))
+
+    def _clear_holder(self):
         self.holder = None; self.pending = None; self.gap_seconds = 0.0
         self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
-        state = PossessionState.UNKNOWN if missing or invalid_input else PossessionState.NO_POSSESSION
-        reason = ("missing_authoritative_frame" if missing else "invalid_evidence" if invalid_input else "evidence_loss",)
-        return self._observation(frame_index, state, candidates=candidates, reason=reason)
+
+    def _lost_no_detection(self, frame, candidates, reason):
+        prior, team = self.holder, self.holder_team
+        elapsed = self.gap_seconds
+        self._clear_holder()
+        observation = self._observation(frame, PossessionState.LOST_NO_DETECTION,
+                                        candidates=candidates, reason=(reason,),
+                                        clear_reason=ClearReason.LOST_NO_DETECTION)
+        observation = replace(observation, audit=replace(observation.audit, last_holder_id=prior,
+                                                          last_holder_team=team,
+                                                          grace_elapsed_seconds=elapsed))
+        self.history[-1] = observation
+        return observation
 
     def retroactive_confirm(self, start_frame, confirmation_frame):
         if type(start_frame) is not int or type(confirmation_frame) is not int or start_frame >= confirmation_frame:

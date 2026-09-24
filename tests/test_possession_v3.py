@@ -441,6 +441,177 @@ def test_raw_only_challenger_cannot_switch_stable_holder():
     assert resolver.history[-1].stable_player_id == "stable-a"
 
 
+def test_continuity_separates_effective_observed_and_challenger_for_006_007():
+    resolver = PossessionResolver(real_fps=10, persistence_seconds=.3)
+    holder = CandidateEvidence("player-006", 6, 1, .9, {"geometry": .9})
+    rival = CandidateEvidence("player-007", 7, 1, .95, {"geometry": .95})
+    assert resolver.resolve(0, [holder]).state is PossessionState.OBSERVED
+    observation = resolver.resolve(1, [rival])
+    assert observation.state is PossessionState.TRANSITIONING
+    assert observation.context.effective_holder_id == "player-006"
+    assert observation.context.observed_candidate_id == "player-007"
+    assert observation.context.challenger_id == "player-007"
+    assert observation.stable_player_id == "player-006"
+
+
+def test_exact_006_007_timeline_preserves_then_confirms_switch():
+    resolver = PossessionResolver(real_fps=20, persistence_seconds=.15)
+    holder = CandidateEvidence("player-006", 6, 1, .9, {"geometry": .9})
+    rival = CandidateEvidence("player-007", 7, 1, .95, {"geometry": .95})
+    tie = CandidateEvidence("player-008", 8, 2, .94, {"geometry": .94})
+
+    assert resolver.resolve(0, [holder]).state is PossessionState.OBSERVED
+    assert resolver.resolve(1, [], ball_lost=True).context.effective_holder_id == "player-006"
+    assert resolver.history[-1].state is PossessionState.INFERRED
+    unknown = resolver.resolve(2, [])
+    assert unknown.state is PossessionState.INFERRED
+    assert unknown.context.effective_holder_id == "player-006"
+    contested = resolver.resolve(3, [rival, tie])
+    assert contested.state is PossessionState.CONTESTED
+    assert contested.context.effective_holder_id == "player-006"
+    assert contested.context.challenger_id is None
+
+    first_challenge = resolver.resolve(4, [rival])
+    assert first_challenge.state is PossessionState.TRANSITIONING
+    assert first_challenge.context.challenger_id == "player-007"
+    assert first_challenge.context.challenger_start_frame == 4
+    cancelled = resolver.resolve(5, [], ball_lost=True)
+    assert cancelled.context.effective_holder_id == "player-006"
+    assert cancelled.context.challenger_id is None
+
+    restarted = resolver.resolve(6, [rival])
+    continued = resolver.resolve(7, [rival])
+    assert restarted.context.challenger_start_frame == continued.context.challenger_start_frame == 6
+    assert continued.context.challenger_elapsed_seconds == .1
+    assert continued.context.effective_holder_id == "player-006"
+    confirmed = resolver.resolve(8, [rival])
+    assert confirmed.state is PossessionState.OBSERVED
+    assert confirmed.context.effective_holder_id == "player-007"
+    assert confirmed.context.challenger_id is None
+    assert confirmed.audit.switch_confirmed is True
+
+
+def test_unknown_contested_and_ball_loss_preserve_holder_until_real_fps_grace_expires():
+    resolver = PossessionResolver(real_fps=10)
+    holder = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    resolver.resolve(0, [holder])
+    unknown = resolver.resolve(1, [], ball_lost=False)
+    contested = resolver.resolve(2, [CandidateEvidence("b", 2, 2, .9, {"geometry": .9}),
+                                    CandidateEvidence("c", 3, 2, .9, {"geometry": .9})])
+    lost = resolver.resolve(3, [], ball_lost=True)
+    expired = resolver.resolve(6, [], ball_lost=True)
+    assert unknown.state is PossessionState.INFERRED
+    assert contested.state is PossessionState.CONTESTED
+    assert lost.state is PossessionState.INFERRED
+    assert lost.context.effective_holder_id == "a"
+    assert expired.state is PossessionState.LOST_NO_DETECTION
+    assert expired.context.effective_holder_id is None
+    assert expired.audit.last_holder_id == "a"
+    assert expired.audit.clear_reason is ClearReason.LOST_NO_DETECTION
+
+
+def test_repeated_contested_frames_expire_holder_grace():
+    resolver = PossessionResolver(real_fps=10, hysteresis_margin=.1)
+    holder = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    rival = CandidateEvidence("b", 2, 2, .9, {"geometry": .9})
+    tie = CandidateEvidence("c", 3, 2, .9, {"geometry": .9})
+    resolver.resolve(0, [holder])
+    states = [resolver.resolve(frame, [rival, tie]) for frame in range(1, 7)]
+    assert [observation.state for observation in states[:-1]] == [PossessionState.CONTESTED] * 5
+    expired = states[-1]
+    assert expired.state is PossessionState.LOST_NO_DETECTION
+    assert expired.context.effective_holder_id is None
+    assert expired.audit.last_holder_id == "a"
+    assert expired.audit.clear_reason is ClearReason.LOST_NO_DETECTION
+
+
+def test_challenger_cancels_when_evidence_disappears_and_failed_transition_keeps_holder():
+    resolver = PossessionResolver(real_fps=10, persistence_seconds=.4)
+    a = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    b = CandidateEvidence("b", 2, 2, .95, {"geometry": .95})
+    resolver.resolve(0, [a])
+    pending = resolver.resolve(1, [b])
+    cancelled = resolver.resolve(2, [])
+    assert pending.context.challenger_id == "b"
+    assert cancelled.context.challenger_id is None
+    assert cancelled.context.effective_holder_id == "a"
+    assert resolver.resolve(3, [b]).context.challenger_id == "b"
+    assert resolver.resolve(4, [a]).context.challenger_id is None
+
+
+def test_observed_requires_keep_threshold_and_confirmed_switch_is_observed():
+    resolver = PossessionResolver(real_fps=10, persistence_seconds=.2, keep_threshold=.5)
+    current = CandidateEvidence("current", 1, 1, .8, {"geometry": .8})
+    weak = CandidateEvidence("weak", 3, 1, .49, {"geometry": .49})
+    strong = CandidateEvidence("strong", 2, 1, .8, {"geometry": .8})
+    assert resolver.resolve(0, [current]).state is PossessionState.OBSERVED
+    weak_observation = resolver.resolve(1, [weak])
+    assert weak_observation.state is PossessionState.TRANSITIONING
+    assert weak_observation.stable_player_id == "current"
+    assert weak_observation.score == .49
+    assert resolver.resolve(2, [strong]).state is PossessionState.TRANSITIONING
+    switched = resolver.resolve(4, [strong])
+    assert switched.state is PossessionState.OBSERVED
+    assert switched.context.effective_holder_id == "strong"
+    assert switched.score >= .5
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), -float("inf"), -.01, 1.01, True, "0.5"])
+def test_resolver_rejects_invalid_keep_threshold(threshold):
+    with pytest.raises(ValueError, match="keep_threshold"):
+        PossessionResolver(real_fps=10, keep_threshold=threshold)
+
+
+def test_resolver_accepts_keep_threshold_edges():
+    assert PossessionResolver(real_fps=10, keep_threshold=0).keep_threshold == 0
+    assert PossessionResolver(real_fps=10, keep_threshold=1).keep_threshold == 1
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), -float("inf")])
+def test_resolver_invalid_timestamp_fails_closed_without_negative_elapsed(timestamp):
+    resolver = PossessionResolver(real_fps=10)
+    holder = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    resolver.resolve(0, [holder], timestamp=1.0)
+    observation = resolver.resolve(1, [holder], timestamp=timestamp)
+    assert observation.state is PossessionState.UNKNOWN
+    assert observation.context.effective_holder_id is None
+    assert observation.audit.grace_elapsed_seconds == 0
+
+
+def test_resolver_reverse_timestamp_fails_closed_without_negative_elapsed():
+    resolver = PossessionResolver(real_fps=10)
+    holder = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    resolver.resolve(0, [holder], timestamp=1.0)
+    observation = resolver.resolve(1, [holder], timestamp=.5)
+    assert observation.state is PossessionState.UNKNOWN
+    assert observation.context.effective_holder_id is None
+    assert observation.audit.grace_elapsed_seconds == 0
+
+
+def test_missing_timestamp_preserves_finite_ordering_baseline():
+    resolver = PossessionResolver(real_fps=10)
+    holder = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    resolver.resolve(0, [holder], timestamp=10.0)
+    resolver.resolve(1, [holder])
+    observation = resolver.resolve(2, [holder], timestamp=9.0)
+    assert observation.state is PossessionState.UNKNOWN
+    assert observation.context.effective_holder_id is None
+    assert "reverse_timestamp" in observation.provenance.reason_codes
+
+
+def test_terminal_input_clears_without_grace_and_does_not_retain_challenger():
+    resolver = PossessionResolver(real_fps=10)
+    a = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    b = CandidateEvidence("b", 2, 2, .95, {"geometry": .95})
+    resolver.resolve(0, [a])
+    resolver.resolve(1, [b])
+    cleared = resolver.resolve(2, [], invalid=True)
+    assert cleared.state is PossessionState.UNKNOWN
+    assert cleared.context.effective_holder_id is None
+    assert cleared.context.challenger_id is None
+    assert cleared.audit.last_holder_id == "a"
+
+
 @pytest.mark.parametrize("kwargs, expected", [
     ({"missing": True}, PossessionState.UNKNOWN),
     ({"invalid": True}, PossessionState.UNKNOWN),
