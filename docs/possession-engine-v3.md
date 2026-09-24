@@ -6,7 +6,17 @@ does not create V3 artifacts.
 
 ## Outputs
 
-Enabled runs add these JSONL files and `possession_v3_manifest.json`:
+Enabled runs publish one generation under `possession_v3/generations/<id>/` and
+atomically replace `possession_v3_manifest.json`. Consumers must resolve JSONL
+paths from that manifest; the pointer is the only current-generation marker, so
+failed runs cannot expose a partial or mixed generation. If publication fails,
+the pointer may continue to reference the valid last-known-good generation; that
+complete previous generation is the intentional rollback/current fallback, not
+an incomplete result from the failed run.
+
+The writer retains the current generation and one rollback generation, cleans
+stale staging directories, and keeps the last-known-good pointer if a later V3
+build or publication fails.
 
 | File | Contents |
 |---|---|
@@ -14,6 +24,11 @@ Enabled runs add these JSONL files and `possession_v3_manifest.json`:
 | `possession_primitives_v3.jsonl` | Release, transit, reception, and loose-ball primitives |
 | `ball_transitions_v3.jsonl` | Source/target transition windows and evidence |
 | `possession_events_v3.jsonl` | Transfer, PASS, STEAL, loss, turnover, or UNKNOWN labels |
+
+If V3 building or publication fails, the writer preserves the last-known-good
+pointer and generation. It records best-effort failure observability separately;
+failure reporting itself cannot make the run fail. Legacy output remains
+authoritative and is never interrupted by V3 diagnostics.
 
 Every record declares the V3 schema version and frame range. Timestamp ranges
 are included when source timestamps exist and are null only when they are not

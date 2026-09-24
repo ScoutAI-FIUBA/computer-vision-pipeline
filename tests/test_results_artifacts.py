@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import time
 from pathlib import Path
 
 import cv2
@@ -199,14 +201,15 @@ def test_v3_artifacts_are_versioned_hashed_and_deterministic(tmp_path: Path):
     first = write_v3_artifacts(tmp_path, [observation], [{"primitive_type": "BALL_RELEASE", "frame_index": 2, "timestamp_seconds": 1.0}], [transition], [event], {"profile": "default"})
     second = write_v3_artifacts(tmp_path / "repeat", [observation], [{"primitive_type": "BALL_RELEASE", "frame_index": 2, "timestamp_seconds": 1.0}], [transition], [event], {"profile": "default"})
     assert first["schema_version"] == 1
-    assert first["artifacts"]["possession"]["path"] == "possession_v3.jsonl"
+    assert first["artifacts"]["possession"]["path"].startswith("possession_v3/generations/")
     assert first["artifacts"]["possession"]["sha256"] == second["artifacts"]["possession"]["sha256"]
     assert first["artifacts"]["manifest"]["sha256"] == second["artifacts"]["manifest"]["sha256"]
-    assert json.loads((tmp_path / "possession_events_v3.jsonl").read_text())["event_type"] == "possession_transfer"
-    possession = json.loads((tmp_path / "possession_v3.jsonl").read_text())
-    primitive = json.loads((tmp_path / "possession_primitives_v3.jsonl").read_text())
-    transition_row = json.loads((tmp_path / "ball_transitions_v3.jsonl").read_text())
-    event_row = json.loads((tmp_path / "possession_events_v3.jsonl").read_text())
+    root = tmp_path / first["artifacts"]["possession"]["path"].split("/", 2)[0]
+    possession = json.loads((tmp_path / first["artifacts"]["possession"]["path"]).read_text())
+    primitive = json.loads((tmp_path / first["artifacts"]["primitives"]["path"]).read_text())
+    transition_row = json.loads((tmp_path / first["artifacts"]["transitions"]["path"]).read_text())
+    event_row = json.loads((tmp_path / first["artifacts"]["events"]["path"]).read_text())
+    assert json.loads((tmp_path / "possession_v3_manifest.json").read_text())["generation"] == first["generation"]
     for row in (possession, primitive, transition_row, event_row):
         assert {"frame_start", "frame_end", "timestamp_start", "timestamp_end"} <= row.keys()
     assert (possession["frame_start"], possession["frame_end"]) == (2, 2)
@@ -230,4 +233,99 @@ def test_v3_writer_is_feature_flag_isolated(tmp_path: Path):
     enabled = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3")
     manifest = _write_v3_artifacts(tmp_path / "v3", [], [], fps=30, config=enabled)
     assert manifest["schema"] == "possession-engine-v3"
-    assert (tmp_path / "v3" / "ball_transitions_v3.jsonl").exists()
+    assert (tmp_path / "v3" / "possession_v3_manifest.json").exists()
+
+
+def test_event_window_controls_runner_transition_artifact(tmp_path: Path):
+    rows = [{"frame_index": frame, "stable_player_id": holder}
+            for frame, holder in ((0, "a"), (1, None), (2, None), (3, "b"), (4, "b"))]
+    balls = [{"frame_index": frame, "timestamp_seconds": frame / 10, "track_state": "detected",
+              "confidence": .9, "center_xy": [frame * 10, 0], "source_records": [f"ball#{frame}"],
+              "source_frame_indices": [frame]}
+             for frame in range(5)]
+    config = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3",
+                            possession_v3_event_window_seconds=.2)
+    manifest = _write_v3_artifacts(tmp_path, rows, balls, fps=10, config=config)
+    transition_path = tmp_path / manifest["artifacts"]["transitions"]["path"]
+    assert transition_path.read_text(encoding="utf-8") == ""
+
+
+def test_v3_artifact_write_failure_does_not_leave_partial_files(tmp_path: Path, monkeypatch):
+    from pipeline import results as results_module
+
+    original = results_module.Path.write_text
+    calls = 0
+
+    def fail_after_first(path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise OSError("diagnostic disk full")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(results_module.Path, "write_text", fail_after_first)
+    with pytest.raises(OSError):
+        results_module.write_v3_artifacts(tmp_path, [], [], [], [])
+    assert not list(tmp_path.glob("*.jsonl"))
+    assert not (tmp_path / "possession_v3_manifest.json").exists()
+
+
+def test_failed_new_generation_preserves_current_pointer(tmp_path: Path, monkeypatch):
+    write_v3_artifacts(tmp_path, [], [], [], [], {"profile": "old"})
+    previous = (tmp_path / "possession_v3_manifest.json").read_text(encoding="utf-8")
+    from pipeline import results as results_module
+    original = results_module.os.replace
+
+    def fail_pointer(source, destination):
+        if Path(destination).name == "possession_v3_manifest.json":
+            raise OSError("pointer publication failed")
+        return original(source, destination)
+
+    monkeypatch.setattr(results_module.os, "replace", fail_pointer)
+    with pytest.raises(OSError):
+        write_v3_artifacts(tmp_path, [], [], [], [], {"profile": "new"})
+    assert (tmp_path / "possession_v3_manifest.json").read_text(encoding="utf-8") == previous
+
+
+def test_build_failure_preserves_last_known_good_pointer(tmp_path: Path, monkeypatch):
+    config = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3")
+    first = _write_v3_artifacts(tmp_path, [], [], fps=10, config=config)
+    pointer = (tmp_path / "possession_v3_manifest.json").read_text(encoding="utf-8")
+    generation = first["generation"]
+    import pipeline.runner as runner
+    monkeypatch.setattr(runner, "normalize_ball_rows", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("build failed")))
+    failed = runner._write_v3_artifacts(tmp_path, [], [], fps=10, config=config)
+    assert failed["status"] == "failed"
+    assert (tmp_path / "possession_v3_manifest.json").read_text(encoding="utf-8") == pointer
+    assert (tmp_path / "possession_v3" / "generations" / generation).exists()
+
+
+def test_failure_report_is_best_effort(tmp_path: Path, monkeypatch):
+    import pipeline.runner as runner
+    monkeypatch.setattr(runner, "_build_v3_artifacts", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("build failed")))
+    monkeypatch.setattr(runner.Path, "write_text", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("read-only")))
+    result = runner._write_v3_artifacts(tmp_path, [], [], fps=10,
+                                        config=PipelineConfig(roboflow_api_key="test-key", possession_engine="v3"))
+    assert result["status"] == "failed"
+
+
+def test_success_removes_stale_failure_report_and_bounds_generations(tmp_path: Path):
+    (tmp_path / "possession_v3_failure.json").write_text("stale", encoding="utf-8")
+    generation_root = tmp_path / "possession_v3" / "generations"
+    generation_root.mkdir(parents=True)
+    for name in ("old-a", "old-b", "old-c"):
+        (generation_root / name).mkdir()
+    _write_v3_artifacts(tmp_path, [], [], fps=10,
+                        config=PipelineConfig(roboflow_api_key="test-key", possession_engine="v3"))
+    assert not (tmp_path / "possession_v3_failure.json").exists()
+    assert len(list(generation_root.iterdir())) <= 2
+
+
+def test_success_cleans_stale_v3_staging_directory(tmp_path: Path):
+    stale = tmp_path / ".possession-v3-stale"
+    stale.mkdir()
+    old = time.time() - 7200
+    os.utime(stale, (old, old))
+    _write_v3_artifacts(tmp_path, [], [], fps=10,
+                        config=PipelineConfig(roboflow_api_key="test-key", possession_engine="v3"))
+    assert not stale.exists()

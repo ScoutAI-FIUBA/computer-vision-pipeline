@@ -16,6 +16,20 @@ def test_calibration_counts_unknown_and_holder_errors():
     assert metrics["false_holder_rate"] == 1.0
     assert metrics["unknown_rate"] == .25
     assert metrics["grace_recovery_rate"] == 1.0
+
+
+def test_recovery_thresholds_are_higher_is_better():
+    clips = [{"clip_id": "recovery", "difficulty": "medium", "frames": [
+        {"frame_index": 0, "predicted_holder": "UNKNOWN", "ground_truth_holder": "UNKNOWN"},
+        {"frame_index": 1, "predicted_holder": "p1", "ground_truth_holder": "p1",
+         "predicted_state": "GRACE"},
+    ]}]
+    report = evaluate_clips(clips, thresholds={"grace_recovery_rate": .8,
+                                               "unknown_recovery_rate": .8})
+    assert report["metrics"]["grace_recovery_rate"] == 1.0
+    assert report["promotion_gate"]["checks"]["grace_recovery_rate"] is True
+    assert report["metrics"]["unknown_recovery_rate"] == 1.0
+    assert report["promotion_gate"]["checks"]["unknown_recovery_rate"] is True
 def test_calibration_event_hooks_and_deterministic_report(tmp_path):
     clip = {"clip_id": "events", "frames": [],
             "primitive_events": [{"event_type": "release", "frame_index": 2}],
@@ -46,6 +60,16 @@ def test_event_metrics_do_not_match_events_across_clip_boundaries():
          "ground_truth_primitive_events": [{"event_type": "release", "frame_index": 2}]},
     ]
     assert evaluate_clips(clips)["metrics"]["primitive_f1"] == 0.0
+
+
+@pytest.mark.parametrize("events", [[{"frame_index": 1}], [{"event_type": "release", "frame_index": "1"}], [None]])
+def test_malformed_event_evidence_cannot_score_perfect_f1(events):
+    clip = {"clip_id": "bad-events", "frames": [],
+            "primitive_events": events,
+            "ground_truth_primitive_events": [{"event_type": "release", "frame_index": 1}]}
+    report = evaluate_clips([clip])
+    assert report["metrics"]["primitive_f1"] is None
+    assert report["promotion_gate"]["checks"]["primitive_f1"] is False
 def test_recovery_resets_at_clip_boundaries_and_report_has_rollout_fields():
     clips = [
         {"clip_id": "easy-1", "difficulty": "easy", "frames": [
@@ -102,6 +126,17 @@ def test_promotion_requires_complete_evidence_and_exact_decisions():
     assert evaluate_clips(no_difficulty, comparison=comparison, replay_evidence=True)["promotion_gate"]["decision"] == "REJECT"
     assert evaluate_clips(_complete_clips(), replay_evidence=True)["promotion_gate"]["decision"] == "REJECT"
     assert evaluate_clips(_complete_clips(), comparison={"legacy": {}, "v2": {}}, replay_evidence=True)["promotion_gate"]["decision"] == "REJECT"
+
+
+@pytest.mark.parametrize("comparison", [
+    {"legacy": {"holder_accuracy": "0.9"}, "v2": {"holder_accuracy": .9}},
+    {"legacy": ["holder_accuracy", .9], "v2": {"holder_accuracy": .9}},
+    {"legacy": {"holder_accuracy": float("nan")}, "v2": {"holder_accuracy": .9}},
+])
+def test_malformed_comparison_evidence_cannot_promote(comparison):
+    report = evaluate_clips(_complete_clips(), comparison=comparison, replay_evidence=True)
+    assert report["promotion_gate"]["checks"]["legacy_v2_comparison"] is False
+    assert report["promotion_gate"]["decision"] == "REJECT"
 
 
 def test_missing_or_failing_required_metrics_reject():

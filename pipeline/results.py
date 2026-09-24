@@ -16,6 +16,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -23,7 +27,11 @@ from typing import Any, Iterable, Mapping
 import cv2
 import numpy as np
 
+from pipeline.possession_v3 import V3_CONTRACT_VERSION
+
 RESULTS_SCHEMA_VERSION = 5
+V3_GENERATION_RETENTION = 2
+V3_STAGING_MAX_AGE_SECONDS = 3600
 
 
 @dataclass
@@ -71,6 +79,7 @@ class PipelineResults:
     possession_v3_transitions_file: str | None = None
     possession_v3_events_file: str | None = None
     possession_v3_manifest_file: str | None = None
+    possession_v3_observability: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -102,6 +111,8 @@ class PipelineResults:
                 payload.pop(key, None)
         if payload.get("possession_v3_schema_version") is None:
             payload.pop("possession_v3_schema_version", None)
+        if payload.get("possession_v3_observability") is None:
+            payload.pop("possession_v3_observability", None)
         return payload
 
     def write(self, path: Path) -> None:
@@ -114,7 +125,7 @@ def _json_record(value: Any, config: Mapping[str, Any]) -> dict[str, Any]:
         value = asdict(value)
     record = dict(value)
     record.setdefault("schema", "possession-engine-v3")
-    record.setdefault("schema_version", 1)
+    record.setdefault("schema_version", V3_CONTRACT_VERSION)
     frame = record.get("frame_index")
     if record.get("frame_start") is None:
         record["frame_start"] = frame
@@ -153,17 +164,65 @@ def write_v3_artifacts(
         "transitions": "ball_transitions_v3.jsonl",
         "events": "possession_events_v3.jsonl",
     }
+    generation_id = hashlib.sha256(json.dumps({"datasets": datasets, "config": config}, sort_keys=True,
+                                               separators=(",", ":")).encode()).hexdigest()[:16]
+    generation_root = output_dir / "possession_v3" / "generations"
+    generation_path = generation_root / generation_id
+    manifest_path = output_dir / "possession_v3_manifest.json"
+    old_root_files = [output_dir / filename for filename in (*filenames.values(),)]
     artifacts: dict[str, Any] = {}
-    for name, rows in datasets.items():
-        path = output_dir / filenames[name]
-        path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
-        artifacts[name] = {"path": filenames[name], "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "count": len(rows)}
-    manifest: dict[str, Any] = {"schema": "possession-engine-v3", "schema_version": 1, "config": config, "artifacts": artifacts}
-    manifest["artifacts"]["manifest"] = {"path": "possession_v3_manifest.json"}
-    manifest_hash = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    manifest["artifacts"]["manifest"]["sha256"] = manifest_hash
-    (output_dir / "possession_v3_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    return manifest
+    staging_path = Path(tempfile.mkdtemp(prefix=".possession-v3-", dir=output_dir))
+    published_generation = False
+    try:
+        generation_stage = staging_path / "generation"
+        generation_stage.mkdir()
+        for name, rows in datasets.items():
+            path = generation_stage / filenames[name]
+            path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
+            artifacts[name] = {"path": f"possession_v3/generations/{generation_id}/{filenames[name]}",
+                               "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "count": len(rows)}
+        manifest: dict[str, Any] = {"schema": "possession-engine-v3", "schema_version": V3_CONTRACT_VERSION,
+                                    "generation": generation_id, "config": config, "artifacts": artifacts}
+        manifest["artifacts"]["manifest"] = {"path": "possession_v3_manifest.json"}
+        manifest["artifacts"]["manifest"]["sha256"] = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        pointer_stage = staging_path / "possession_v3_manifest.json"
+        pointer_stage.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        generation_root.mkdir(parents=True, exist_ok=True)
+        if generation_path.exists():
+            shutil.rmtree(generation_stage)
+        else:
+            os.replace(generation_stage, generation_path)
+            published_generation = True
+        os.replace(pointer_stage, manifest_path)
+        try:
+            for path in old_root_files:
+                path.unlink(missing_ok=True)
+            _prune_v3_generations(generation_root, current=generation_id)
+        except OSError:
+            pass
+        return manifest
+    except Exception:
+        if published_generation:
+            shutil.rmtree(generation_path, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(staging_path, ignore_errors=True)
+
+
+def _prune_v3_generations(root: Path, *, current: str) -> None:
+    """Retain the current generation plus one rollback generation."""
+    generations = sorted((path for path in root.iterdir() if path.is_dir()),
+                         key=lambda path: (path.name == current, path.stat().st_mtime), reverse=True)
+    for path in generations[V3_GENERATION_RETENTION:]:
+        shutil.rmtree(path, ignore_errors=True)
+    now = time.time()
+    for path in root.parent.parent.glob(".possession-v3-*"):
+        try:
+            if path.is_dir() and now - path.stat().st_mtime > V3_STAGING_MAX_AGE_SECONDS:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
 
 
 class TrackWriter:

@@ -12,6 +12,13 @@ if TYPE_CHECKING:
 
 V3_CONTRACT_VERSION = 1
 V3_INPUT_CONTRACT_VERSION = 1
+DEFAULT_CANDIDATE_AMBIGUITY_MARGIN = 0.1
+MIN_CANDIDATE_SCORE = 0.5
+MASK_SCORE_WEIGHT = 0.35
+BBOX_SCORE_WEIGHT = 0.35
+PLAYER_CONFIDENCE_WEIGHT = 0.15
+BALL_QUALITY_WEIGHT = 0.10
+PREVIOUS_HOLDER_WEIGHT = 0.10
 class _ValueEnum(str, Enum):
     def __str__(self) -> str:
         return self.value
@@ -277,7 +284,8 @@ def _identity_key(row):
 def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1):
     """Return deterministic, explainable CandidateEvidence for one ball row."""
     point = _point(ball)
-    quality = float(ball.get("confidence", ball.get("score", 0.0))) if isinstance(ball, dict) else 0.0
+    quality_value = ball.get("confidence", ball.get("score", 0.0)) if isinstance(ball, dict) else 0.0
+    quality = float(quality_value) if type(quality_value) in {int, float} and math.isfinite(float(quality_value)) else 0.0
     quality = max(0.0, min(1.0, quality))
     output = []
     for row in players or []:
@@ -299,17 +307,27 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
         elif box_hit: geometry, mask = .7, 0.0
         else: geometry, mask = 0.0, 0.0
         if not geometry: reasons.append("outside_dynamic_player_region")
-        confidence = float(row.get("confidence", row.get("player_confidence", 0.0))) if isinstance(row, dict) else 0.0
+        confidence_value = row.get("confidence", row.get("player_confidence", 0.0)) if isinstance(row, dict) else 0.0
+        confidence_valid = type(confidence_value) in {int, float} and math.isfinite(float(confidence_value))
+        confidence = float(confidence_value) if confidence_valid else 0.0
         confidence = max(0.0, min(1.0, confidence))
+        if not confidence_valid:
+            reasons.append("non_finite_confidence")
         prior = 1.0 if stable == previous_holder else 0.0
-        contributions = {"mask": mask * .35, "bbox": geometry * .35, "player_confidence": confidence * .15,
-                         "ball_quality": quality * .10, "previous_holder": prior * .10}
+        contributions = {"mask": mask * MASK_SCORE_WEIGHT, "bbox": geometry * BBOX_SCORE_WEIGHT,
+                         "player_confidence": confidence * PLAYER_CONFIDENCE_WEIGHT,
+                         "ball_quality": quality * BALL_QUALITY_WEIGHT,
+                         "previous_holder": prior * PREVIOUS_HOLDER_WEIGHT}
         score = sum(contributions.values()) if not reasons or reasons == ["outside_dynamic_player_region"] else 0.0
         if reasons and reasons != ["outside_dynamic_player_region"]: score = 0.0
         fallback = f"raw:{raw}" if stable is None and raw is not None else None
         output.append(CandidateEvidence(stable, raw, team if type(team) is int and team >= 0 else None,
                                         min(1.0, score), contributions, reasons, fallback))
-    return sorted(output, key=lambda c: (-c.score, c.stable_player_id or "", c.raw_track_id or 0))
+    output = sorted(output, key=lambda c: (-c.score, c.stable_player_id or "", c.raw_track_id or 0))
+    if len(output) > 1 and output[0].score - output[1].score < max(0.0, ambiguity_margin):
+        output = [replace(candidate, rejected_reasons=candidate.rejected_reasons + ["ambiguous_margin"])
+                  for candidate in output]
+    return output
 
 
 class PossessionResolver:
@@ -359,7 +377,7 @@ class PossessionResolver:
                 return self._observation(frame_index, PossessionState.NO_POSSESSION, candidates=candidates, reason=("no_valid_candidate",))
             if len(candidates) > 1 and candidates[0].score - candidates[1].score < self.hysteresis:
                 return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates, reason=("insufficient_margin",))
-            if top.score < .5 and self.holder is None:
+            if top.score < MIN_CANDIDATE_SCORE and self.holder is None:
                 return self._observation(frame_index, PossessionState.CANDIDATE, top, candidates, ("weak_candidate",))
             if self.holder is None:
                 self.holder = self._key(top); self.holder_stable, self.holder_raw = top.stable_player_id, top.raw_track_id
@@ -622,9 +640,11 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
     return sorted(result, key=lambda item: (item["frame_index"], order[item["primitive_type"]]))
 
 
-def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_seconds=.3, release_persistence_frames=2, reception_persistence_frames=2):
+def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_seconds=.3, release_persistence_frames=2, reception_persistence_frames=2, event_window_seconds=None):
     ball_rows = list(ball_rows)
     _reject_duplicate_ball_frames(ball_rows)
+    if event_window_seconds is not None and (type(event_window_seconds) not in {int, float} or not math.isfinite(float(event_window_seconds)) or event_window_seconds <= 0):
+        raise ValueError("event_window_seconds must be positive and finite")
     primitives = derive_ball_primitives(ball_rows, possession_states, real_fps=real_fps, loose_seconds=loose_seconds, release_persistence_frames=release_persistence_frames, reception_persistence_frames=reception_persistence_frames)
     if not primitives:
         return []
@@ -633,23 +653,32 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
         return []
     holders = _holder_by_frame(possession_states)
     teams = _team_by_frame(possession_states)
-    release = next(item for item in grouped if item["primitive_type"] == "BALL_RELEASE")
-    reception = next(item for item in grouped if item["primitive_type"] == "BALL_RECEPTION")
-    refs = sorted({ref for item in grouped for ref in item["provenance"]["source_records"]})
-    start_holder = holders.get(release["frame_index"] - 1)
-    end_holder = holders.get(reception["frame_index"])
-    start_row = next(row for row in ball_rows if row.get("frame_index") == release["frame_index"])
-    end_row = next(row for row in ball_rows if row.get("frame_index") == reception["frame_index"])
-    start_time, end_time = start_row.get("timestamp_seconds"), end_row.get("timestamp_seconds")
-    duration = (float(end_time) - float(start_time)) if start_time is not None and end_time is not None else (reception["frame_index"] - release["frame_index"]) / float(real_fps)
-    return [BallTransition(f"ball-transition-{release['frame_index']}", start_holder, end_holder,
-                           [item["primitive_type"] for item in grouped],
-                           Provenance(refs, sorted({frame for item in grouped for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
-                           frame_start=release["frame_index"], frame_end=reception["frame_index"], confidence=.5,
-                           source_team_id=teams.get(release["frame_index"] - 1), destination_team_id=teams.get(reception["frame_index"]),
-                            duration_seconds=duration, timestamp_start=start_time, timestamp_end=end_time,
-                            release_evidence=True, reception_evidence=True,
-                           trajectory_evidence=True, score_margin=None)]
+    transitions = []
+    releases = [index for index, item in enumerate(grouped) if item["primitive_type"] == "BALL_RELEASE"]
+    for release_index in releases:
+        release = grouped[release_index]
+        reception = next((item for item in grouped[release_index + 1:] if item["primitive_type"] == "BALL_RECEPTION"), None)
+        if reception is None:
+            continue
+        end_index = grouped.index(reception, release_index + 1) + 1
+        segment = grouped[release_index:end_index]
+        start_holder = holders.get(release["frame_index"] - 1)
+        end_holder = holders.get(reception["frame_index"])
+        start_row = next(row for row in ball_rows if row.get("frame_index") == release["frame_index"])
+        end_row = next(row for row in ball_rows if row.get("frame_index") == reception["frame_index"])
+        start_time, end_time = start_row.get("timestamp_seconds"), end_row.get("timestamp_seconds")
+        duration = (float(end_time) - float(start_time)) if start_time is not None and end_time is not None else (reception["frame_index"] - release["frame_index"]) / float(real_fps)
+        if event_window_seconds is not None and duration > event_window_seconds:
+            continue
+        refs = sorted({ref for item in segment for ref in item["provenance"]["source_records"]})
+        transitions.append(BallTransition(f"ball-transition-{release['frame_index']}", start_holder, end_holder,
+                             [item["primitive_type"] for item in segment],
+                             Provenance(refs, sorted({frame for item in segment for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
+                             frame_start=release["frame_index"], frame_end=reception["frame_index"], confidence=.5,
+                             source_team_id=teams.get(release["frame_index"] - 1), destination_team_id=teams.get(reception["frame_index"]),
+                             duration_seconds=duration, timestamp_start=start_time, timestamp_end=end_time,
+                             release_evidence=True, reception_evidence=True, trajectory_evidence=True, score_margin=None))
+    return transitions
 
 
 def classify_transition(transition, *, rapid_seconds=.3, proximity_threshold=80.0,

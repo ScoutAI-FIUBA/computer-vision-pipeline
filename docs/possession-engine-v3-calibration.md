@@ -9,14 +9,15 @@ start Modal, and does not load a model.
 4. Run:
 
 ```bash
-python -m pipeline.calibration labels.jsonl report.json --profile pilot
+python -m pipeline.calibration labels.jsonl report.json --profile pilot \
+  --legacy-comparison legacy-metrics.json --v2-comparison v2-metrics.json
 ```
 
 The report includes raw and benchmark-input SHA-256 values. The latter hashes clips plus profile, thresholds, feature flag, fixture reference, clip bounds, calibration mode, and configuration, so reruns are reproducible and traceable. Without labeled frames/events, metrics are `null`; the report is descriptive only and must not be presented as benchmark quality. A single clip is always non-authoritative and cannot promote.
 
 ## Fixture fields
 
-Each clip requires a unique `clip_id`, has `frames`, and may declare `difficulty` as `easy`, `medium`, or `hard`. Clip boundaries are mandatory so recovery metrics cannot join adjacent clips. Optional primitive/semantic event lists are supported.
+Each clip requires a unique `clip_id`, has `frames`, and may declare `difficulty` as `easy`, `medium`, or `hard`. Clip boundaries are mandatory so recovery metrics cannot join adjacent clips. Optional primitive/semantic event lists are supported. The CLI requires JSON comparison metric objects for both Legacy and V2; each must contain known metric names with finite numeric values between 0 and 1. Arbitrary non-empty JSON is rejected and cannot promote.
 Frame fields are `frame_index`, `predicted_holder`, `ground_truth_holder`, and
 optional `predicted_state`. Event matching uses `(clip_id, event_type, frame_index)`;
 events from different clips never match.

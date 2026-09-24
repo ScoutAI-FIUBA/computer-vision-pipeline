@@ -24,21 +24,38 @@ DEFAULT_THRESHOLDS = {"coverage": .8, "holder_accuracy": .8, "false_holder_rate"
                       "primitive_recall": .8, "primitive_f1": .8, "semantic_precision": .8,
                       "semantic_recall": .8, "semantic_f1": .8}
 _HIGHER_IS_BETTER = {"coverage", "holder_accuracy", "primitive_precision", "primitive_recall",
-                     "primitive_f1", "semantic_precision", "semantic_recall", "semantic_f1"}
+                     "primitive_f1", "semantic_precision", "semantic_recall", "semantic_f1",
+                     "grace_recovery_rate", "unknown_recovery_rate"}
+_COMPARISON_METRICS = set(DEFAULT_THRESHOLDS) | {"unknown_rate", "contested_rate", "fragmentation"}
 
 
 def load_clips(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _events(rows: Iterable[tuple[str, Iterable[Mapping]]]) -> set[tuple]:
-    return {(clip_id, row.get("event_type", row.get("type")), row.get("frame_index"))
-            for clip_id, batch in rows for row in batch}
+def _events(rows: Iterable[tuple[str, Iterable[Mapping]]]) -> tuple[set[tuple], bool]:
+    events = set()
+    valid = True
+    for clip_id, batch in rows:
+        if not isinstance(batch, Iterable) or isinstance(batch, (str, bytes, Mapping)):
+            valid = False
+            continue
+        for row in batch:
+            event_type = row.get("event_type", row.get("type")) if isinstance(row, Mapping) else None
+            frame = row.get("frame_index") if isinstance(row, Mapping) else None
+            if not isinstance(event_type, str) or not event_type.strip() or type(frame) is not int or frame < 0:
+                valid = False
+                continue
+            events.add((clip_id, event_type, frame))
+    return events, valid
 
 
 def _prf(predicted: Iterable[tuple[str, Iterable[Mapping]]],
          truth: Iterable[tuple[str, Iterable[Mapping]]]) -> dict[str, float | None]:
-    actual, expected = _events(predicted), _events(truth)
+    actual, actual_valid = _events(predicted)
+    expected, expected_valid = _events(truth)
+    if not actual_valid or not expected_valid:
+        return {"precision": None, "recall": None, "f1": None}
     if not expected:
         return {"precision": None, "recall": None, "f1": None}
     true_positive = len(actual & expected)
@@ -60,9 +77,18 @@ def _validated_thresholds(thresholds):
         raise ValueError("thresholds must be known finite values between 0 and 1")
     return values
 def _has_comparison_evidence(comparison) -> bool:
-    return (isinstance(comparison, Mapping) and
-            all(isinstance(comparison.get(name), Mapping) and bool(comparison[name])
-                for name in ("legacy", "v2")))
+    if not isinstance(comparison, Mapping):
+        return False
+    for name in ("legacy", "v2"):
+        metrics = comparison.get(name)
+        if not isinstance(metrics, Mapping) or not metrics:
+            return False
+        if any(key not in _COMPARISON_METRICS for key in metrics):
+            return False
+        if any(type(value) not in {int, float} or not math.isfinite(float(value)) or not 0 <= value <= 1
+               for value in metrics.values()):
+            return False
+    return True
 def evaluate_clips(clips: Iterable[Mapping], *, profile: str = "default", thresholds=None,
                    feature_flag: str = "v3", benchmark_reference: str = "calibration-fixture",
                    configuration: Mapping | None = None, comparison: Mapping | None = None,
@@ -133,8 +159,8 @@ def evaluate_clips(clips: Iterable[Mapping], *, profile: str = "default", thresh
     for kind in ("primitive", "semantic"):
         predicted_events = [event for clip in clips for event in clip.get(f"{kind}_events", [])]
         truth_events = [event for clip in clips for event in clip.get(f"ground_truth_{kind}_events", [])]
-        by_type = lambda events: {name: sum(event.get("event_type", event.get("type")) == name for event in events)
-                                  for name in sorted({event.get("event_type", event.get("type")) for event in events}, key=str)}
+        by_type = lambda events: {name: sum(isinstance(event, Mapping) and event.get("event_type", event.get("type")) == name for event in events)
+                                  for name in sorted({event.get("event_type", event.get("type")) for event in events if isinstance(event, Mapping)}, key=str)}
         event_counts[kind] = {"predicted": len(predicted_events), "ground_truth": len(truth_events),
                               "predicted_by_type": by_type(predicted_events), "ground_truth_by_type": by_type(truth_events)}
     if calibration_mode not in {"benchmark", "non_authoritative"}:
@@ -201,8 +227,14 @@ def main() -> None:
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--profile", default="default", choices=sorted(PROFILES))
+    parser.add_argument("--legacy-comparison", type=Path, required=True,
+                        help="JSON object containing legacy comparison metrics")
+    parser.add_argument("--v2-comparison", type=Path, required=True,
+                        help="JSON object containing V2 comparison metrics")
     args = parser.parse_args()
-    write_report(args.input, args.output, profile=args.profile)
+    comparison = {"legacy": json.loads(args.legacy_comparison.read_text(encoding="utf-8")),
+                  "v2": json.loads(args.v2_comparison.read_text(encoding="utf-8"))}
+    write_report(args.input, args.output, profile=args.profile, comparison=comparison)
 
 
 if __name__ == "__main__":

@@ -206,6 +206,19 @@ def test_scoring_rejects_bad_identity_and_persists_competition_margin():
     assert result[0].score == result[1].score and result[2].rejected_reasons
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_scoring_fails_closed_for_non_finite_confidence(value):
+    result = score_candidates([_player("a", (0, 0, 20, 20), confidence=value)], {"x": 10, "y": 10})
+    assert result[0].score == 0.0
+    assert "non_finite_confidence" in result[0].rejected_reasons
+
+
+def test_scoring_wires_ambiguity_margin_into_candidate_reasons():
+    result = score_candidates([_player("a", (0, 0, 20, 20)), _player("b", (0, 0, 20, 20))],
+                               {"x": 10, "y": 10}, ambiguity_margin=1.0)
+    assert all("ambiguous_margin" in candidate.rejected_reasons for candidate in result)
+
+
 def test_resolver_uses_stable_identity_and_hysteresis_against_one_frame_switch():
     resolver = PossessionResolver(real_fps=10, hysteresis_margin=.15, persistence_seconds=.2)
     a = CandidateEvidence("stable-a", 1, 1, .8, {"geometry": .8})
@@ -440,6 +453,21 @@ def test_release_requires_persistent_separation_and_transit_has_trajectory():
     assert [item["primitive_type"] for item in primitives] == ["BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"]
     assert primitives[1]["provenance"]["frame_indices"] == [1, 2]
     assert derive_ball_transitions(rows, [_pos(0, "a"), _pos(1, None), _pos(2, None), _pos(3, "b"), _pos(4, "b")], real_fps=10)
+
+
+def test_ball_transitions_emits_every_qualifying_transition():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(10)], real_fps=10, max_gap_frames=1)
+    states = [_pos(i, "a" if i == 0 else "b" if i in (3, 4) else "c" if i == 5 else "d" if i in (8, 9) else None)
+              for i in range(10)]
+    transitions = derive_ball_transitions(rows, states, real_fps=10)
+    assert [transition.transition_id for transition in transitions] == ["ball-transition-1", "ball-transition-6"]
+
+
+def test_event_window_rejects_over_window_but_keeps_in_window_transition():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(5)], real_fps=10, max_gap_frames=1)
+    states = [_pos(0, "a"), _pos(1, None), _pos(2, None), _pos(3, "b"), _pos(4, "b")]
+    assert derive_ball_transitions(rows, states, real_fps=10, event_window_seconds=.2) == []
+    assert len(derive_ball_transitions(rows, states, real_fps=10, event_window_seconds=.5)) == 1
 
 
 def test_primitives_preserve_available_source_timestamp_ranges():

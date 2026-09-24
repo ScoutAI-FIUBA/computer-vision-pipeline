@@ -49,7 +49,7 @@ from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.possession_v3 import (
     PossessionResolver, derive_ball_primitives, derive_ball_transitions, classify_transition,
-    normalize_ball_rows, score_candidates,
+    normalize_ball_rows, score_candidates, V3_CONTRACT_VERSION,
 )
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
@@ -90,7 +90,7 @@ def _possession_result_config(config: PipelineConfig, base: dict) -> dict:
     return {
         **base,
         "possession_engine": "v3",
-        "possession_v3_schema_version": 1,
+        "possession_v3_schema_version": V3_CONTRACT_VERSION,
     }
 
 TRACKS_FILENAME = "tracks.jsonl"
@@ -128,7 +128,7 @@ def _frame_timestamp_seconds(frame_index: int, fps: float) -> float | None:
     return None if fps <= 0 else frame_index / fps
 
 
-def _write_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig) -> dict:
+def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig) -> dict:
     """Run the additive V3 path; legacy files are never read or rewritten."""
     if not config.possession_v3_enabled:
         return {}
@@ -154,13 +154,58 @@ def _write_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
         observations.append(observation)
     normalized = normalize_ball_rows(ball_rows, real_fps=fps, config=config)
     primitives = derive_ball_primitives(normalized, observations, real_fps=fps)
-    transitions = derive_ball_transitions(normalized, observations, real_fps=fps)
+    transitions = derive_ball_transitions(normalized, observations, real_fps=fps,
+                                          event_window_seconds=config.possession_v3_event_window_seconds)
     events = [event for transition in transitions for event in classify_transition(transition)]
     manifest = write_v3_artifacts(output_dir, observations, primitives, transitions, events,
                                   {"profile": config.possession_v3_calibration_profile,
-                                   "input_contract_version": config.possession_v3_input_contract_version,
-                                   "engine": "v3"})
+                                    "input_contract_version": config.possession_v3_input_contract_version,
+                                    "event_window_seconds": config.possession_v3_event_window_seconds,
+                                    "engine": "v3"})
+    manifest["observability"] = {"status": "complete", "phase": "artifact_write",
+                                  "counts": {"observations": len(observations), "primitives": len(primitives),
+                                             "transitions": len(transitions), "events": len(events)},
+                                  "elapsed_seconds": 0.0, "error": None}
     return manifest
+
+
+def _write_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig) -> dict:
+    """Keep optional V3 diagnostics non-authoritative when they fail."""
+    if not config.possession_v3_enabled:
+        return {}
+    started = time.monotonic()
+    try:
+        manifest = _build_v3_artifacts(output_dir, rows, ball_rows, fps=fps, config=config)
+        manifest["observability"]["elapsed_seconds"] = round(time.monotonic() - started, 6)
+        try:
+            (output_dir / "possession_v3_failure.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            logger.info("v3_observability %s", json.dumps(manifest["observability"], sort_keys=True))
+        except Exception:
+            pass
+        return manifest
+    except Exception as error:
+        failure = {"schema": "possession-engine-v3", "schema_version": V3_CONTRACT_VERSION,
+                   "status": "failed", "error": f"{type(error).__name__}: {error}",
+                   "observability": {"status": "failed", "phase": "artifact_write",
+                                      "counts": {}, "elapsed_seconds": round(time.monotonic() - started, 6),
+                                      "error": f"{type(error).__name__}: {error}"}}
+        try:
+            (output_dir / "possession_v3_failure.json").write_text(json.dumps(failure, sort_keys=True), encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            logger.error("v3_observability %s", json.dumps(failure["observability"], sort_keys=True))
+        except Exception:
+            pass
+        return failure
+
+
+def _v3_artifact_path(manifest: dict, name: str) -> str | None:
+    artifact = manifest.get("artifacts", {}).get(name)
+    return artifact.get("path") if isinstance(artifact, dict) else None
 
 
 def _split_detection_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -948,11 +993,12 @@ def run_stats_from_v2_observations(
         shot_evidence_file=SHOT_EVIDENCE_FILENAME, ball_tracks_file=BALL_TRACKS_FILENAME,
         possession_events_file=POSSESSION_EVENTS_FILENAME,
          possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
-         possession_v3_file=POSSESSION_V3_FILENAME if v3_manifest else None,
-         possession_v3_transitions_file=BALL_TRANSITIONS_V3_FILENAME if v3_manifest else None,
-         possession_v3_events_file=POSSESSION_EVENTS_V3_FILENAME if v3_manifest else None,
-         possession_v3_manifest_file=POSSESSION_V3_MANIFEST_FILENAME if v3_manifest else None,
-         possession_v3_schema_version=1 if v3_manifest else None,
+         possession_v3_file=_v3_artifact_path(v3_manifest, "possession") if v3_manifest and v3_manifest.get("status") != "failed" else None,
+         possession_v3_transitions_file=_v3_artifact_path(v3_manifest, "transitions") if v3_manifest and v3_manifest.get("status") != "failed" else None,
+         possession_v3_events_file=_v3_artifact_path(v3_manifest, "events") if v3_manifest and v3_manifest.get("status") != "failed" else None,
+         possession_v3_manifest_file=POSSESSION_V3_MANIFEST_FILENAME if v3_manifest and v3_manifest.get("status") != "failed" else None,
+          possession_v3_schema_version=V3_CONTRACT_VERSION if v3_manifest and v3_manifest.get("status") != "failed" else None,
+          possession_v3_observability=v3_manifest.get("observability") if v3_manifest else None,
          artifact_references={
             "possession_events": {"file": possession_path.name, "schema_version": 1},
             "possession_transitions": {
@@ -960,7 +1006,7 @@ def run_stats_from_v2_observations(
                 "event_types": ["pass", "steal", "turnover", "lost_possession"],
             },
             **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
-                                  "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest else {}),
+                                   "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
         },
     )
     emit("artifact writing start")
@@ -1574,12 +1620,13 @@ def run_pipeline(
         max_frame_gap=config.possession_transition_max_gap,
     )
     v3_manifest = _write_v3_artifacts(output_dir, _load_jsonl_rows(tracks_path), ball_rows, fps=info.fps, config=config)
-    if v3_manifest:
-        results.possession_v3_file = POSSESSION_V3_FILENAME
-        results.possession_v3_transitions_file = BALL_TRANSITIONS_V3_FILENAME
-        results.possession_v3_events_file = POSSESSION_EVENTS_V3_FILENAME
+    if v3_manifest and v3_manifest.get("status") != "failed":
+        results.possession_v3_file = _v3_artifact_path(v3_manifest, "possession")
+        results.possession_v3_transitions_file = _v3_artifact_path(v3_manifest, "transitions")
+        results.possession_v3_events_file = _v3_artifact_path(v3_manifest, "events")
         results.possession_v3_manifest_file = POSSESSION_V3_MANIFEST_FILENAME
-        results.possession_v3_schema_version = 1
+        results.possession_v3_schema_version = V3_CONTRACT_VERSION
+    results.possession_v3_observability = v3_manifest.get("observability") if v3_manifest else None
     results.artifact_references = {
         "possession_events": {
             "file": possession_path.name,
@@ -1592,7 +1639,7 @@ def run_pipeline(
             "event_types": ["pass", "steal", "turnover", "lost_possession"],
         },
         **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
-                              "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest else {}),
+                              "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
     }
 
     # One line per suspected swap, so a run can be reviewed without watching the
