@@ -743,3 +743,29 @@ def test_render_frame_shows_v3_state_scores_transition_and_event(tmp_path: Path,
     assert any("EVENT WINDOW: 4-8" in call for call in calls)
     assert any("EVENT PROVENANCE: t1" in call for call in calls)
     assert any("EVENT REASONS: release_trajectory_reception" in call for call in calls)
+
+
+def test_render_frame_exposes_contested_candidates_and_margin(tmp_path: Path):
+    frame = np.zeros((80, 120, 3), dtype=np.uint8)
+    rendered = render_frame(
+        frame,
+        [],
+        tmp_path,
+        v3_observation={"state": "CONTESTED", "stable_player_id": None,
+                        "score": .82, "score_margin": .03,
+                        "candidates": [{"score": .82}, {"score": .79}]},
+    )
+
+    expected = frame.copy()
+    cv2.putText(expected, "HOLDER: NONE STATE: CONTESTED", (6, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(expected, "SCORE: 0.82 MARGIN: 0.03", (6, 36),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(expected, "CANDIDATES: 0.82,0.79", (6, 52),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Compare rendered glyphs, especially the candidate label's expected area.
+    for y_start, y_end in ((11, 21), (27, 37), (43, 53)):
+        actual = rendered[y_start:y_end, 6:120]
+        assert np.any(actual != frame[y_start:y_end, 6:120])
+        assert np.array_equal(actual, expected[y_start:y_end, 6:120])

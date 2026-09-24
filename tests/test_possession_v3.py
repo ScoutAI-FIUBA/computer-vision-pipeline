@@ -470,6 +470,24 @@ def test_event_window_rejects_over_window_but_keeps_in_window_transition():
     assert len(derive_ball_transitions(rows, states, real_fps=10, event_window_seconds=.5)) == 1
 
 
+def test_near_edge_ball_transition_without_court_evidence_stays_unknown():
+    rows = normalize_ball_rows([_ball(0, 1, 40), _ball(1, 2, 40), _ball(2, 3, 40),
+                                _ball(3, 4, 40), _ball(4, 5, 40)], real_fps=10, max_gap_frames=1)
+    states = [
+        {"frame_index": 0, "stable_player_id": "a", "team_id": 1},
+        {"frame_index": 1, "stable_player_id": None, "team_id": None},
+        {"frame_index": 2, "stable_player_id": None, "team_id": None},
+        {"frame_index": 3, "stable_player_id": "b", "team_id": 2},
+        {"frame_index": 4, "stable_player_id": "b", "team_id": 2},
+    ]
+
+    transitions = derive_ball_transitions(rows, states, real_fps=10)
+
+    assert len(transitions) == 1
+    assert all("OUT_OF_BOUNDS" not in transition.primitive_types for transition in transitions)
+    assert classify_transition(transitions[0])[-1].event_type is EventType.UNKNOWN
+
+
 def test_primitives_preserve_available_source_timestamp_ranges():
     rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(5)], real_fps=10, max_gap_frames=1)
     primitives = derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, None), _pos(3, "b"), _pos(4, "b")], real_fps=10)
