@@ -100,6 +100,16 @@ def test_from_env_reads_opt_in_v3_engine_and_profile(monkeypatch):
     assert (config.possession_engine, config.possession_v3_grace_seconds, config.possession_v3_calibration_profile) == ("v3", 0.4, "pilot")
 
 
+def test_from_env_preserves_legacy_possession_default(monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.delenv("POSSESSION_ENGINE", raising=False)
+
+    config = PipelineConfig.from_env()
+
+    assert config.possession_engine == "legacy"
+    assert config.possession_v3_enabled is False
+
+
 @pytest.mark.parametrize("field,value", [("possession_v3_hysteresis_margin", float("nan")), ("possession_v3_persistence_seconds", float("inf")), ("possession_v3_event_window_seconds", "bad"), ("possession_v3_input_contract_version", 1.5)])
 def test_pipeline_config_rejects_invalid_v3_numeric_values(field, value):
     with pytest.raises((ValueError, TypeError)):

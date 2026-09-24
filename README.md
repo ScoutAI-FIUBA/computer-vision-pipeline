@@ -22,6 +22,15 @@ High-level flow:
 
 `stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/shot_events.jsonl`, `stats/shot_evidence.jsonl`, `stats/possession_events.jsonl`, `stats/possession_transitions.jsonl`, and `stats/ball_tracks.jsonl` use the legacy contracts and are referenced in the V2 manifest with relative paths, sizes, and hashes. The V2 adapter does not produce `numbers.json` because V2 observations contain no jersey-number evidence, so `numbers_file` remains nullable. The adapter carries through V2 raw/stable IDs, boxes, team IDs, confidence, state, and frame indices. For stats geometry, rows marked `bbox_coordinate_space: "normalized"` are converted to pixel `xyxy` using the probed video dimensions; pixel or unspecified legacy rows are preserved. Ball tracking remains an independent pass: the V2 Modal image enables TrackNet by default from the mounted `tracknet-data` Volume at `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`; local callers can enable it with `TRACKNET_ENABLED=1` and `TRACKNET_CHECKPOINT`. If TrackNet is disabled, exact V2 frames receive lost ball evidence rather than fabricated data. Shot detection keeps its own model pass, then shot evidence, possession, and transitions join to the supplied V2 player rows.
 
+The V2 Modal image sets `POSSESSION_ENGINE=v3`, so its existing stats adapter also writes the additive V3 artifacts. Run it with:
+
+```bash
+modal run modal_app_v2.py --video-path clips/game_03.mp4 \
+  --frame-start 60 --frame-end 130 --output-dir outputs/v2-game
+```
+
+Expected V3 outputs under the returned `stats/` directory are `possession_v3_manifest.json` and generation-scoped `possession_v3/` artifacts for possession rows, transitions, and events. The legacy `modal_app.py` image does not set this variable and keeps the global default unchanged.
+
 ### Conservative temporal BBox sanitizer
 
 Set `BBOX_SANITIZER_ENABLED=1` to run the offline V2 sanitizer before ReID and team identification; leave it at `0` for compatibility runs. Correction precedence is **mask cleanup → temporal interpolation → unresolved**. Mask cleanup uses connected components and conservative temporal evidence, writes optional `clean_mask_ref` artifacts under `masks_clean/`, and leaves the raw mask and `raw_bbox` available for provenance. Component areas are compared in the same units as the mask: normalized player boxes are converted to mask-pixel units before validation. If cleanup cannot produce one defensible component, the existing temporal interpolator may correct only a bounded multi-signal gap; otherwise the giant raw bbox remains unchanged and is marked `bbox_unresolved`. Initial calibration values are `BBOX_HISTORY_SIZE=15`, `BBOX_MAX_INTERPOLATION_GAP=2`, and `BBOX_SIGNAL_THRESHOLD=3.0`; tune them from reported corrected and unresolved counts, not from a single area threshold.

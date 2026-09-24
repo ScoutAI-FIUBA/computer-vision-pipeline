@@ -75,6 +75,20 @@ PY
 The expected values are `tracknet_enabled: True` and at least one non-lost
 ball row for a clip where TrackNet detects the ball.
 
+The V2 image opts its existing stats adapter into Possession V3 without changing
+the legacy Modal image:
+
+```bash
+modal run modal_app_v2.py --video-path clips/game_03.mp4 \
+  --frame-start 60 --frame-end 130 --output-dir outputs/v2-game
+```
+
+The returned `stats/` directory should contain `possession_v3_manifest.json` and
+generation-scoped files under `possession_v3/` for possession rows, transitions,
+and events. `modal_app.py` remains on the legacy possession engine, and local
+or other callers still default to legacy unless they explicitly set
+`POSSESSION_ENGINE=v3`.
+
 How to get the pipeline running on Modal GPUs. Follow it in order — each step
 gets cheaper to debug if the previous one worked.
 

@@ -82,6 +82,7 @@ image = (
         "TRACKNET_CHECKPOINT": TRACKNET_CHECKPOINT,
         "BALL_ALL_FRAMES": "1",
         "BBOX_SANITIZER_ENABLED": "1",
+        "POSSESSION_ENGINE": "v3",
     })
     .add_local_python_source("pipeline")
     .add_local_file("scripts/ball/tracknet.py", remote_path="/root/scripts/ball/tracknet.py")

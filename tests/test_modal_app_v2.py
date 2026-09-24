@@ -12,7 +12,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def fake_v2_stats(monkeypatch, request):
-    if request.node.name == "test_process_exercises_real_stats_adapter_and_manifest_contract":
+    if request.node.name in {
+        "test_process_exercises_real_stats_adapter_and_manifest_contract",
+        "test_process_uses_v3_image_config_and_returns_v3_artifacts",
+    }:
         return
     import modal_app_v2
 
@@ -112,6 +115,35 @@ def test_v2_image_mounts_and_enables_tracknet_without_sam2():
     assert '"BBOX_SANITIZER_ENABLED": "1"' in source
     assert '"tracknet-data", environment_name="main", create_if_missing=False' in source
     assert 'volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data}' in source
+
+
+def test_v2_image_enables_v3_without_changing_legacy_config(monkeypatch):
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    env_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "env"
+    )
+    env = {
+        key.value: value.value
+        for key, value in zip(env_call.args[0].keys, env_call.args[0].values)
+        if isinstance(key, ast.Constant) and isinstance(value, ast.Constant)
+    }
+    assert env["POSSESSION_ENGINE"] == "v3"
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("POSSESSION_ENGINE", env["POSSESSION_ENGINE"])
+    from pipeline.config import PipelineConfig
+
+    assert PipelineConfig.from_env().possession_v3_enabled is True
+
+    monkeypatch.delenv("POSSESSION_ENGINE")
+    legacy = PipelineConfig.from_env()
+    assert legacy.possession_engine == "legacy"
+    assert legacy.possession_v3_enabled is False
 
 
 def test_v2_image_pins_sam31_runtime_dependencies():
@@ -1085,6 +1117,88 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
         assert reference["size_bytes"] == len(data)
         assert reference["sha256"] == hashlib.sha256(data).hexdigest()
     assert manifest["legacy_stats_results"] == "stats/results.json"
+
+
+def test_process_uses_v3_image_config_and_returns_v3_artifacts(monkeypatch):
+    import modal_app_v2
+    from pipeline.config import PipelineConfig
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("POSSESSION_ENGINE", "v3")
+    configs = []
+    original_from_env = PipelineConfig.from_env
+
+    def from_env(cls):
+        config = original_from_env()
+        configs.append(config)
+        return config
+
+    monkeypatch.setattr(PipelineConfig, "from_env", classmethod(from_env))
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: ([], {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda rows, **_kwargs: types.SimpleNamespace(
+            observations=rows, acceptance={}, acceptance_reasons=[]
+        ),
+    )
+
+    def fake_stats(_video_path, config, output_dir, _observations):
+        assert config.possession_v3_enabled is True
+        output_dir.mkdir(parents=True, exist_ok=True)
+        files = {
+            "results.json": "{}",
+            "tracks.jsonl": "",
+            "teams.json": "{}",
+            "shot_events.jsonl": "",
+        }
+        for name, contents in files.items():
+            (output_dir / name).write_text(contents, encoding="utf-8")
+        generation = output_dir / "possession_v3" / "generations" / "fake-generation"
+        generation.mkdir(parents=True)
+        (generation / "possession_v3.jsonl").write_text("{}\n", encoding="utf-8")
+        manifest = {
+            "schema": "possession-engine-v3",
+            "artifacts": {
+                "manifest": {"path": "possession_v3_manifest.json"},
+                "possession": {
+                    "path": "possession_v3/generations/fake-generation/possession_v3.jsonl"
+                },
+            },
+        }
+        (output_dir / "possession_v3_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        return types.SimpleNamespace(
+            to_dict=lambda: {
+                "tracks_file": "tracks.jsonl",
+                "teams_file": "teams.json",
+                "numbers_file": None,
+                "shot_events_file": "shot_events.jsonl",
+            }
+        )
+
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_observations", fake_stats)
+    cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[
+        next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))
+    ].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60,
+                      return_artifacts=True)
+
+    assert configs and all(config.possession_v3_enabled for config in configs)
+    artifacts = payload["artifacts"]
+    assert "stats/possession_v3_manifest.json" in artifacts
+    manifest = json.loads(artifacts["stats/possession_v3_manifest.json"])
+    pointer = manifest["artifacts"]["possession"]["path"]
+    assert f"stats/{pointer}" in artifacts
 
 
 def test_process_passes_tracked_frames_and_masks_to_v2_runner(monkeypatch):
