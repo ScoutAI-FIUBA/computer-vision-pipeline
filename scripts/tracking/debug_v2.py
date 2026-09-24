@@ -21,7 +21,7 @@ TEAM_COLORS = {
 }
 NEUTRAL_COLOR = (160, 255, 160)
 POSSESSION_STATUSES = {"confirmed", "unknown", "lost", "unassigned"}
-V3_STATES = {"OBSERVED", "INFERRED", "GRACE", "CONTESTED", "NO_POSSESSION", "UNKNOWN", "CANDIDATE", "TRANSITIONING"}
+V3_STATES = {"OBSERVED", "INFERRED", "GRACE", "CONTESTED", "NO_POSSESSION", "UNKNOWN", "CANDIDATE", "TRANSITIONING", "LOST_NO_DETECTION"}
 
 
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
@@ -239,8 +239,23 @@ def render_v3_overlay(frame: np.ndarray, observation: Mapping[str, Any] | None =
     if observation:
         state = str(observation.get("state", "NO_POSSESSION"))
         state = state if state in V3_STATES else "NO_POSSESSION"
-        holder = observation.get("stable_player_id") or observation.get("raw_track_id") or "NONE"
-        labels.append(f"HOLDER: {holder} STATE: {state}")
+        context = observation.get("context") or {}
+        audit = observation.get("audit") or {}
+        holder = (context.get("effective_holder_id") or observation.get("stable_player_id")
+                  or observation.get("raw_track_id") or "NONE")
+        if context:
+            labels.append(f"EFFECTIVE HOLDER: {holder} STATE: {state}")
+            labels.append(f"OBSERVED CANDIDATE: {context.get('observed_candidate_id') or 'NONE'}")
+            labels.append(f"CHALLENGER: {context.get('challenger_id') or 'NONE'}")
+            if "grace_remaining_seconds" in context:
+                labels.append(f"GRACE REMAINING: {context['grace_remaining_seconds']}")
+        else:
+            labels.append(f"HOLDER: {holder} STATE: {state}")
+        if audit.get("clear_reason") is not None:
+            labels.append(f"CLEAR REASON: {audit['clear_reason']}")
+        if any(audit.get(key) is not None for key in ("frame_start", "frame_end", "timestamp_start", "timestamp_end")):
+            labels.append(f"AUDIT WINDOW: {audit.get('frame_start', 'NA')}-{audit.get('frame_end', 'NA')} "
+                          f"{audit.get('timestamp_start', 'NA')}-{audit.get('timestamp_end', 'NA')}")
         if observation.get("score") is not None or observation.get("score_margin") is not None:
             labels.append(f"SCORE: {observation.get('score', 'NA')} MARGIN: {observation.get('score_margin', 'NA')}")
         candidates = observation.get("candidates") or []

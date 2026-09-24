@@ -354,6 +354,44 @@ def test_render_frame_overlays_authoritative_possession_status(status, expected,
     assert calls == [expected]
 
 
+def test_render_v3_overlay_shows_continuity_roles_state_reason_and_windows(monkeypatch):
+    calls = []
+    original_put_text = cv2.putText
+
+    def recording_put_text(image, text, *args, **kwargs):
+        calls.append(text)
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", recording_put_text)
+    debug_v2.render_v3_overlay(
+        np.zeros((160, 320, 3), dtype=np.uint8),
+        {
+            "state": "LOST_NO_DETECTION",
+            "context": {
+                "effective_holder_id": "player-006",
+                "observed_candidate_id": "player-007",
+                "challenger_id": "player-007",
+                "grace_remaining_seconds": 0.0,
+            },
+            "audit": {
+                "last_holder_id": "player-006",
+                "clear_reason": "LOST_NO_DETECTION",
+                "frame_start": 6, "frame_end": 24,
+                "timestamp_start": .2, "timestamp_end": .8,
+            },
+        },
+    )
+
+    rendered = "\n".join(calls)
+    assert "EFFECTIVE HOLDER: player-006" in rendered
+    assert "OBSERVED CANDIDATE: player-007" in rendered
+    assert "CHALLENGER: player-007" in rendered
+    assert "STATE: LOST_NO_DETECTION" in rendered
+    assert "CLEAR REASON: LOST_NO_DETECTION" in rendered
+    assert "GRACE REMAINING: 0.0" in rendered
+    assert "AUDIT WINDOW: 6-24 0.2-0.8" in rendered
+
+
 def test_possession_events_match_frames_without_inference(tmp_path: Path):
     path = tmp_path / "possession_events.jsonl"
     path.write_text(
@@ -434,6 +472,29 @@ def test_render_debug_video_writes_possession_overlay_video(tmp_path: Path):
     # The confirmed event draws the possession banner on the actual encoded frame.
     assert not np.array_equal(first_frame[0:28, 0:32], np.full((28, 32, 3), (20, 30, 200), dtype=np.uint8))
     assert np.linalg.norm(first_frame[4, 4].astype(float) - np.array(debug_v2.color_for_team(1))) < 100
+
+
+def test_render_debug_video_loads_legacy_v3_shape_without_crashing(tmp_path: Path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    artifacts = tmp_path / "artifacts"
+    v3_dir = tmp_path / "v3"
+    output = tmp_path / "legacy-v3-debug.mp4"
+    _write_video(video, count=2)
+    _write_artifacts(artifacts)
+    v3_dir.mkdir()
+    (v3_dir / "possession_v3.jsonl").write_text(json.dumps({
+        "frame_index": 1, "state": "CONTESTED", "stable_player_id": None,
+        "score": .42, "score_margin": .03,
+    }) + "\n")
+    calls = []
+    original = cv2.putText
+    monkeypatch.setattr(cv2, "putText", lambda image, text, *args, **kwargs: (calls.append(text), original(image, text, *args, **kwargs))[1])
+
+    stats = render_debug_video(video, artifacts / "tracks.jsonl", artifacts / "masks", output, v3_dir=v3_dir)
+
+    assert output.is_file()
+    assert stats["frames_written"] == 2
+    assert "HOLDER: NONE STATE: CONTESTED" in calls
 
 
 def test_cli_without_stats_input_remains_backward_compatible(tmp_path: Path, monkeypatch):

@@ -15,7 +15,8 @@ import pytest
 from pipeline.results import PipelineResults, RunSummary, package_artifacts, write_v3_artifacts
 from pipeline.possession_v3 import (
     BallTransition, EventType, PossessionEvent, PossessionObservation,
-    PossessionState, EvidenceKind, Provenance,
+    PossessionState, EvidenceKind, Provenance, PossessionContext, PossessionAudit,
+    ClearReason,
 )
 from pipeline.config import PipelineConfig
 from pipeline.runner import _write_v3_artifacts
@@ -216,6 +217,67 @@ def test_v3_artifacts_are_versioned_hashed_and_deterministic(tmp_path: Path):
     assert (primitive["timestamp_start"], primitive["timestamp_end"]) == (1.0, 1.0)
     assert (transition_row["frame_start"], transition_row["frame_end"]) == (2, 4)
     assert (event_row["frame_start"], event_row["frame_end"]) == (4, 4)
+
+
+def test_v3_artifact_persists_continuity_roles_and_audit_fields(tmp_path: Path):
+    observation = PossessionObservation(
+        7, PossessionState.TRANSITIONING, EvidenceKind.CONTESTED,
+        context=PossessionContext(
+            effective_holder_id="player-006", effective_holder_team=1,
+            observed_candidate_id="player-007", challenger_id="player-007",
+            grace_remaining_seconds=.4,
+        ),
+        audit=PossessionAudit(
+            last_holder_id="player-006", last_holder_team=1,
+            clear_reason=ClearReason.GRACE_EXPIRED,
+            frame_start=5, frame_end=7, timestamp_start=.5, timestamp_end=.7,
+        ),
+    )
+    manifest = write_v3_artifacts(tmp_path, [observation], [], [], [])
+    row = json.loads((tmp_path / manifest["artifacts"]["possession"]["path"]).read_text())
+
+    assert row["schema_version"] == 1
+    assert row["state"] == "TRANSITIONING"
+    assert row["context"]["effective_holder_id"] == "player-006"
+    assert row["context"]["observed_candidate_id"] == "player-007"
+    assert row["context"]["challenger_id"] == "player-007"
+    assert row["context"]["grace_remaining_seconds"] == .4
+    assert row["audit"]["last_holder_id"] == "player-006"
+    assert row["audit"]["clear_reason"] == "GRACE_EXPIRED"
+    assert row["audit"]["frame_start"] == 5 and row["audit"]["timestamp_end"] == .7
+
+
+def test_real_006_007_continuity_artifact_replays_byte_for_byte(tmp_path: Path):
+    config = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3")
+    players = [
+        {"frame_index": frame, "raw_track_id": 6, "stable_player_id": "player-006",
+         "team_id": 1, "xyxy": [0, 0, 20, 20], "confidence": .9}
+        for frame in range(3)
+    ] + [
+        {"frame_index": frame, "raw_track_id": 7, "stable_player_id": "player-007",
+         "team_id": 1, "xyxy": [18, 0, 38, 20], "confidence": .9}
+        for frame in range(3)
+    ]
+    balls = [{"frame_index": frame, "timestamp_seconds": frame / 10, "track_state": "detected",
+              "confidence": .9, "center_xy": [10, 10]} for frame in range(3)]
+    first = _write_v3_artifacts(tmp_path / "first", players, balls, fps=10, config=config)
+    first_rows = {
+        name: [json.loads(line) for line in (tmp_path / "first" / first["artifacts"][name]["path"]).read_text().splitlines()]
+        for name in ("possession", "primitives", "transitions", "events")
+    }
+    second = write_v3_artifacts(tmp_path / "second", first_rows["possession"], first_rows["primitives"],
+                                first_rows["transitions"], first_rows["events"], first["config"])
+    second_rows = {
+        name: [json.loads(line) for line in (tmp_path / "second" / second["artifacts"][name]["path"]).read_text().splitlines()]
+        for name in ("possession", "primitives", "transitions", "events")
+    }
+
+    assert first["generation"] == second["generation"]
+    assert first_rows["possession"][0]["context"]["effective_holder_id"] == "player-006"
+    assert first_rows["possession"][0]["context"]["observed_candidate_id"] == "player-006"
+    for name in ("possession", "primitives", "transitions", "events"):
+        assert first_rows[name] == second_rows[name]
+        assert first["artifacts"][name]["sha256"] == second["artifacts"][name]["sha256"]
 
 
 def test_v3_results_pointers_are_additive_only_when_set():

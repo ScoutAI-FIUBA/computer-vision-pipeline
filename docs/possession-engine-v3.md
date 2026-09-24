@@ -20,7 +20,7 @@ build or publication fails.
 
 | File | Contents |
 |---|---|
-| `possession_v3.jsonl` | Per-frame holder, state, candidates, scores, thresholds, and provenance |
+| `possession_v3.jsonl` | Per-frame holder roles, state, candidates, scores, thresholds, grace, clear reason, audit windows, and provenance |
 | `possession_primitives_v3.jsonl` | Release, transit, reception, and loose-ball primitives |
 | `ball_transitions_v3.jsonl` | Source/target transition windows and evidence |
 | `possession_events_v3.jsonl` | Transfer, PASS, STEAL, loss, turnover, or UNKNOWN labels |
@@ -37,8 +37,23 @@ rejected reasons, and provenance. Debug rendering shows holder state, candidate
 scores/contributions, rejected evidence, transition start/end windows, and
 final event labels.
 
+## Continuity fields
+
+V3 keeps schema version `1` and adds optional `context` and `audit` objects.
+`context` separates `effective_holder_id`, `observed_candidate_id`,
+`challenger_id`, team, and grace fields. `audit` records `last_holder_id/team`,
+`clear_reason`, source quality/authority, and frame/time windows. Existing
+consumers can ignore these fields; missing objects use deterministic defaults.
+
+The debug overlay renders `INFERRED`, `CONTESTED`, `TRANSITIONING`, and
+`LOST_NO_DETECTION`, plus all three holder roles, clear reason, grace remaining,
+and switch/clear audit windows. Transition and event windows remain event-level
+facts, not per-frame semantic claims.
+
 ## Rollback
 
 Set `POSSESSION_ENGINE=legacy` or stop consuming the V3 pointers. Existing
 possession and transition artifacts remain authoritative; no migration is
-required.
+required. Disabled/legacy runs omit V3 pointers and files; re-enabling V3
+produces additive continuity records without upstream model or semantic-event
+changes.
