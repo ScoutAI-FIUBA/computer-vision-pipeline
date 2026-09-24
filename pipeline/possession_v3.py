@@ -43,6 +43,12 @@ class EventType(_ValueEnum):
     LOSS_OF_CONTROL = "LOSS_OF_CONTROL"
     TURNOVER = "TURNOVER"
     UNKNOWN = "UNKNOWN"
+class ClearReason(_ValueEnum):
+    GRACE_EXPIRED = "GRACE_EXPIRED"
+    LOOSE_BALL_CONFIRMED = "LOOSE_BALL_CONFIRMED"
+    OUT_OF_BOUNDS = "OUT_OF_BOUNDS"
+    END_OF_SEGMENT = "END_OF_SEGMENT"
+    EXPLICIT_RESET = "EXPLICIT_RESET"
 def _frame(value: int, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -77,6 +83,13 @@ def _identity(stable, raw, team):
 def _holder(value):
     if value is not None and (type(value) is not str or not value.strip()):
         raise ValueError("holder identity must be a non-empty string when set")
+def _required_text(value, name):
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+def _optional_nonnegative_frame(value, name):
+    if value is not None:
+        _frame(value, name)
 def _thresholds(value):
     if not isinstance(value, dict) or any(type(k) is not str or not k.strip() or type(v) not in {int, float} or not math.isfinite(v) for k, v in value.items()):
         raise ValueError("thresholds/contributions must map names to finite numbers")
@@ -114,6 +127,71 @@ class CandidateEvidence:
         if self.fallback_identity is not None and (type(self.fallback_identity) is not str or not self.fallback_identity.strip()):
             raise ValueError("fallback_identity must be a non-empty string when set")
 @dataclass(frozen=True)
+class PossessionContext:
+    """Serializable roles and temporal state owned by the future resolver."""
+    effective_holder_id: str | None = None
+    effective_holder_team: int | None = None
+    observed_candidate_id: str | None = None
+    challenger_id: str | None = None
+    challenger_start_frame: int | None = None
+    challenger_confirmation_frame: int | None = None
+    grace_start_frame: int | None = None
+    grace_remaining_seconds: float = 0.0
+    last_observed_holder_frame: int | None = None
+    last_observed_holder_score: float | None = None
+
+    def __post_init__(self) -> None:
+        _holder(self.effective_holder_id)
+        if self.effective_holder_team is not None and (type(self.effective_holder_team) is not int or self.effective_holder_team < 0):
+            raise ValueError("effective_holder_team must be a non-negative integer when set")
+        _holder(self.observed_candidate_id)
+        _holder(self.challenger_id)
+        _optional_nonnegative_frame(self.challenger_start_frame, "challenger_start_frame")
+        _optional_nonnegative_frame(self.challenger_confirmation_frame, "challenger_confirmation_frame")
+        _optional_nonnegative_frame(self.grace_start_frame, "grace_start_frame")
+        if self.challenger_start_frame is None and self.challenger_confirmation_frame is not None:
+            raise ValueError("challenger confirmation requires challenger start")
+        if (self.challenger_start_frame is not None and self.challenger_confirmation_frame is not None
+                and self.challenger_confirmation_frame < self.challenger_start_frame):
+            raise ValueError("challenger confirmation must not precede challenger start")
+        if self.challenger_id is None and (self.challenger_start_frame is not None or self.challenger_confirmation_frame is not None):
+            raise ValueError("challenger frames require challenger_id")
+        if type(self.grace_remaining_seconds) not in {int, float} or not math.isfinite(self.grace_remaining_seconds) or self.grace_remaining_seconds < 0:
+            raise ValueError("grace_remaining_seconds must be finite and non-negative")
+        _optional_nonnegative_frame(self.last_observed_holder_frame, "last_observed_holder_frame")
+        _score(self.last_observed_holder_score, "last_observed_holder_score")
+@dataclass(frozen=True)
+class PossessionAudit:
+    last_holder_id: str | None = None
+    last_holder_team: int | None = None
+    clear_reason: ClearReason | None = None
+    switch_confirmed: bool = False
+    observation_quality: str = "unknown"
+    observation_source: str = "unknown"
+    authority: str = "unknown"
+    grace_eligible: bool = False
+    grace_elapsed_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        _holder(self.last_holder_id)
+        if self.last_holder_team is not None and (type(self.last_holder_team) is not int or self.last_holder_team < 0):
+            raise ValueError("last_holder_team must be a non-negative integer when set")
+        if self.clear_reason is not None:
+            object.__setattr__(self, "clear_reason", _enum(self.clear_reason, ClearReason, "clear_reason"))
+        if type(self.switch_confirmed) is not bool:
+            raise ValueError("switch_confirmed must be boolean")
+        quality = _required_text(self.observation_quality, "observation_quality")
+        if quality not in {kind.value for kind in EvidenceKind}:
+            raise ValueError(f"invalid observation_quality: {quality!r}")
+        _required_text(self.observation_source, "observation_source")
+        _required_text(self.authority, "authority")
+        if type(self.grace_eligible) is not bool:
+            raise ValueError("grace_eligible must be boolean")
+        if (type(self.grace_elapsed_seconds) not in {int, float}
+                or not math.isfinite(self.grace_elapsed_seconds)
+                or self.grace_elapsed_seconds < 0):
+            raise ValueError("grace_elapsed_seconds must be finite and non-negative")
+@dataclass(frozen=True)
 class PossessionObservation:
     frame_index: int
     state: PossessionState
@@ -129,6 +207,8 @@ class PossessionObservation:
     profile: str = "default"
     thresholds: dict[str, float] = field(default_factory=dict)
     timestamp_seconds: float | None = None
+    context: PossessionContext = field(default_factory=PossessionContext)
+    audit: PossessionAudit = field(default_factory=PossessionAudit)
 
     def __post_init__(self) -> None:
         _frame(self.frame_index, "frame_index")
@@ -136,6 +216,10 @@ class PossessionObservation:
         object.__setattr__(self, "state", _enum(self.state, PossessionState, "state"))
         if not isinstance(self.provenance, Provenance):
             raise ValueError("provenance must be Provenance")
+        if not isinstance(self.context, PossessionContext):
+            raise ValueError("context must be PossessionContext")
+        if not isinstance(self.audit, PossessionAudit):
+            raise ValueError("audit must be PossessionAudit")
         object.__setattr__(self, "evidence_kind", _enum(self.evidence_kind, EvidenceKind, "evidence_kind"))
         _identity(self.stable_player_id, self.raw_track_id, self.team_id)
         _score(self.score, "score")

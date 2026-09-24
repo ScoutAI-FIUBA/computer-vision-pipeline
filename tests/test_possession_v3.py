@@ -9,7 +9,8 @@ import pytest
 from pipeline.config import PipelineConfig
 from pipeline.possession_v3 import (
     BallTransition, CandidateEvidence, EvidenceKind, EventType, PossessionEvent,
-    PossessionObservation, PossessionState, Provenance, V3_CONTRACT_VERSION,
+    PossessionObservation, PossessionState, Provenance, PossessionContext,
+    PossessionAudit, ClearReason, V3_CONTRACT_VERSION,
     engine_name,
     score_candidates, PossessionResolver,
     normalize_ball_rows, derive_ball_primitives, derive_ball_transitions,
@@ -29,6 +30,102 @@ def test_contract_serialization_is_versioned_and_stable():
     assert payload["state"] == PossessionState.UNKNOWN.value
     assert payload["primitive_types"] == ["release", "transit"]
     assert payload["provenance"]["source_records"] == ["tracks.jsonl#frame=4"]
+
+
+def test_continuity_context_and_audit_are_additive_and_deterministic():
+    context = PossessionContext(
+        effective_holder_id="player-006", effective_holder_team=1,
+        observed_candidate_id="player-007", challenger_id="player-007",
+        challenger_start_frame=20, challenger_confirmation_frame=24,
+        grace_start_frame=18, grace_remaining_seconds=.4,
+        last_observed_holder_frame=17, last_observed_holder_score=.91,
+    )
+    audit = PossessionAudit(
+        last_holder_id="player-006", last_holder_team=1,
+        clear_reason=ClearReason.GRACE_EXPIRED, switch_confirmed=False,
+        observation_quality="inferred", observation_source="ball_tracks.jsonl",
+        authority="stable", grace_eligible=True, grace_elapsed_seconds=.2,
+    )
+    observation = PossessionObservation(
+        20, PossessionState.INFERRED, EvidenceKind.INFERRED,
+        context=context, audit=audit,
+    )
+    payload = asdict(observation)
+    assert payload["context"]["challenger_confirmation_frame"] == 24
+    assert payload["context"]["grace_remaining_seconds"] == .4
+    assert payload["audit"]["clear_reason"] == "GRACE_EXPIRED"
+    assert payload["audit"]["observation_source"] == "ball_tracks.jsonl"
+    assert payload["audit"]["authority"] == "stable"
+    assert payload["audit"]["grace_eligible"] is True
+    assert payload["audit"]["grace_elapsed_seconds"] == .2
+
+
+@pytest.mark.parametrize("reason", list(ClearReason))
+def test_all_clear_reasons_are_serializable(reason):
+    payload = asdict(PossessionAudit(clear_reason=reason))
+    assert payload["clear_reason"] == reason.value
+
+
+def test_non_null_audit_payload_round_trips_through_json():
+    observation = PossessionObservation(
+        20, PossessionState.INFERRED, EvidenceKind.INFERRED,
+        audit=PossessionAudit(
+            last_holder_id="player-006", last_holder_team=1,
+            clear_reason=ClearReason.GRACE_EXPIRED, switch_confirmed=True,
+            observation_quality="inferred", observation_source="ball_tracks.jsonl",
+            authority="stable", grace_eligible=True, grace_elapsed_seconds=.2,
+        ),
+    )
+    decoded = json.loads(json.dumps(asdict(observation), sort_keys=True))
+    audit = decoded["audit"]
+    assert audit["clear_reason"] == "GRACE_EXPIRED"
+    assert audit["last_holder_id"] == "player-006"
+    assert audit["switch_confirmed"] is True
+    assert audit["authority"] == "stable"
+    assert audit["grace_eligible"] is True
+    assert audit["grace_elapsed_seconds"] == .2
+
+
+def test_old_observation_construction_keeps_deterministic_continuity_defaults():
+    payload = asdict(PossessionObservation(1, PossessionState.UNKNOWN, EvidenceKind.UNKNOWN))
+    assert payload["context"] == asdict(PossessionContext())
+    assert payload["audit"] == asdict(PossessionAudit())
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: PossessionContext(effective_holder_id="p", effective_holder_team=-1),
+    lambda: PossessionContext(challenger_start_frame=2, challenger_id=None),
+    lambda: PossessionContext(grace_remaining_seconds=-.1),
+    lambda: PossessionContext(last_observed_holder_score=1.1),
+    lambda: PossessionAudit(clear_reason="NOT_A_REASON"),
+    lambda: PossessionAudit(switch_confirmed="yes"),
+    lambda: PossessionAudit(observation_quality=""),
+    lambda: PossessionAudit(observation_source=""),
+    lambda: PossessionAudit(observation_quality=None),
+    lambda: PossessionAudit(observation_source=None),
+    lambda: PossessionAudit(grace_eligible="yes"),
+    lambda: PossessionAudit(grace_elapsed_seconds=-.1),
+    lambda: PossessionAudit(grace_elapsed_seconds=float("nan")),
+])
+def test_continuity_contract_rejects_invalid_state_or_reason(factory):
+    with pytest.raises(ValueError):
+        factory()
+
+
+@pytest.mark.parametrize("authority", [None, "", 123, {"value": "unsupported"}],
+                         ids=["none", "empty", "non-string", "unsupported"])
+def test_audit_rejects_invalid_authority_values(authority):
+    with pytest.raises(ValueError):
+        PossessionAudit(authority=authority)
+
+
+def test_audit_defaults_keep_legacy_observation_construction_serializable():
+    audit = asdict(PossessionAudit())
+    assert audit["observation_quality"] == "unknown"
+    assert audit["observation_source"] == "unknown"
+    assert audit["authority"] == "unknown"
+    assert audit["grace_eligible"] is False
+    assert audit["grace_elapsed_seconds"] == 0.0
 
 
 def test_vocabulary_and_event_contract_are_explicit():
