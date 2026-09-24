@@ -305,9 +305,20 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
         if stable is None and raw is None: reasons.append("missing_authoritative_identity")
         if type(team) is not int or team < 0: reasons.append("invalid_team")
         if point is None: reasons.append("invalid_ball_geometry")
-        clean = bool(row.get("clean_mask", row.get("mask_clean", False))) if isinstance(row, dict) else False
-        mask_hit = bool(row.get("mask_contains", False)) if isinstance(row, dict) else False
-        if callable(row.get("mask_contains")) and point is not None: mask_hit = bool(row["mask_contains"](*point))
+        clean_value = row.get("clean_mask", row.get("mask_clean", False)) if isinstance(row, dict) else False
+        clean = type(clean_value) is bool and clean_value
+        mask_contains = row.get("mask_contains") if isinstance(row, dict) else None
+        mask_hit = False
+        mask_available = False
+        if callable(mask_contains) and point is not None:
+            try:
+                mask_result = mask_contains(*point)
+            except Exception:
+                mask_result = None
+            if type(mask_result) is bool:
+                mask_hit, mask_available = mask_result, clean
+        elif type(mask_contains) is bool:
+            mask_hit, mask_available = mask_contains, point is not None and clean
         height = (box[3] - box[1]) if isinstance(box, (list, tuple)) and len(box) == 4 else 0
         speed = float(ball.get("speed", 0.0)) if isinstance(ball, dict) and isinstance(ball.get("speed", 0), (int, float)) else 0.0
         margin = max(2.0, height * .15 + speed * .02)
@@ -318,19 +329,38 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
         if not geometry: reasons.append("outside_dynamic_player_region")
         confidence_value = row.get("confidence", row.get("player_confidence")) if isinstance(row, dict) else None
         confidence_available = confidence_value is not None
-        confidence_valid = (
-            not confidence_available
-            or (type(confidence_value) in {int, float} and math.isfinite(float(confidence_value)))
-        )
+        confidence_valid = (not confidence_available or
+                            (type(confidence_value) in {int, float} and
+                             math.isfinite(float(confidence_value)) and
+                             0 <= float(confidence_value) <= 1))
         confidence = float(confidence_value) if confidence_available and confidence_valid else 0.0
         confidence = max(0.0, min(1.0, confidence))
         if not confidence_valid:
-            reasons.append("non_finite_confidence")
+            if type(confidence_value) in {int, float} and not math.isfinite(float(confidence_value)):
+                reasons.append("non_finite_confidence")
+            elif type(confidence_value) in {int, float}:
+                reasons.append("out_of_range_confidence")
+            else:
+                reasons.append("invalid_confidence")
         prior = 1.0 if stable == previous_holder else 0.0
-        contributions = {"mask": mask * MASK_SCORE_WEIGHT, "bbox": geometry * BBOX_SCORE_WEIGHT,
-                         "player_confidence": confidence * PLAYER_CONFIDENCE_WEIGHT,
-                         "ball_quality": quality * BALL_QUALITY_WEIGHT,
-                         "previous_holder": prior * PREVIOUS_HOLDER_WEIGHT}
+        active = {
+            "mask": mask_available,
+            "bbox": point is not None and isinstance(box, (list, tuple)) and len(box) == 4,
+            "player_confidence": confidence_available,
+            "ball_quality": point is not None,
+            "previous_holder": previous_holder is not None,
+        }
+        weights = {"mask": MASK_SCORE_WEIGHT, "bbox": BBOX_SCORE_WEIGHT,
+                   "player_confidence": PLAYER_CONFIDENCE_WEIGHT,
+                   "ball_quality": BALL_QUALITY_WEIGHT,
+                   "previous_holder": PREVIOUS_HOLDER_WEIGHT}
+        denominator = sum(weight for name, weight in weights.items() if active[name])
+        raw_contributions = {"mask": mask * MASK_SCORE_WEIGHT, "bbox": geometry * BBOX_SCORE_WEIGHT,
+                             "player_confidence": confidence * PLAYER_CONFIDENCE_WEIGHT,
+                             "ball_quality": quality * BALL_QUALITY_WEIGHT,
+                             "previous_holder": prior * PREVIOUS_HOLDER_WEIGHT}
+        contributions = {name: (value / denominator if active[name] and denominator else 0.0)
+                         for name, value in raw_contributions.items()}
         score = sum(contributions.values()) if not reasons or reasons == ["outside_dynamic_player_region"] else 0.0
         if reasons and reasons != ["outside_dynamic_player_region"]: score = 0.0
         fallback = f"raw:{raw}" if stable is None and raw is not None else None

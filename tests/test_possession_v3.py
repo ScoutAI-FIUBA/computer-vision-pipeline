@@ -213,6 +213,13 @@ def test_scoring_fails_closed_for_non_finite_confidence(value):
     assert "non_finite_confidence" in result[0].rejected_reasons
 
 
+@pytest.mark.parametrize("value", [-0.01, 1.01])
+def test_scoring_fails_closed_for_out_of_range_confidence(value):
+    result = score_candidates([_player("a", (0, 0, 20, 20), confidence=value)], {"x": 10, "y": 10})
+    assert result[0].score == 0.0
+    assert "out_of_range_confidence" in result[0].rejected_reasons
+
+
 @pytest.mark.parametrize("confidence", [None, "missing"])
 def test_scoring_treats_missing_or_null_player_confidence_as_unavailable(confidence):
     player = _player("a", (0, 0, 20, 20))
@@ -221,7 +228,7 @@ def test_scoring_treats_missing_or_null_player_confidence_as_unavailable(confide
     else:
         player["confidence"] = None
     result = score_candidates([player], {"center_xy": [10, 10], "xyxy": [9, 9, 11, 11]})
-    assert result[0].score > 0
+    assert result[0].score > 0.5
     assert result[0].contributions["player_confidence"] == 0
     assert "non_finite_confidence" not in result[0].rejected_reasons
 
@@ -233,6 +240,42 @@ def test_scoring_uses_tracknet_center_and_player_xyxy_shapes():
         {"center_xy": [10, 10], "xyxy": [9, 9, 11, 11]},
     )
     assert result[0].score > 0
+
+
+@pytest.mark.parametrize("mask_contains", ["yes", {"hit": True}, 1, [True]])
+def test_scoring_ignores_malformed_mask_hits(mask_contains):
+    player = _player("a", (0, 0, 20, 20), clean_mask=True, mask_contains=mask_contains)
+    result = score_candidates([player], {"center_xy": [10, 10], "confidence": .9})
+    assert result[0].score < 1.0
+    assert result[0].contributions["mask"] == 0
+
+
+@pytest.mark.parametrize("mask_contains", [lambda _x, _y: "yes", lambda _x, _y: {"hit": True}])
+def test_scoring_ignores_malformed_callable_mask_results(mask_contains):
+    player = _player("a", (0, 0, 20, 20), clean_mask=True, mask_contains=mask_contains)
+    result = score_candidates([player], {"center_xy": [10, 10], "confidence": .9})
+    assert result[0].contributions["mask"] == 0
+
+
+@pytest.mark.parametrize("mask_contains", [lambda _x, _y: True, lambda _x, _y: False])
+def test_scoring_accepts_boolean_callable_mask_results(mask_contains):
+    player = _player("a", (0, 0, 20, 20), clean_mask=True, mask_contains=mask_contains)
+    result = score_candidates([player], {"center_xy": [10, 10], "confidence": .9})
+    assert (result[0].contributions["mask"] > 0) is mask_contains(10, 10)
+
+
+def test_real_shapes_without_masks_remain_unresolved_when_geometry_is_ambiguous():
+    players = [
+        {"stable_player_id": "a", "raw_track_id": 1, "team_id": 1,
+         "xyxy": [0, 0, 20, 20], "confidence": None},
+        {"stable_player_id": "b", "raw_track_id": 2, "team_id": 2,
+         "xyxy": [0, 0, 20, 20], "confidence": None},
+    ]
+    candidates = score_candidates(players, {"center_xy": [10, 10], "xyxy": [9, 9, 11, 11]})
+    resolver = PossessionResolver(real_fps=4, persistence_seconds=.5)
+    assert resolver.resolve(0, candidates).state is PossessionState.CONTESTED
+    assert resolver.resolve(1, candidates).state is PossessionState.CONTESTED
+    assert resolver.history[-1].stable_player_id is None
 
 
 def test_scoring_wires_ambiguity_margin_into_candidate_reasons():

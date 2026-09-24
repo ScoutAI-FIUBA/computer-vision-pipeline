@@ -183,7 +183,8 @@ def test_v2_stats_adapter_v3_uses_actual_tracknet_and_player_shapes(tmp_path, mo
         json.loads(line)
         for line in (tmp_path / "stats" / "possession_v3" / "generations").glob("*/possession_v3.jsonl").__next__().read_text().splitlines()
     ]
-    assert observations[-1]["candidates"][0]["score"] > 0
+    assert observations[-1]["candidates"][0]["score"] > 0.5
+    assert observations[-1]["state"] == "OBSERVED"
     assert observations[-1]["stable_player_id"] == "player-7"
     legacy = [json.loads(line) for line in (tmp_path / "stats" / "possession_events.jsonl").read_text().splitlines()]
     assert legacy[-1]["status"] == "confirmed"
