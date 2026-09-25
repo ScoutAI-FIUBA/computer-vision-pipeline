@@ -95,6 +95,8 @@ def test_old_observation_construction_keeps_deterministic_continuity_defaults():
 @pytest.mark.parametrize("factory", [
     lambda: PossessionContext(effective_holder_id="p", effective_holder_team=-1),
     lambda: PossessionContext(challenger_start_frame=2, challenger_id=None),
+    lambda: PossessionContext(challenger_elapsed_seconds=.1, challenger_id=None),
+    lambda: PossessionContext(challenger_confirmation_frame=2, challenger_id=None),
     lambda: PossessionContext(grace_remaining_seconds=-.1),
     lambda: PossessionContext(last_observed_holder_score=1.1),
     lambda: PossessionAudit(clear_reason="NOT_A_REASON"),
@@ -537,6 +539,22 @@ def test_challenger_cancels_when_evidence_disappears_and_failed_transition_keeps
     assert cancelled.context.effective_holder_id == "a"
     assert resolver.resolve(3, [b]).context.challenger_id == "b"
     assert resolver.resolve(4, [a]).context.challenger_id is None
+
+
+def test_canceled_challenger_window_is_empty_when_next_evidence_is_not_a_challenger():
+    resolver = PossessionResolver(real_fps=10, persistence_seconds=.4)
+    holder = CandidateEvidence("holder", 1, 1, .9, {"geometry": .9})
+    challenger = CandidateEvidence("challenger", 2, 2, .95, {"geometry": .95})
+    weak = CandidateEvidence("weak", 3, 2, .2, {"geometry": .2})
+
+    resolver.resolve(0, [holder])
+    resolver.resolve(1, [challenger])
+    canceled = resolver.resolve(2, [weak])
+
+    assert canceled.context.challenger_id is None
+    assert canceled.context.challenger_start_frame is None
+    assert canceled.context.challenger_confirmation_frame is None
+    assert canceled.context.challenger_elapsed_seconds == 0.0
 
 
 def test_observed_requires_keep_threshold_and_confirmed_switch_is_observed():

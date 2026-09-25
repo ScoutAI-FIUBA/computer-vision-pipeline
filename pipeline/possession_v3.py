@@ -523,6 +523,7 @@ class PossessionResolver:
         if state is PossessionState.LOST_NO_DETECTION:
             stable = raw = team = None
         challenger_id = self._key(challenger) if challenger else None
+        pending = self.pending if challenger_id is not None and self.pending and self.pending[0] == challenger_id else None
         observed_id = self._key(direct) if direct else None
         prov = Provenance(frame_indices=[frame], reason_codes=list(reason))
         quality = (EvidenceKind.OBSERVED if state is PossessionState.OBSERVED else
@@ -531,8 +532,8 @@ class PossessionResolver:
         context = PossessionContext(effective_holder_id=None if state is PossessionState.LOST_NO_DETECTION else effective,
                                     effective_holder_team=None if state is PossessionState.LOST_NO_DETECTION else self.holder_team,
                                     observed_candidate_id=observed_id, challenger_id=challenger_id,
-                                    challenger_start_frame=self.pending[2] if self.pending else None,
-                                    challenger_elapsed_seconds=self.pending[1] if self.pending else 0.0,
+                                    challenger_start_frame=pending[2] if pending else None,
+                                     challenger_elapsed_seconds=pending[1] if pending else 0.0,
                                     grace_start_frame=self.last_frame - int(self.gap_seconds * self.fps) if self.gap_seconds else None,
                                     grace_remaining_seconds=max(0.0, self.grace - self.gap_seconds),
                                     last_observed_holder_frame=self.last_observed_frame,

@@ -17,6 +17,7 @@ from pipeline.possession_v3 import (
     BallTransition, EventType, PossessionEvent, PossessionObservation,
     PossessionState, EvidenceKind, Provenance, PossessionContext, PossessionAudit,
     ClearReason,
+    CandidateEvidence, PossessionResolver,
 )
 from pipeline.config import PipelineConfig
 from pipeline.runner import _write_v3_artifacts
@@ -245,6 +246,28 @@ def test_v3_artifact_persists_continuity_roles_and_audit_fields(tmp_path: Path):
     assert row["audit"]["last_holder_id"] == "player-006"
     assert row["audit"]["clear_reason"] == "GRACE_EXPIRED"
     assert row["audit"]["frame_start"] == 5 and row["audit"]["timestamp_end"] == .7
+
+
+def test_v3_artifact_serializes_stale_pending_challenger_timeline(tmp_path: Path):
+    resolver = PossessionResolver(real_fps=10, persistence_seconds=.4)
+    holder = CandidateEvidence("holder", 1, 1, .9, {"geometry": .9})
+    challenger = CandidateEvidence("challenger", 2, 2, .95, {"geometry": .95})
+    weak = CandidateEvidence("weak", 3, 2, .2, {"geometry": .2})
+    resolver.resolve(0, [holder])
+    resolver.resolve(1, [challenger])
+    assert resolver.pending is not None
+    canceled = resolver.resolve(2, [weak])
+
+    # The resolver still has stale pending state, but the observation has no
+    # active challenger evidence and must therefore serialize an empty window.
+    manifest = write_v3_artifacts(tmp_path, [canceled], [], [], [])
+    row = json.loads((tmp_path / manifest["artifacts"]["possession"]["path"]).read_text())
+
+    assert row["context"]["challenger_id"] is None
+    assert row["context"]["challenger_start_frame"] is None
+    assert row["context"]["challenger_confirmation_frame"] is None
+    assert row["context"]["challenger_elapsed_seconds"] == 0.0
+    assert (tmp_path / "possession_v3_manifest.json").exists()
 
 
 def test_real_006_007_continuity_artifact_replays_byte_for_byte(tmp_path: Path):
