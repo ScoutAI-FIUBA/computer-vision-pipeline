@@ -45,6 +45,7 @@ from pipeline.number_evidence import (
     write_number_prediction_artifacts,
 )
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
+from pipeline.v2_numbers import run_v2_number_evidence
 from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.possession_v3 import (
@@ -833,6 +834,9 @@ def _normalize_v2_stats_rows(observations, *, width: int, height: int) -> list[d
         rows.append({
             "frame_index": int(row["frame_index"]),
             "track_id": int(track_id),
+            "observation_key": row.get("observation_key"),
+            "mask_ref": row.get("mask_ref"),
+            "clean_mask_ref": row.get("clean_mask_ref"),
             "stable_player_id": row.get("stable_player_id"),
             "team_id": row.get("team_id"),
             "track_state": row.get("track_state", "unknown"),
@@ -882,6 +886,9 @@ def run_stats_from_v2_observations(
     observations,
     *,
     on_progress: Callable[[str], None] | None = None,
+    number_predictor=None,
+    masks_by_observation=None,
+    clean_masks_by_observation=None,
 ) -> PipelineResults:
     """Run stats stages from authoritative V2 player rows without player tracking."""
     emit = on_progress or (lambda message: print(f"[v2-stats] {message}", flush=True))
@@ -979,18 +986,25 @@ def run_stats_from_v2_observations(
         max_frame_gap=config.possession_transition_max_gap,
     ))
     v3_manifest = phase("possession V3", lambda: _write_v3_artifacts(output_dir, rows, ball_rows, fps=info.fps, config=config))
-    (output_dir / NUMBERS_FILENAME).unlink(missing_ok=True)
+    numbers_available = phase("V2 jersey numbers", lambda: run_v2_number_evidence(
+        video_path, rows, config, output_dir, predictor=number_predictor,
+        masks_by_observation=masks_by_observation,
+        clean_masks_by_observation=clean_masks_by_observation,
+    ))
     results = PipelineResults(
         schema_version=RESULTS_SCHEMA_VERSION,
         video={"filename": video_path.name, "fps": info.fps, "frame_count": info.frame_count,
                "width": info.width, "height": info.height, "duration_seconds": info.duration_seconds},
          config=_possession_result_config(
-             config, {"source": "sam31_v2_observations", "tracknet_enabled": config.tracknet_enabled}
+             config, {"source": "sam31_v2_observations", "tracknet_enabled": config.tracknet_enabled,
+                      "number_predictor_backend": config.number_predictor_backend,
+                      "number_predictor_score_threshold": config.number_predictor_score_threshold}
          ),
         summary=RunSummary(frames_processed=len(frame_indices), track_records=len(rows),
                            distinct_track_ids=len({row["track_id"] for row in rows})),
-        device="cpu", teams_file=TEAMS_FILENAME, shot_events_file=SHOT_EVENTS_FILENAME,
-        shot_evidence_file=SHOT_EVIDENCE_FILENAME, ball_tracks_file=BALL_TRACKS_FILENAME,
+         device="cpu", teams_file=TEAMS_FILENAME, shot_events_file=SHOT_EVENTS_FILENAME,
+         numbers_file=NUMBERS_FILENAME if numbers_available else None,
+         shot_evidence_file=SHOT_EVIDENCE_FILENAME, ball_tracks_file=BALL_TRACKS_FILENAME,
         possession_events_file=POSSESSION_EVENTS_FILENAME,
          possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
          possession_v3_file=_v3_artifact_path(v3_manifest, "possession") if v3_manifest and v3_manifest.get("status") != "failed" else None,
@@ -999,12 +1013,16 @@ def run_stats_from_v2_observations(
          possession_v3_manifest_file=POSSESSION_V3_MANIFEST_FILENAME if v3_manifest and v3_manifest.get("status") != "failed" else None,
           possession_v3_schema_version=V3_CONTRACT_VERSION if v3_manifest and v3_manifest.get("status") != "failed" else None,
           possession_v3_observability=v3_manifest.get("observability") if v3_manifest else None,
-         artifact_references={
+          artifact_references={
             "possession_events": {"file": possession_path.name, "schema_version": 1},
-            "possession_transitions": {
+             "possession_transitions": {
                 "file": transitions_path.name, "schema_version": 1,
                 "event_types": ["pass", "steal", "turnover", "lost_possession"],
-            },
+             },
+             **({"numbers": {"file": NUMBERS_FILENAME, "manifest": "number_manifest.json",
+                               "source": "sam31_v2_observations",
+                               "artifacts": json.loads((output_dir / "number_manifest.json").read_text(encoding="utf-8")).get("artifacts", {})}}
+                if numbers_available else {}),
             **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
                                    "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
         },

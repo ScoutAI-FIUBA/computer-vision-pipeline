@@ -75,6 +75,14 @@ PY
 The expected values are `tracknet_enabled: True` and at least one non-lost
 ball row for a clip where TrackNet detects the ball.
 
+V2 jersey numbers use the existing predictor settings but do not invoke the
+legacy pipeline. Player crops are sampled every `FRAME_STRIDE` frames and votes
+are grouped by `stable_player_id`; two consistent accepted reads are required
+for confirmation. Use `NUMBER_PREDICTOR_BACKEND=dummy` for an offline smoke run,
+or `roboflow-hosted` with the configured Modal secret for OCR. Inspect
+`stats/number_manifest.json`, `stats/number_predictions.json`, and
+`stats/numbers.json`; increasing `FRAME_STRIDE` reduces hosted inference cost.
+
 The V2 image opts its existing stats adapter into Possession V3 without changing
 the legacy Modal image:
 

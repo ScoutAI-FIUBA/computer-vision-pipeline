@@ -1107,7 +1107,11 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
     assert results["schema_version"] == 5
     assert results["tracks_file"] == "tracks.jsonl"
     assert results["teams_file"] == "teams.json"
+    # This fixture has no V2 player rows, so the adapter must preserve the
+    # no-evidence/null contract. Configured rows are covered by the real adapter
+    # integration test and produce numbers artifacts.
     assert results["numbers_file"] is None
+    assert "numbers" not in manifest["artifacts"]["legacy_stats"]
     assert results["shot_events_file"] == "shot_events.jsonl"
     assert results["possession_events_file"] == "possession_events.jsonl"
     assert results["possession_transitions_file"] == "possession_transitions.jsonl"
@@ -1117,6 +1121,61 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
         assert reference["size_bytes"] == len(data)
         assert reference["sha256"] == hashlib.sha256(data).hexdigest()
     assert manifest["legacy_stats_results"] == "stats/results.json"
+
+
+def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifacts(monkeypatch):
+    import modal_app_v2
+
+    rows = [{
+        "observation_key": "60:3", "frame_index": 60, "raw_track_id": 3,
+        "stable_player_id": "player-3", "bbox_xyxy": [1, 2, 11, 22],
+        "track_state": "tracked",
+    }]
+    predictor = object()
+    seen = []
+
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: (rows, {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **_kwargs: types.SimpleNamespace(
+        observations=observations, acceptance={}, acceptance_reasons=[],
+    ))
+    monkeypatch.setattr(modal_app_v2, "build_number_predictor", lambda _config: predictor)
+
+    def fake_stats(_video, output_dir, _observations, **kwargs):
+        seen.append(kwargs["number_predictor"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        files = {
+            "results.json": json.dumps({"numbers_file": "numbers.json"}),
+            "tracks.jsonl": "{}\n", "teams.json": "{}", "numbers.json": json.dumps({"players": []}),
+            "number_predictions.json": json.dumps({"predictions": []}),
+            "number_prediction_cases.jsonl": "", "number_manifest.json": json.dumps({"artifacts": {}}),
+            "shot_events.jsonl": "",
+        }
+        for name, content in files.items():
+            (output_dir / name).write_text(content, encoding="utf-8")
+        return types.SimpleNamespace(to_dict=lambda: {
+            "tracks_file": "tracks.jsonl", "teams_file": "teams.json", "numbers_file": "numbers.json",
+            "shot_events_file": "shot_events.jsonl",
+        })
+
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", fake_stats)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
+    artifacts = payload["artifacts"]
+    assert seen == [predictor]
+    manifest = json.loads(artifacts["manifest.json"])
+    stats_refs = manifest["artifacts"]["legacy_stats"]
+    for name in ("numbers", "number_predictions", "number_prediction_cases", "number_manifest"):
+        reference = stats_refs[name]
+        data = artifacts[reference["key"]]
+        assert reference["size_bytes"] == len(data)
+        assert reference["sha256"] == hashlib.sha256(data).hexdigest()
+    results = json.loads(artifacts["stats/results.json"])
+    assert results["numbers_file"] == "numbers.json"
 
 
 def test_process_uses_v3_image_config_and_returns_v3_artifacts(monkeypatch):

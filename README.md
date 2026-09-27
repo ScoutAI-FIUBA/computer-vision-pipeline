@@ -20,7 +20,7 @@ High-level flow:
 
 `modal_app_v2.py` keeps its SAM3.1 observation artifact at the root of the returned bundle (`tracks.jsonl` and `manifest.json`). Its stats adapter consumes those same observations in `stats/`; it does not load SAM2, run a second player tracker, or call Roboflow to recreate V2 players.
 
-`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/shot_events.jsonl`, `stats/shot_evidence.jsonl`, `stats/possession_events.jsonl`, `stats/possession_transitions.jsonl`, and `stats/ball_tracks.jsonl` use the legacy contracts and are referenced in the V2 manifest with relative paths, sizes, and hashes. The V2 adapter does not produce `numbers.json` because V2 observations contain no jersey-number evidence, so `numbers_file` remains nullable. The adapter carries through V2 raw/stable IDs, boxes, team IDs, confidence, state, and frame indices. For stats geometry, rows marked `bbox_coordinate_space: "normalized"` are converted to pixel `xyxy` using the probed video dimensions; pixel or unspecified legacy rows are preserved. Ball tracking remains an independent pass: the V2 Modal image enables TrackNet by default from the mounted `tracknet-data` Volume at `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`; local callers can enable it with `TRACKNET_ENABLED=1` and `TRACKNET_CHECKPOINT`. If TrackNet is disabled, exact V2 frames receive lost ball evidence rather than fabricated data. Shot detection keeps its own model pass, then shot evidence, possession, and transitions join to the supplied V2 player rows.
+`stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/shot_events.jsonl`, `stats/shot_evidence.jsonl`, `stats/possession_events.jsonl`, `stats/possession_transitions.jsonl`, and `stats/ball_tracks.jsonl` use the legacy contracts and are referenced in the V2 manifest with relative paths, sizes, and hashes. When player rows and a number predictor are available, the V2 adapter also samples pixel-coordinate V2 rows, writes `numbers.json`, prediction cases, and `number_manifest.json`, and reports `numbers_file`; it never calls legacy `run_pipeline` or legacy tracking. Number votes are keyed by authoritative `stable_player_id`, while raw IDs remain provenance. The adapter carries through V2 raw/stable IDs, boxes, team IDs, confidence, state, and frame indices. For stats geometry, rows marked `bbox_coordinate_space: "normalized"` are converted to pixel `xyxy` using the probed video dimensions; pixel or unspecified legacy rows are preserved. Ball tracking remains an independent pass: the V2 Modal image enables TrackNet by default from the mounted `tracknet-data` Volume at `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`; local callers can enable it with `TRACKNET_ENABLED=1` and `TRACKNET_CHECKPOINT`. If TrackNet is disabled, exact V2 frames receive lost ball evidence rather than fabricated data. Shot detection keeps its own model pass, then shot evidence, possession, and transitions join to the supplied V2 player rows.
 
 The V2 Modal image sets `POSSESSION_ENGINE=v3`, so its existing stats adapter also writes the additive V3 artifacts. Run it with:
 
@@ -416,6 +416,13 @@ Current limits:
 ## Jersey numbers
 
 The pipeline now has a working jersey-number path.
+
+V2 uses the same predictor configuration without re-running player detection:
+sampled V2 player boxes are cropped from the video every `FRAME_STRIDE` source
+frames, associated directly with their `stable_player_id`, and aggregated with a
+minimum two-read support requirement. This keeps OCR spend proportional to the
+sampling stride. The dummy backend is safe for dry runs and produces unknown
+votes; hosted Roboflow is enabled only with `NUMBER_PREDICTOR_BACKEND=roboflow-hosted`.
 
 What it does today:
 

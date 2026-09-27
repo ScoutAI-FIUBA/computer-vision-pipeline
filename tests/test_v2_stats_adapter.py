@@ -394,6 +394,19 @@ def test_v2_stats_adapter_keeps_pixel_boxes_and_rejects_invalid_normalized_boxes
     ]
 
 
+def test_v2_stats_normalization_preserves_mask_provenance():
+    from pipeline.runner import _normalize_v2_stats_rows
+
+    rows = _normalize_v2_stats_rows([{
+        "frame_index": 0, "raw_track_id": 3, "stable_player_id": "p-3",
+        "bbox_xyxy": [1, 2, 11, 22], "observation_key": "0:3",
+        "mask_ref": "masks/0_3.png", "clean_mask_ref": "masks_clean/0_3.png",
+    }], width=20, height=30)
+    assert rows[0]["observation_key"] == "0:3"
+    assert rows[0]["mask_ref"] == "masks/0_3.png"
+    assert rows[0]["clean_mask_ref"] == "masks_clean/0_3.png"
+
+
 def test_v2_stats_adapter_requires_checkpoint_when_tracknet_enabled(tmp_path, monkeypatch):
     import pipeline.runner as runner
 
@@ -453,3 +466,153 @@ def test_bounded_progress_marks_capped_phase_complete_without_fake_source_percen
     output = capsys.readouterr().out
     assert "TrackNet progress: phase complete (100%; processed 3 frames; source progress 3/10)" in output
     assert "3/10 frames (100%)" not in output
+
+
+def test_v2_number_sampling_uses_stable_ids_and_preserves_conflicts(tmp_path, monkeypatch):
+    import sys
+    import types
+    import pipeline.v2_numbers as numbers
+    from pipeline.number_predictor import NumberPrediction
+
+    class Capture:
+        def __init__(self, _path): self.frame = None
+        def set(self, _property, frame): self.frame = frame
+        def read(self): return True, np.ones((40, 40, 3), dtype=np.uint8) * int(self.frame or 0)
+        def release(self): pass
+
+    fake_cv2 = types.SimpleNamespace(VideoCapture=Capture, CAP_PROP_POS_FRAMES=1)
+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+
+    class Predictor:
+        name = "fake"
+        def __init__(self): self.frames = []
+        def predict(self, sample):
+            self.frames.append(sample.frame_index)
+            return NumberPrediction("12" if sample.frame_index in {0, 2} else "13", 0.99)
+
+    predictor = Predictor()
+    monkeypatch.setattr(numbers, "build_number_predictor", lambda _config: (_ for _ in ()).throw(
+        AssertionError("injected predictor must not be reconstructed")
+    ))
+    rows = [{"frame_index": frame, "track_id": frame + 10, "stable_player_id": "stable-a",
+             "xyxy": [1, 1, 10, 10], "track_state": "tracked"} for frame in range(4)]
+    config = PipelineConfig(roboflow_api_key="key", frame_stride=2, team_embedder_backend="none")
+    assert numbers.run_v2_number_evidence(tmp_path / "video.mp4", rows, config, tmp_path, predictor=predictor)
+    assert predictor.frames == [0, 2]
+    payload = json.loads((tmp_path / "numbers.json").read_text())
+    player = payload["players"][0]
+    assert player["stable_player_id"] == "stable-a"
+    assert player["status"] == "confirmed"
+    assert player["number"] == "12"
+    assert player["conflicts"] == []
+
+
+def test_v2_number_aggregation_marks_ambiguous_and_unknown():
+    from pipeline.v2_numbers import _aggregate
+
+    records = [
+        {"stable_player_id": "a", "accepted": True, "tentative_number": "7", "frame_index": 0},
+        {"stable_player_id": "a", "accepted": True, "tentative_number": "8", "frame_index": 2},
+        {"stable_player_id": "b", "accepted": False, "tentative_number": "unknown", "frame_index": 0},
+    ]
+    result = {row["stable_player_id"]: row for row in _aggregate(records)}
+    assert result["a"]["status"] == "ambiguous"
+    assert result["a"]["number"] == "unknown"
+    assert result["b"]["status"] == "unknown"
+
+
+def test_v2_number_evidence_uses_masked_torso_and_cleans_stale_outputs(tmp_path, monkeypatch):
+    import sys
+    import types
+    import pipeline.v2_numbers as numbers
+    from pipeline.number_predictor import NumberPrediction
+
+    class Capture:
+        def __init__(self, _path): pass
+        def set(self, _property, _frame): pass
+        def read(self): return True, np.ones((40, 40, 3), dtype=np.uint8)
+        def release(self): pass
+
+    monkeypatch.setitem(sys.modules, "cv2", types.SimpleNamespace(
+        VideoCapture=Capture, CAP_PROP_POS_FRAMES=1,
+    ))
+
+    seen = []
+    class Predictor:
+        name = "fake"
+        def predict(self, sample):
+            seen.append(sample)
+            return NumberPrediction("7", 0.99)
+
+    config = PipelineConfig(roboflow_api_key="key", frame_stride=1, team_embedder_backend="none")
+    row = {"frame_index": 0, "track_id": 3, "stable_player_id": "p-3",
+           "observation_key": "0:3", "xyxy": [2, 2, 30, 38], "track_state": "tracked"}
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[10:25, 8:24] = 1
+    assert numbers.run_v2_number_evidence(
+        tmp_path / "video.mp4", [row], config, tmp_path, predictor=Predictor(),
+        masks_by_observation={"0:3": mask},
+    )
+    assert seen[0].number_xyxy != seen[0].player_xyxy
+    assert seen[0].overlap_ratio < 1.0
+    evidence = json.loads((tmp_path / "number_predictions.json").read_text())["predictions"][0]["evidence"]
+    assert evidence["association_method"] == "masked_torso_roi"
+    assert evidence["mask_kind"] == "raw_mask"
+
+    for name in ("numbers.json", "number_predictions.json", "number_prediction_cases.jsonl", "number_manifest.json"):
+        assert (tmp_path / name).exists()
+    assert not numbers.run_v2_number_evidence(
+        tmp_path / "video.mp4", [{"frame_index": 1, "track_id": 3, "xyxy": [1, 1, 2, 2]}],
+        config, tmp_path, predictor=Predictor(),
+    )
+    assert all(not (tmp_path / name).exists() for name in numbers._NUMBER_ARTIFACTS)
+
+
+def test_run_stats_v2_writes_number_artifacts_and_hashed_references(tmp_path, monkeypatch):
+    import sys
+    import types
+    import hashlib
+    import pipeline.runner as runner
+    from pipeline.number_predictor import NumberPrediction
+
+    class Capture:
+        def __init__(self, _path): pass
+        def set(self, _property, _frame): pass
+        def read(self): return True, np.ones((40, 40, 3), dtype=np.uint8)
+        def release(self): pass
+
+    monkeypatch.setitem(sys.modules, "cv2", types.SimpleNamespace(
+        VideoCapture=Capture, CAP_PROP_POS_FRAMES=1,
+    ))
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(
+        fps=30.0, frame_count=2, width=40, height=40, duration_seconds=2 / 30,
+    ))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    class Predictor:
+        name = "fake"
+        def predict(self, _sample): return NumberPrediction("11", 0.99)
+
+    output = tmp_path / "stats"
+    result = run_stats_from_v2_observations(
+        tmp_path / "input.mp4",
+        PipelineConfig(roboflow_api_key="key", frame_stride=1, team_embedder_backend="none"),
+        output,
+        [{"frame_index": frame, "raw_track_id": frame + 1, "stable_player_id": "stable-1",
+          "observation_key": f"{frame}:{frame + 1}", "mask_ref": f"masks/{frame}.png",
+          "clean_mask_ref": f"masks_clean/{frame}.png", "bbox_xyxy": [2, 2, 30, 38],
+          "track_state": "tracked"} for frame in (0, 1)],
+        number_predictor=Predictor(),
+        masks_by_observation={
+            f"{frame}:{frame + 1}": np.pad(np.ones((15, 16), dtype=np.uint8), ((10, 15), (8, 16)))
+            for frame in (0, 1)
+        },
+    )
+    assert result.numbers_file == "numbers.json"
+    references = result.artifact_references["numbers"]["artifacts"]
+    for name, reference in references.items():
+        data = (output / name).read_bytes()
+        assert reference["size"] == len(data)
+        assert reference["sha256"] == hashlib.sha256(data).hexdigest()
+    prediction = json.loads((output / "number_predictions.json").read_text())["predictions"][0]
+    assert prediction["evidence"]["association_method"] == "masked_torso_roi"
