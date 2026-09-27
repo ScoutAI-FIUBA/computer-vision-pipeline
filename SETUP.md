@@ -219,6 +219,19 @@ modal run modal_app_v2.py --video-path clips/game_03.mp4 \
   --frame-start 60 --frame-end 130 --return-diagnostics
 ```
 
+To opt into bounded SAM3.1 sessions while retaining the 16-object model limit:
+
+```bash
+SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py \
+  --video-path clips/game_03.mp4 --frame-start 60 --frame-end 130 \
+  --segment-window 32 --segment-overlap 1 --output-dir outputs/v2-segmented
+```
+
+The later segment owns shared frames. Temporary clips preserve source dimensions
+and FPS, and their local SAM IDs are namespaced before the global deduplication,
+ReID, and Team ID stages. To roll back, omit `SAM31_V2_SEGMENTED`; the original
+full-video session is the default.
+
 ---
 
 ## 4. First run — smallest possible

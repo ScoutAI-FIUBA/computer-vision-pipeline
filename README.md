@@ -35,6 +35,26 @@ Expected V3 outputs under the returned `stats/` directory are `possession_v3_man
 
 Set `BBOX_SANITIZER_ENABLED=1` to run the offline V2 sanitizer before ReID and team identification; leave it at `0` for compatibility runs. Correction precedence is **mask cleanup → temporal interpolation → unresolved**. Mask cleanup uses connected components and conservative temporal evidence, writes optional `clean_mask_ref` artifacts under `masks_clean/`, and leaves the raw mask and `raw_bbox` available for provenance. Component areas are compared in the same units as the mask: normalized player boxes are converted to mask-pixel units before validation. If cleanup cannot produce one defensible component, the existing temporal interpolator may correct only a bounded multi-signal gap; otherwise the giant raw bbox remains unchanged and is marked `bbox_unresolved`. Initial calibration values are `BBOX_HISTORY_SIZE=15`, `BBOX_MAX_INTERPOLATION_GAP=2`, and `BBOX_SIGNAL_THRESHOLD=3.0`; tune them from reported corrected and unresolved counts, not from a single area threshold.
 
+### Bounded SAM3.1 V2 propagation
+
+The default V2 path remains the single full-video session for rollback. Enable
+bounded sessions explicitly; each temporary clip is prompted at local frame zero,
+overlap is owned by the later clip, and only the deduplicated global observations
+reach ReID and Team ID:
+
+```bash
+SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py \
+  --video-path clips/game_03.mp4 --frame-start 60 --frame-end 130 \
+  --segment-window 32 --segment-overlap 1 --output-dir outputs/v2-segmented
+```
+
+`--segment-window` and `--segment-overlap` may also be set with
+`SAM31_V2_SEGMENT_WINDOW` and `SAM31_V2_SEGMENT_OVERLAP`. The default overlap is
+one frame. SAM3.1 remains configured with `max_num_objects=16`; a segment that
+produces more active objects fails with a diagnostic instead of raising the model
+limit. Roll back by omitting `SAM31_V2_SEGMENTED=1` to use the existing
+full-video path.
+
 Render possession from a saved V2 bundle with the root SAM3.1 video overlay and the legacy stats events/tracks:
 
 ```bash

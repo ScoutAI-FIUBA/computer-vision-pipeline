@@ -1241,6 +1241,71 @@ def test_process_passes_tracked_frames_and_masks_to_v2_runner(monkeypatch):
     assert np.array_equal(captured["masks_by_observation"]["60:3"], mask)
 
 
+def test_process_segmented_boundary_passes_rows_masks_and_artifacts(monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result
+
+    calls = []
+    rows = [
+        {
+            "observation_key": "0:7",
+            "frame_index": 0,
+            "raw_track_id": 7,
+            "bbox_xyxy": [0, 0, 1, 1],
+            "track_state": "tracked",
+        }
+    ]
+    masks = {"0:7": np.ones((2, 2), dtype=np.uint8)}
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(modal_app_v2, "_track_segmented_video", lambda *args, **kwargs: calls.append((args, kwargs)) or (rows, masks))
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args, **kwargs: pytest.fail("full-video path used"))
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {0: frame})
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    captured = {}
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda observations, **kwargs: captured.update({"rows": observations, **kwargs}) or RunnerV2Result(observations),
+    )
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=0, frame_end=0,
+                      segmented=True, segment_window=4, segment_overlap=1, return_artifacts=True)
+
+    assert calls and calls[0][1] == {"window": 4, "overlap": 1}
+    assert captured["rows"] == rows
+    assert np.array_equal(captured["masks_by_observation"]["0:7"], masks["0:7"])
+    assert "0:7" in json.loads(payload["artifacts"]["tracks.jsonl"].decode())["observation_key"]
+    assert any(name.startswith("masks/") for name in payload["artifacts"])
+    manifest = json.loads(payload["artifacts"]["manifest.json"])
+    assert manifest["config"]["sam31_segmented"] is True
+
+
+@pytest.mark.parametrize("segmented", [False, None])
+def test_process_segmented_false_or_unset_rolls_back_to_full_video(monkeypatch, segmented):
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result
+
+    calls = []
+    monkeypatch.delenv("SAM31_V2_SEGMENTED", raising=False)
+    monkeypatch.setattr(modal_app_v2, "_track_segmented_video", lambda *args, **kwargs: pytest.fail("segmented path used"))
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args, **kwargs: calls.append((args, kwargs)) or ([], {}))
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **_kwargs: RunnerV2Result(observations))
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    process(cls(), video_bytes=b"fake-video", frame_start=0, frame_end=0, segmented=segmented)
+
+    assert calls and calls[0][1] == {}
+
+
 def test_process_exposes_runtime_diagnostics_only_through_explicit_debug_response(
     monkeypatch,
 ):

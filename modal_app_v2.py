@@ -25,6 +25,14 @@ from pipeline.config import PipelineConfig
 from pipeline.runner import run_stats_from_v2_observations
 from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
+from pipeline.sam31_segments import (
+    SAM31_MAX_NUM_OBJECTS,
+    assert_segment_object_limit,
+    deduplicate_segment_observations,
+    extract_segment_video,
+    plan_segment_windows,
+    remap_segment_rows,
+)
 
 SAM31_REPOSITORY = "git+https://github.com/facebookresearch/sam3.git"
 SAM31_COMMIT = "2345a4a"
@@ -332,7 +340,15 @@ def _start_session(predictor: Any, video_path: Path) -> dict[str, Any]:
         model.init_state = original_init_state
 
 
-def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int, frame_end: int):
+def _track_video(
+    predictor: Any,
+    video_path: Path,
+    prompt: str,
+    frame_start: int,
+    frame_end: int,
+    *,
+    local_propagation: bool = False,
+):
     start = _start_session(predictor, video_path)
     session_id = start["session_id"]
     predictor.handle_request(
@@ -341,9 +357,10 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
     rows: list[dict[str, Any]] = []
     masks: dict[str, Any] = {}
     try:
-        stream = predictor.handle_stream_request(
-            {"type": "propagate_in_video", "session_id": session_id}
-        )
+        request = {"type": "propagate_in_video", "session_id": session_id}
+        if local_propagation:
+            request.update({"start_frame_index": frame_start, "max_frame_num_to_track": frame_end - frame_start + 1})
+        stream = predictor.handle_stream_request(request)
         for output in stream:
             frame_index = int(output.get("frame_index", output.get("frame_idx", -1)))
             if not frame_start <= frame_index <= frame_end:
@@ -359,6 +376,49 @@ def _track_video(predictor: Any, video_path: Path, prompt: str, frame_start: int
     finally:
         predictor.handle_request({"type": "close_session", "session_id": session_id})
     return rows, masks
+
+
+def _track_segmented_video(
+    predictor: Any,
+    video_path: Path,
+    prompt: str,
+    frame_start: int,
+    frame_end: int,
+    work_dir: Path,
+    *,
+    window: int,
+    overlap: int = 1,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run independent bounded SAM sessions, then stitch their raw output."""
+
+    all_rows: list[dict[str, Any]] = []
+    all_masks: dict[str, Any] = {}
+    for segment in plan_segment_windows(frame_start, frame_end, window=window, overlap=overlap):
+        segment_path = work_dir / f"segment-{segment.ordinal:04d}.mp4"
+        extract_segment_video(video_path, segment_path, segment)
+        # The temporary clip always starts at local frame zero.  This is also
+        # what prevents a session from retaining the full source video.
+        rows, masks = _track_video(
+            predictor, segment_path, prompt, 0, segment.frame_count - 1,
+            local_propagation=True,
+        )
+        assert_segment_object_limit(rows, max_objects=SAM31_MAX_NUM_OBJECTS)
+        remapped_rows, remapped_masks = remap_segment_rows(rows, masks, segment)
+        all_rows.extend(remapped_rows)
+        all_masks.update(remapped_masks)
+    return deduplicate_segment_observations(all_rows, all_masks)
+
+
+def _segmented_enabled(value: bool | None) -> bool:
+    if value is not None:
+        return bool(value)
+    return os.getenv("SAM31_V2_SEGMENTED", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _segment_setting(value: int | None, env_name: str, default: int) -> int:
+    return default if value is None and os.getenv(env_name) is None else int(
+        value if value is not None else os.environ[env_name]
+    )
 
 
 @app.cls(
@@ -416,6 +476,9 @@ class PipelineV2:
         return_artifacts: bool = False,
         return_diagnostics: bool = False,
         max_artifact_bytes: int | None = None,
+        segmented: bool | None = None,
+        segment_window: int | None = None,
+        segment_overlap: int | None = None,
     ) -> dict[str, Any]:
         validate_entrypoint_args(
             video_bytes=video_bytes,
@@ -431,9 +494,16 @@ class PipelineV2:
             started = time.perf_counter()
             print("[v2] progress=0")
             try:
-                rows, masks = _track_video(
-                    self._ensure_predictor(), video_path, prompt, frame_start, frame_end
-                )
+                if _segmented_enabled(segmented):
+                    rows, masks = _track_segmented_video(
+                        self._ensure_predictor(), video_path, prompt, frame_start, frame_end, root,
+                        window=_segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
+                        overlap=_segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
+                    )
+                else:
+                    rows, masks = _track_video(
+                        self._ensure_predictor(), video_path, prompt, frame_start, frame_end
+                    )
                 _add_mask_references(rows, masks)
                 frames = _load_video_frames(video_path, frame_start, frame_end)
                 config = PipelineConfig.from_env()
@@ -446,6 +516,13 @@ class PipelineV2:
                 _add_clean_mask_references(result.observations, clean_masks)
                 video_metadata = _video_metadata(video_path)
                 artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
+                if _segmented_enabled(segmented):
+                    artifact_config.update({
+                        "sam31_segmented": True,
+                        "sam31_segment_window": _segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
+                        "sam31_segment_overlap": _segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
+                        "sam31_max_num_objects": SAM31_MAX_NUM_OBJECTS,
+                    })
                 sanitizer_metadata = getattr(result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
                 if sanitizer_metadata.get("corrected_count", 0) or sanitizer_metadata.get("unresolved_count", 0):
                     artifact_config["bbox_sanitizer"] = sanitizer_metadata
@@ -511,6 +588,9 @@ def main(
     frame_end: int = 130,
     max_artifact_bytes: int = 0,
     return_diagnostics: bool = False,
+    segmented: bool | None = None,
+    segment_window: int | None = None,
+    segment_overlap: int | None = None,
 ) -> None:
     if not video_path:
         raise ValueError("--video-path is required")
@@ -531,6 +611,9 @@ def main(
         frame_end=frame_end,
         return_artifacts=bool(output_dir),
         return_diagnostics=return_diagnostics,
+        segmented=segmented,
+        segment_window=segment_window,
+        segment_overlap=segment_overlap,
         max_artifact_bytes=max_artifact_bytes or None,
     )
     artifacts = payload.pop("artifacts", None)
