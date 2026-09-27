@@ -680,7 +680,7 @@ def test_rejected_runner_result_keeps_explicit_rejection_state():
     assert result.acceptance_reasons == ["missing_stable_player_id:60:3"]
 
 
-def test_same_stable_player_with_conflicting_team_assignments_is_rejected():
+def test_same_stable_player_with_conflicting_team_assignments_is_contested_only():
     class FakeTeamEmbedder:
         name = "fake-team"
 
@@ -712,14 +712,14 @@ def test_same_stable_player_with_conflicting_team_assignments_is_rejected():
         },
     )
 
-    assert "team_assignments" not in result.downstream
-    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.downstream == {}
+    assert result.acceptance["tracking_identity"] == "unvalidated"
     assert result.acceptance_reasons == [
         "conflicting_team_assignment:stable_player_id=player-7"
     ]
 
 
-def test_rejected_team_conflict_preserves_runtime_vote_diagnostics():
+def test_contested_team_preserves_runtime_vote_diagnostics():
     class FakeTeamEmbedder:
         name = "fake-team"
 
@@ -758,7 +758,7 @@ def test_rejected_team_conflict_preserves_runtime_vote_diagnostics():
             "player-7": {"cluster_votes": {"0": 1, "1": 2}, "total_samples": 3}
         },
     }
-    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance["tracking_identity"] == "unvalidated"
 
 
 def test_runtime_vote_diagnostics_are_bounded_to_observed_stable_players():
@@ -888,14 +888,13 @@ def test_stable_player_team_vote_rejects_ambiguous_share_below_85_percent():
     )
 
     assert result.downstream == {}
-    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance["tracking_identity"] == "unvalidated"
     assert result.acceptance_reasons == [
         "conflicting_team_assignment:stable_player_id=player-7"
     ]
-    assert all(
-        not {"stable_player_id", "team_id"}.intersection(observation)
-        for observation in result.observations
-    )
+    assert all(observation["stable_player_id"] == "player-7" for observation in result.observations)
+    assert all(observation["team_id"] is None for observation in result.observations)
+    assert all(observation["team_assignment"]["status"] == "contested" for observation in result.observations)
 
 
 def test_team_id_runs_after_identity_and_groups_fragments_by_stable_player():
@@ -1007,15 +1006,105 @@ def test_team_id_rejects_conflicting_labels_after_stable_aggregation_even_with_r
         },
     )
 
-    assert result.acceptance["tracking_identity"] == "rejected"
+    assert result.acceptance["tracking_identity"] == "unvalidated"
     assert result.downstream == {}
     assert result.acceptance_reasons == [
         "conflicting_team_assignment:stable_player_id=player-7"
     ]
-    assert all(
-        not {"stable_player_id", "team_id"}.intersection(observation)
-        for observation in result.observations
+    assert all(observation["stable_player_id"] == "player-7" for observation in result.observations)
+    assert all(observation["team_id"] is None for observation in result.observations)
+    assert all(observation["team_assignment"]["status"] == "contested" for observation in result.observations)
+
+
+def test_team_conflict_is_scoped_to_identity_and_runtime_authority_keeps_valid_players():
+    class FakeEmbedder:
+        def embed(self, _frame, boxes):
+            return [[3.0, 4.0] for _ in boxes]
+
+    class FakeTeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[float(sample.track_id)], embedding=None) for sample in samples]
+
+    class Clusterer:
+        name = "scoped-conflict-clusterer"
+
+        def fit_predict(self, embeddings, team_count):
+            # player-1: 0, 0; player-2: 0, 1 (contested); player-3: 1.
+            return [0, 0, 0, 1, 1]
+
+    observations = [
+        row(frame_index=60, raw_track_id=1),
+        row(frame_index=61, raw_track_id=2),
+        row(frame_index=62, raw_track_id=3),
+        row(frame_index=63, raw_track_id=4),
+        row(frame_index=64, raw_track_id=5),
+    ]
+    stable_by_key = {
+        "60:1": "player-1", "61:2": "player-1",
+        "62:3": "player-2", "63:4": "player-2",
+        "64:5": "player-3",
+    }
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda rows: {item["observation_key"]: stable_by_key[item["observation_key"]] for item in rows},
+            reid=FakeEmbedder(),
+            team_embedder=FakeTeamEmbedder(),
+            team_clusterer=Clusterer(),
+            identity_authority=RuntimeIdentityAuthority(),
+        )
+    ).run(
+        observations,
+        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in range(60, 65)},
+        masks_by_observation={item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations},
     )
+
+    assert result.acceptance["tracking_identity"] == "accepted"
+    assert result.downstream["team_assignments"] == {"player-1": 0, "player-3": 1}
+    by_stable = {item["stable_player_id"]: item for item in result.observations}
+    assert by_stable["player-1"]["team_id"] == 0
+    assert by_stable["player-3"]["team_id"] == 1
+    assert by_stable["player-2"]["team_id"] is None
+    assert by_stable["player-2"]["team_assignment"] == {
+        "status": "contested",
+        "reason": "conflicting_team_assignment",
+        "provenance": {"stable_player_id": "player-2", "source": "stable_identity_team_vote"},
+    }
+    assert "conflicting_team_assignment:stable_player_id=player-2" in result.acceptance_reasons
+
+
+def test_runtime_authority_rejects_all_contested_identities_without_global_acceptance():
+    class TeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class ConflictingClusterer:
+        name = "all-contested"
+
+        def fit_predict(self, _embeddings, _team_count):
+            return [0, 1]
+
+    observations = [row(frame_index=60, raw_track_id=3), row(frame_index=61, raw_track_id=4)]
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=lambda items: {item["observation_key"]: "player-7" for item in items},
+            team_embedder=TeamEmbedder(),
+            team_clusterer=ConflictingClusterer(),
+            identity_authority=RuntimeIdentityAuthority(),
+        )
+    ).run(
+        observations,
+        frames_by_index={index: np.ones((24, 12, 3), dtype=np.uint8) for index in (60, 61)},
+        masks_by_observation={item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations},
+    )
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert "identity_authority:no_accepted_identities" in result.acceptance_reasons
+    assert result.downstream == {}
+    assert all("team_id" not in item and "stable_player_id" not in item for item in result.observations)
 
 
 def test_team_id_leaves_fragments_without_stable_identity_unassigned():

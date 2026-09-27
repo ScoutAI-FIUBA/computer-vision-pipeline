@@ -918,7 +918,7 @@ def test_process_returns_complete_raw_artifacts_from_fake_session(monkeypatch):
     import cv2
     import numpy as np
     import modal_app_v2
-    from pipeline.runner_v2 import RunnerV2, RunnerV2Seams
+    from pipeline.runner_v2 import RunnerV2, RunnerV2Seams, RuntimeIdentityAuthority
 
     class FakePredictor:
         class Model:
@@ -1285,6 +1285,96 @@ def test_process_segmented_boundary_passes_rows_masks_and_artifacts(monkeypatch)
     assert manifest["config"]["sam31_segmented"] is True
 
 
+def test_segmented_conflicted_team_is_scoped_in_artifacts_and_manifest(monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2, RunnerV2Seams, RuntimeIdentityAuthority
+    from pipeline.team_embedder import TeamFeatures
+
+    rows = [
+        {"observation_key": f"{frame}:{raw}", "frame_index": frame,
+         "raw_track_id": raw, "bbox_xyxy": [0, 0, 2, 2], "track_state": "tracked"}
+        for frame, raw in enumerate(range(1, 8), start=60)
+    ]
+    stable = {
+        "60:1": "player-1", "61:2": "player-1",
+        "62:3": "player-2", "63:4": "player-2",
+        "64:5": "player-3",
+        "65:6": "player-4", "66:7": "player-4",
+    }
+
+    class ReID:
+        def embed(self, _frame, boxes):
+            return [[3.0, 4.0] for _ in boxes]
+
+    class TeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[float(sample.track_id)], embedding=None) for sample in samples]
+
+    class Clusterer:
+        name = "segmented-conflict-clusterer"
+
+        def fit_predict(self, _embeddings, _team_count):
+            return [0, 0, 0, 1, 1, 1, 0]
+
+    monkeypatch.setattr(modal_app_v2, "_track_segmented_video", lambda *args, **kwargs: (
+        rows, {row["observation_key"]: np.ones((2, 2), dtype=bool) for row in rows}
+    ))
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {
+        frame: np.ones((2, 2, 3), dtype=np.uint8) for frame in range(60, 67)
+    })
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(
+        modal_app_v2, "run_v2",
+        lambda observations, **kwargs: RunnerV2(RunnerV2Seams(
+            identity=lambda items: {item["observation_key"]: stable[item["observation_key"]] for item in items},
+            reid=ReID(), team_embedder=TeamEmbedder(), team_clusterer=Clusterer(),
+            identity_authority=RuntimeIdentityAuthority(),
+        )).run(observations, **kwargs),
+    )
+
+    def stats(_video_path, output_dir, observations):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "results.json").write_text("{}", encoding="utf-8")
+        (output_dir / "tracks.jsonl").write_text("", encoding="utf-8")
+        (output_dir / "teams.json").write_text(json.dumps({
+            "assignments_by_track_id": {str(row["raw_track_id"]): row["team_id"]
+                                         for row in observations if row.get("team_id") is not None},
+            "unassigned_track_ids": [row["raw_track_id"] for row in observations
+                                     if row.get("team_id") is None],
+            "source": "sam31_v2_observations",
+        }), encoding="utf-8")
+        return types.SimpleNamespace(to_dict=lambda: {
+            "tracks_file": "tracks.jsonl", "teams_file": "teams.json",
+            "numbers_file": None, "shot_events_file": None,
+        })
+
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", stats)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+               if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__
+                                       if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=66,
+                      segmented=True, return_artifacts=True)
+    manifest = json.loads(payload["artifacts"]["manifest.json"])
+    tracks = [json.loads(line) for line in payload["artifacts"]["tracks.jsonl"].decode().splitlines()]
+    teams = json.loads(payload["artifacts"]["stats/teams.json"])
+
+    assert payload["acceptance"]["tracking_identity"] == "accepted"
+    assert "conflicting_team_assignment:stable_player_id=player-2" in manifest["acceptance_reasons"]
+    assert "conflicting_team_assignment:stable_player_id=player-4" in manifest["acceptance_reasons"]
+    assert {row["stable_player_id"] for row in tracks if row.get("team_id") is not None} == {"player-1", "player-3"}
+    assert {row["stable_player_id"] for row in tracks if row.get("team_id") is None} == {"player-2", "player-4"}
+    assert all(row["team_assignment"]["status"] == "contested"
+               for row in tracks if row.get("team_id") is None)
+    assert teams["assignments_by_track_id"] == {"1": 0, "2": 0, "5": 1}
+    assert teams["unassigned_track_ids"] == [3, 4, 6, 7]
+
+
 @pytest.mark.parametrize("segmented", [False, None])
 def test_process_segmented_false_or_unset_rolls_back_to_full_video(monkeypatch, segmented):
     import modal_app_v2
@@ -1427,7 +1517,7 @@ def test_conflicting_team_response_keeps_rejected_policy_with_debug_opt_in(monke
     )
 
     assert normal == {
-        "acceptance": {"tracking_identity": "rejected", "statistics": "deferred"}
+        "acceptance": {"tracking_identity": "unvalidated", "statistics": "deferred"}
     }
     assert debug["acceptance"] == normal["acceptance"]
     assert debug.keys() == {"acceptance", "debug_diagnostics"}

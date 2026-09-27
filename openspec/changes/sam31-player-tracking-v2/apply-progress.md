@@ -119,6 +119,39 @@
 
 ## Remaining Tasks
 
+## Granular Team Conflict Follow-up
+
+- [x] Scoped stable-ID team conflicts to the affected identity instead of
+  rejecting the complete V2 result. Conflicted rows retain raw/stable/ReID
+  evidence, carry `team_id: null`, and include `team_assignment` contest
+  reason/provenance; valid stable identities retain their team assignments.
+- [x] Runtime identity authority now evaluates only uncontested identities for
+  the acceptance transaction while preserving explicit conflict reasons in the
+  result and manifest. Segmented artifact regression verifies valid teams,
+  unassigned conflicted raw tracks, and truthful manifest reasons.
+
+### TDD Cycle Evidence — Granular Team Conflict
+
+| Change | Test File | RED | GREEN | Regression |
+|---|---|---|---|---|
+| Per-identity conflict handling | `tests/test_runner_v2.py` | ✅ Existing atomic conflict assertions failed after scoped expectation was added | ✅ 76 runner tests passed | ✅ Valid identities retain teams; conflicted identity is contested/null |
+| Segmented artifact truthfulness | `tests/test_modal_app_v2.py` | ✅ New segmented mixed-identity regression failed before scoped handling | ✅ 146 focused V2 tests passed | ✅ `teams.json`, `tracks.jsonl`, and manifest agree on valid/unassigned identities |
+
+## Verification
+
+- Granular Team conflict focused command: `.venv/bin/python -m pytest
+  tests/test_runner_v2.py tests/test_modal_app_v2.py -q` — `146 passed`.
+- Strengthened segmented artifact regression uses the real `RunnerV2`, real
+  `RuntimeIdentityAuthority`, ReID/team stage receipts, and two contested stable
+  identities plus valid identities; only the stats file writer is isolated.
+- [x] Runtime authority now rejects zero accepted identities with
+  `identity_authority:no_accepted_identities`; mixed valid/contested rows remain
+  accepted. Added an all-contested runner regression.
+- [x] Added a production `run_stats_from_v2_observations` plus
+  `package_artifacts` regression without mocking the stats adapter or serializer;
+  it verifies `teams.json`, `tracks.jsonl`, and manifest acceptance provenance.
+- Full suite: `.venv/bin/python -m pytest -q` — `825 passed, 1 skipped`.
+
 - [x] BFloat16 ReID boundary remediation: BoxMOT 22.0.0 converts backend
   tensors with `.cpu().numpy()` at `base_backend.py:215`; V2's surrounding SAM
   CUDA autocast therefore made the tensor BFloat16 before BoxMOT's conversion.

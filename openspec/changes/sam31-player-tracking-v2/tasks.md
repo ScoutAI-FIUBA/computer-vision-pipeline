@@ -59,6 +59,8 @@ Chain strategy: feature-branch-chain
 - [x] 5.5 **RED/GREEN:** Add the explicit post-resolution identity-authority stage, wire it into V2 Modal, and cover accepted, rejected/scrubbed, and no-authority compatibility paths in runner and Modal boundary tests. Preserve the 0.85 Team policy.
 - [x] 5.6 **RED/GREEN:** Harden authority acceptance with runner-produced stable/ReID/Team stage receipts; reject forged prepopulated fields and diagnose missing receipts without changing no-authority behavior or atomic scrubbing.
 - [x] 5.7 **RED/GREEN:** Enforce opaque provenance for `RuntimeStageReceipts`; add multi-row acceptance and partial-stage-failure regressions proving all rows are checked and rejected results are scrubbed atomically.
+- [x] 5.8 **RED/GREEN:** Scope conflicting Team assignments to the affected stable identities; preserve valid stable/team authority, emit contested team provenance, and cover segmented artifact/manifest truthfulness.
+- [x] 5.9 **RED/GREEN:** Reject all-contested/all-unassigned authority inputs while retaining mixed acceptance, and verify production stats/manifest serialization without mocking the V2 stats adapter.
 
 ## Status
 

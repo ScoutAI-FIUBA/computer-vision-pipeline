@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 
 from pipeline.config import PipelineConfig
 from pipeline.runner import _BoundedProgress, run_stats_from_v2_observations
@@ -63,6 +64,73 @@ def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, m
     assert "[v2-stats] possession start" in output
     assert "[v2-stats] artifact writing start" in output
     assert "[v2-stats] stats complete" in output
+
+
+def test_v2_stats_adapter_serializes_scoped_team_conflicts_truthfully(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner,
+        "probe",
+        lambda _path: SimpleNamespace(
+            fps=30.0, frame_count=7, width=100, height=100, duration_seconds=7 / 30
+        ),
+    )
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    observations = [
+        {"frame_index": 0, "raw_track_id": 1, "stable_player_id": "player-1", "team_id": 0,
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"},
+        {"frame_index": 1, "raw_track_id": 2, "stable_player_id": "player-1", "team_id": 0,
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"},
+        {"frame_index": 2, "raw_track_id": 3, "stable_player_id": "player-2", "team_id": None,
+         "team_assignment": {"status": "contested", "reason": "conflicting_team_assignment",
+                              "provenance": {"stable_player_id": "player-2"}},
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"},
+        {"frame_index": 3, "raw_track_id": 4, "stable_player_id": "player-2", "team_id": None,
+         "team_assignment": {"status": "contested", "reason": "conflicting_team_assignment",
+                              "provenance": {"stable_player_id": "player-2"}},
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"},
+        {"frame_index": 4, "raw_track_id": 5, "stable_player_id": "player-3", "team_id": 1,
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"},
+        {"frame_index": 5, "raw_track_id": 6, "stable_player_id": "player-4", "team_id": None,
+         "team_assignment": {"status": "contested", "reason": "conflicting_team_assignment",
+                              "provenance": {"stable_player_id": "player-4"}},
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"},
+        {"frame_index": 6, "raw_track_id": 7, "stable_player_id": "player-4", "team_id": None,
+         "team_assignment": {"status": "contested", "reason": "conflicting_team_assignment",
+                              "provenance": {"stable_player_id": "player-4"}},
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"},
+    ]
+    acceptance_reasons = [
+        "conflicting_team_assignment:stable_player_id=player-2",
+        "conflicting_team_assignment:stable_player_id=player-4",
+    ]
+    for row in observations:
+        row["observation_key"] = f"{row['frame_index']}:{row['raw_track_id']}"
+    package_dir = tmp_path / "package"
+    package_artifacts(
+        package_dir, observations, {f"{row['frame_index']}:{row['raw_track_id']}":
+                                    np.ones((2, 2), dtype=np.uint8) for row in observations},
+        acceptance={"tracking_identity": "accepted", "statistics": "deferred"},
+        acceptance_reasons=acceptance_reasons,
+    )
+    result = run_stats_from_v2_observations(
+        video, PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none"),
+        tmp_path / "stats", observations,
+    )
+
+    teams = json.loads((tmp_path / "stats" / result.teams_file).read_text())
+    manifest = json.loads((package_dir / "manifest.json").read_text())
+    tracks = [json.loads(line) for line in (package_dir / "tracks.jsonl").read_text().splitlines()]
+    assert teams["assignments_by_track_id"] == {"1": 0, "2": 0, "5": 1}
+    assert teams["unassigned_track_ids"] == [3, 4, 6, 7]
+    assert manifest["acceptance"]["tracking_identity"] == "accepted"
+    assert manifest["acceptance_reasons"] == acceptance_reasons
+    assert {row["stable_player_id"] for row in tracks if row.get("team_id") is None} == {"player-2", "player-4"}
 
 
 def test_v2_stats_adapter_uses_tracknet_when_enabled(tmp_path, monkeypatch, capsys):

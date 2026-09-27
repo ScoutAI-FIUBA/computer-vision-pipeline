@@ -32,7 +32,7 @@ IdentityAuthority = Callable[
     [list[dict[str, Any]], "RuntimeStageReceipts"], "IdentityAuthorityDecision"
 ]
 _DERIVED_OBSERVATION_FIELDS = frozenset(
-    {"stable_player_id", "reid_embedding", "reid_evidence", "team_id"}
+    {"stable_player_id", "reid_embedding", "reid_evidence", "team_id", "team_assignment"}
 )
 _RUNTIME_RECEIPT_TOKEN = object()
 
@@ -184,6 +184,8 @@ class RuntimeIdentityAuthority:
     ) -> IdentityAuthorityDecision:
         if not isinstance(receipts, RuntimeStageReceipts) or not receipts._is_runner_provenance():
             return IdentityAuthorityDecision(False, ("identity_authority:invalid_stage_receipts",))
+        if not rows:
+            return IdentityAuthorityDecision(False, ("identity_authority:no_accepted_identities",))
         reasons: list[str] = []
         for row in rows:
             key = str(row.get("observation_key", ""))
@@ -463,7 +465,7 @@ def _run_team_id(
     team_count: int,
     frames_by_index: Mapping[int, Any],
     crops_by_observation: Mapping[str, MaskAppearanceCrop] | None = None,
-) -> tuple[dict[str, int], list[str], dict[str, Any]]:
+) -> tuple[dict[str, int], list[str], dict[str, Any], frozenset[str]]:
     observations: list[TeamObservation] = []
     next_detection_id = 1
     stable_ids = sorted(
@@ -519,6 +521,7 @@ def _run_team_id(
         minimum_vote_share=STABLE_PLAYER_TEAM_VOTE_SHARE_THRESHOLD,
     )
     conflicts = []
+    conflicted_stable_ids: set[str] = set()
     vote_diagnostics: dict[str, dict[str, Any]] = {}
     for stable_id in stable_ids:
         diagnostics = result.track_diagnostics.get(stable_to_track[stable_id], {})
@@ -529,6 +532,7 @@ def _run_team_id(
             }
         if diagnostics.get("vote_decision") != "assigned":
             conflicts.append(f"conflicting_team_assignment:stable_player_id={stable_id}")
+            conflicted_stable_ids.add(stable_id)
 
     assignments = {
         stable_id: int(assignment.team_id)
@@ -538,7 +542,12 @@ def _run_team_id(
         for stable_id, track_id in stable_to_track.items()
         if track_id == assignment.track_id
     }
-    return assignments, conflicts, vote_diagnostics
+    assignments = {
+        stable_id: team_id
+        for stable_id, team_id in assignments.items()
+        if stable_id not in conflicted_stable_ids
+    }
+    return assignments, conflicts, vote_diagnostics, frozenset(conflicted_stable_ids)
 
 
 class RunnerV2:
@@ -580,6 +589,8 @@ class RunnerV2:
             runtime_diagnostics["bbox_sanitizer"] = sanitizer_report.diagnostics
         acceptance_reasons = reasons
         stage_receipts = _mint_runtime_stage_receipts()
+        team_conflicts: list[str] = []
+        conflicted_stable_ids: frozenset[str] = frozenset()
 
         appearance_requested = self.seams.reid is not None or self.seams.team_embedder is not None
         if structurally_valid and appearance_requested and downstream_masks is None:
@@ -616,7 +627,7 @@ class RunnerV2:
                     and row["stable_player_id"].strip()
                 ]
             if team_rows:
-                team_assignments, team_reasons, vote_diagnostics = _run_team_id(
+                team_assignments, team_reasons, vote_diagnostics, conflicted_stable_ids = _run_team_id(
                     team_rows,
                     self.seams.team_embedder,
                     self.seams.team_clusterer or KMeansTeamClusterer(),
@@ -628,30 +639,45 @@ class RunnerV2:
                     "debug_runtime_only": True,
                     "team_vote_diagnostics": vote_diagnostics,
                 })
-                reasons.extend(team_reasons)
-                if not team_reasons:
+                team_conflicts.extend(team_reasons)
+                if team_assignments:
                     downstream["team_assignments"] = team_assignments
-                    stage_receipts = stage_receipts._with(
-                        team=frozenset(
-                            str(row["observation_key"])
-                            for row in team_rows
-                            if row.get("stable_player_id") in team_assignments
-                        ),
-                    )
-                    for row in rows:
-                        stable_id = row.get("stable_player_id")
-                        if stable_id in team_assignments:
-                            row["team_id"] = team_assignments[stable_id]
+                stage_receipts = stage_receipts._with(
+                    team=frozenset(
+                        str(row["observation_key"])
+                        for row in team_rows
+                        if row.get("stable_player_id") in team_assignments
+                    ),
+                )
+                for row in rows:
+                    stable_id = row.get("stable_player_id")
+                    if stable_id in team_assignments:
+                        row["team_id"] = team_assignments[stable_id]
+                    elif stable_id in conflicted_stable_ids:
+                        row["team_id"] = None
+                        row["team_assignment"] = {
+                            "status": "contested",
+                            "reason": "conflicting_team_assignment",
+                            "provenance": {
+                                "stable_player_id": stable_id,
+                                "source": "stable_identity_team_vote",
+                            },
+                        }
 
         authority_decision: IdentityAuthorityDecision | None = None
         if structurally_valid and self.seams.identity_authority is not None:
-            authority_decision = self.seams.identity_authority(rows, stage_receipts)
+            authority_rows = [
+                row for row in rows
+                if row.get("stable_player_id") not in conflicted_stable_ids
+            ]
+            authority_decision = self.seams.identity_authority(authority_rows, stage_receipts)
             if not isinstance(authority_decision, IdentityAuthorityDecision):
                 raise TypeError("identity_authority must return IdentityAuthorityDecision")
             if authority_decision.accepted and not reasons:
-                acceptance_reasons = list(authority_decision.reasons)
+                acceptance_reasons = list(authority_decision.reasons) + team_conflicts
             else:
                 reasons.extend(authority_decision.reasons or ("identity_authority_rejected",))
+                reasons.extend(team_conflicts)
 
         structurally_valid = not reasons
         if not structurally_valid:
@@ -668,6 +694,8 @@ class RunnerV2:
             acceptance["tracking_identity"] = "accepted"
         if not structurally_valid:
             acceptance_reasons = reasons
+        elif not acceptance_reasons:
+            acceptance_reasons = team_conflicts
         return RunnerV2Result(
             rows,
             downstream,
