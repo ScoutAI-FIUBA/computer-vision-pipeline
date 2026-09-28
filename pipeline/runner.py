@@ -45,7 +45,7 @@ from pipeline.number_evidence import (
     write_number_prediction_artifacts,
 )
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
-from pipeline.v2_numbers import run_v2_number_evidence
+from pipeline.v2_numbers import _remove_artifacts, run_v2_number_evidence
 from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.possession_v3 import (
@@ -889,6 +889,7 @@ def run_stats_from_v2_observations(
     number_predictor=None,
     masks_by_observation=None,
     clean_masks_by_observation=None,
+    number_detector=None,
 ) -> PipelineResults:
     """Run stats stages from authoritative V2 player rows without player tracking."""
     emit = on_progress or (lambda message: print(f"[v2-stats] {message}", flush=True))
@@ -986,11 +987,15 @@ def run_stats_from_v2_observations(
         max_frame_gap=config.possession_transition_max_gap,
     ))
     v3_manifest = phase("possession V3", lambda: _write_v3_artifacts(output_dir, rows, ball_rows, fps=info.fps, config=config))
-    numbers_available = phase("V2 jersey numbers", lambda: run_v2_number_evidence(
-        video_path, rows, config, output_dir, predictor=number_predictor,
-        masks_by_observation=masks_by_observation,
-        clean_masks_by_observation=clean_masks_by_observation,
-    ))
+    _remove_artifacts(output_dir)
+    numbers_available = False
+    if getattr(config, "number_evidence_enabled", True) and number_predictor is not None:
+        numbers_available = phase("V2 jersey numbers", lambda: run_v2_number_evidence(
+            video_path, rows, config, output_dir, predictor=number_predictor,
+            masks_by_observation=masks_by_observation,
+            clean_masks_by_observation=clean_masks_by_observation,
+            detector=number_detector,
+        ))
     results = PipelineResults(
         schema_version=RESULTS_SCHEMA_VERSION,
         video={"filename": video_path.name, "fps": info.fps, "frame_count": info.frame_count,

@@ -12,7 +12,8 @@ import hashlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from pipeline.number_evidence import NumberEvidenceSample
+from pipeline.detection import build_detector
+from pipeline.number_evidence import NumberEvidenceSample, associate_number_rows
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
 
 
@@ -71,6 +72,31 @@ def _masked_torso_crop(frame, player_xyxy, mask, *, mask_kind):
                        "mask_kind": mask_kind, "mask_coverage": round(coverage, 4)}
 
 
+def _detector_rows(result: dict, *, width: int, height: int) -> list[dict]:
+    """Convert the configured detector's Roboflow response to pixel rows."""
+    rows = []
+    for prediction in (result or {}).get("predictions", []):
+        if not isinstance(prediction, dict):
+            continue
+        class_name = prediction.get("class_name", prediction.get("class"))
+        if str(class_name) != "number":
+            continue
+        if all(key in prediction for key in ("x1", "y1", "x2", "y2")):
+            xyxy = [prediction[key] for key in ("x1", "y1", "x2", "y2")]
+        elif all(key in prediction for key in ("x", "y", "width", "height")):
+            x, y = float(prediction["x"]), float(prediction["y"])
+            width_box, height_box = float(prediction["width"]), float(prediction["height"])
+            xyxy = [x - width_box / 2, y - height_box / 2,
+                    x + width_box / 2, y + height_box / 2]
+        else:
+            continue
+        if not all(0 <= float(value) <= max(width, height) * 2 for value in xyxy):
+            continue
+        rows.append({"xyxy": [float(value) for value in xyxy],
+                     "confidence": prediction.get("confidence")})
+    return rows
+
+
 _NUMBER_ARTIFACTS = ("numbers.json", "number_predictions.json", "number_prediction_cases.jsonl", "number_manifest.json")
 
 
@@ -120,8 +146,9 @@ def run_v2_number_evidence(
     predictor=None,
     masks_by_observation=None,
     clean_masks_by_observation=None,
+    detector=None,
 ) -> bool:
-    """Predict sampled player crops and write V2-owned number artifacts."""
+    """Use legacy detector number boxes, associated to authoritative V2 players."""
     sampled = _sampled_rows(rows, max(1, int(config.frame_stride)))
     if not sampled:
         _remove_artifacts(output_dir)
@@ -129,6 +156,9 @@ def run_v2_number_evidence(
 
     _remove_artifacts(output_dir)
     predictor = build_number_predictor(config) if predictor is None else predictor
+    # A missing detector is the explicit/local fallback seam used by old callers;
+    # Modal always supplies the configured basketball detector.
+    detector = build_detector(config) if detector is None and getattr(config, "number_detector_enabled", False) else detector
     import cv2
 
     by_frame = defaultdict(list)
@@ -142,23 +172,48 @@ def run_v2_number_evidence(
             ok, frame = capture.read()
             if not ok:
                 continue
-            for row in by_frame[frame_index]:
-                player_xyxy = tuple(float(value) for value in row["xyxy"])
-                mask, mask_kind = _mask_for_row(row, masks_by_observation, clean_masks_by_observation)
-                crop, number_xyxy, evidence = _masked_torso_crop(
-                    frame, player_xyxy, mask, mask_kind=mask_kind
-                )
-                evidence["player_xyxy"] = list(player_xyxy)
-                evidence["number_xyxy"] = list(number_xyxy)
-                sample = NumberEvidenceSample(
-                    track_id=int(row["track_id"]), frame_index=frame_index,
-                    track_state=str(row.get("track_state", "tracked")),
-                    player_xyxy=player_xyxy, number_xyxy=tuple(number_xyxy),
-                    player_confidence=row.get("confidence"), number_confidence=None,
-                    overlap_ratio=float(evidence.get("mask_coverage", 0.0)),
-                    player_overlap_ratio=float(evidence.get("mask_coverage", 0.0)),
-                    contains_number_center=bool(evidence.get("mask_used", False)), crop_image=crop,
-                )
+            player_rows = by_frame[frame_index]
+            number_rows = _detector_rows(
+                detector.detect(frame), width=frame.shape[1], height=frame.shape[0]
+            ) if detector is not None else []
+            associated = associate_number_rows(
+                frame, player_rows, number_rows, frame_index=frame_index
+            ) if number_rows else []
+            if detector is None and not associated:
+                # Compatibility fallback for local callers that have not opted
+                # into the object detector seam yet.
+                associated = []
+                for row in player_rows:
+                    player_xyxy = tuple(float(value) for value in row["xyxy"])
+                    mask, mask_kind = _mask_for_row(row, masks_by_observation, clean_masks_by_observation)
+                    crop, number_xyxy, evidence = _masked_torso_crop(
+                        frame, player_xyxy, mask, mask_kind=mask_kind
+                    )
+                    associated.append(NumberEvidenceSample(
+                        track_id=int(row["track_id"]), frame_index=frame_index,
+                        track_state=str(row.get("track_state", "tracked")),
+                        player_xyxy=player_xyxy, number_xyxy=tuple(number_xyxy),
+                        player_confidence=row.get("confidence"), number_confidence=None,
+                        overlap_ratio=float(evidence.get("mask_coverage", 0.0)),
+                        player_overlap_ratio=float(evidence.get("mask_coverage", 0.0)),
+                        contains_number_center=bool(evidence.get("mask_used", False)), crop_image=crop,
+                        confidence_hints={"fallback_row": row, "evidence": evidence},
+                    ))
+            row_by_track = {int(row["track_id"]): row for row in player_rows}
+            for sample in associated:
+                row = row_by_track[sample.track_id]
+                player_xyxy = sample.player_xyxy
+                evidence = {
+                    "association_method": "object_detector_number_box" if number_rows else "torso_roi_fallback",
+                    "source": "legacy_basketball_object_detector" if number_rows else "torso_roi_fallback",
+                    "player_xyxy": list(player_xyxy), "number_xyxy": list(sample.number_xyxy),
+                    "overlap_ratio": sample.overlap_ratio, "player_overlap_ratio": sample.player_overlap_ratio,
+                    "contains_number_center": sample.contains_number_center,
+                }
+                crop = sample.crop_image
+                if not number_rows:
+                    fallback_evidence = sample.confidence_hints.get("evidence", {})
+                    evidence.update(fallback_evidence)
                 prediction = predictor.predict(sample)
                 number, accepted = normalize_number_prediction(
                     prediction, threshold=config.number_predictor_score_threshold
@@ -172,7 +227,7 @@ def run_v2_number_evidence(
                     "accepted": accepted,
                     "score": prediction.score,
                     "raw_response": prediction.raw_response,
-                    "evidence": {**evidence, "source": "sam31_v2_observations"},
+                    "evidence": evidence,
                 })
     except Exception:
         _remove_artifacts(output_dir)
@@ -188,6 +243,7 @@ def run_v2_number_evidence(
     )
     (output_dir / "numbers.json").write_text(json.dumps({
         "source": "sam31_v2_observations", "identity_authority": "stable_player_id",
+        "evidence_sources": sorted({record["evidence"].get("source", "unknown") for record in records}),
         "sample_stride": int(config.frame_stride), "players": _aggregate(records),
     }, indent=2), encoding="utf-8")
     artifact_names = ["numbers.json", "number_predictions.json", "number_prediction_cases.jsonl"]
@@ -197,6 +253,7 @@ def run_v2_number_evidence(
         artifacts[name] = {"sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
     (output_dir / "number_manifest.json").write_text(json.dumps({
         "source": "sam31_v2_observations", "sampled_frames": sorted(by_frame),
+        "evidence_sources": sorted({record["evidence"].get("source", "unknown") for record in records}),
         "prediction_count": len(records), "artifacts": artifacts,
     }, indent=2), encoding="utf-8")
     return bool(records)

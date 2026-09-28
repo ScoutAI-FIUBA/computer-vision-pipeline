@@ -15,11 +15,12 @@ def fake_v2_stats(monkeypatch, request):
     if request.node.name in {
         "test_process_exercises_real_stats_adapter_and_manifest_contract",
         "test_process_uses_v3_image_config_and_returns_v3_artifacts",
+        "test_process_end_to_end_number_detector_reaches_real_v2_stats_chain",
     }:
         return
     import modal_app_v2
 
-    def run(_video_path, output_dir, _observations):
+    def run(_video_path, output_dir, _observations, **_kwargs):
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "results.json").write_text("{}", encoding="utf-8")
         (output_dir / "tracks.jsonl").write_text("", encoding="utf-8")
@@ -1116,6 +1117,9 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
     monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: ([], {}))
     monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
     monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "build_detector", lambda _config: (_ for _ in ()).throw(
+        AssertionError("number detector must not initialize without stable V2 players")
+    ))
     monkeypatch.setattr(modal_app_v2, "run_v2", lambda rows, **_kwargs: types.SimpleNamespace(
         observations=rows, acceptance={}, acceptance_reasons=[]
     ))
@@ -1154,6 +1158,55 @@ def test_process_exercises_real_stats_adapter_and_manifest_contract(monkeypatch)
     assert manifest["legacy_stats_results"] == "stats/results.json"
 
 
+def test_process_disabled_number_evidence_skips_predictor_and_detector(monkeypatch):
+    import modal_app_v2
+
+    rows = [{"observation_key": "60:3", "frame_index": 60, "raw_track_id": 3, "stable_player_id": "stable-3",
+             "bbox_xyxy": [1, 2, 11, 22], "track_state": "tracked"}]
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("NUMBER_EVIDENCE_ENABLED", "0")
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: (rows, {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **_kwargs: types.SimpleNamespace(
+        observations=observations, acceptance={}, acceptance_reasons=[]
+    ))
+    monkeypatch.setattr(modal_app_v2, "build_number_predictor", lambda _config: (_ for _ in ()).throw(
+        AssertionError("disabled number predictor must not initialize")
+    ))
+    monkeypatch.setattr(modal_app_v2, "build_detector", lambda _config: (_ for _ in ()).throw(
+        AssertionError("disabled number detector must not initialize")
+    ))
+    seen = {}
+
+    def disabled_stats(_video, output_dir, _observations, **kwargs):
+        seen.update(kwargs)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in {
+            "results.json": json.dumps({"numbers_file": None}),
+            "tracks.jsonl": "", "teams.json": "{}", "shot_events.jsonl": "",
+        }.items():
+            (output_dir / name).write_text(content, encoding="utf-8")
+        return types.SimpleNamespace(to_dict=lambda: {
+            "tracks_file": "tracks.jsonl", "teams_file": "teams.json",
+            "numbers_file": None, "shot_events_file": "shot_events.jsonl",
+        })
+
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", disabled_stats)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+               if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__
+                                       if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
+    assert seen["number_predictor"] is None
+    assert seen["number_detector"] is None
+    results = json.loads(payload["artifacts"]["stats/results.json"])
+    assert results["numbers_file"] is None
+    assert not any(name.startswith("stats/number") for name in payload["artifacts"])
+
+
 def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifacts(monkeypatch):
     import modal_app_v2
 
@@ -1165,6 +1218,7 @@ def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifa
     predictor = object()
     predictor_configs = []
     seen = []
+    detector = object()
 
     monkeypatch.setenv("NUMBER_PREDICTOR_BACKEND", "roboflow-hosted")
     monkeypatch.setenv("NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID", "test-jersey-model/9")
@@ -1181,9 +1235,11 @@ def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifa
         return predictor
 
     monkeypatch.setattr(modal_app_v2, "build_number_predictor", fake_build_number_predictor)
+    monkeypatch.setattr(modal_app_v2, "build_detector", lambda _config: detector)
 
     def fake_stats(_video, output_dir, _observations, **kwargs):
         seen.append(kwargs["number_predictor"])
+        seen.append(kwargs["number_detector"])
         output_dir.mkdir(parents=True, exist_ok=True)
         files = {
             "results.json": json.dumps({"numbers_file": "numbers.json"}),
@@ -1210,7 +1266,7 @@ def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifa
     assert predictor_configs[0].number_predictor_backend == "roboflow-hosted"
     assert predictor_configs[0].number_predictor_roboflow_model_id == "test-jersey-model/9"
     assert predictor_configs[0].roboflow_api_key == "test-key"
-    assert seen == [predictor]
+    assert seen == [predictor, detector]
     manifest = json.loads(artifacts["manifest.json"])
     stats_refs = manifest["artifacts"]["legacy_stats"]
     for name in ("numbers", "number_predictions", "number_prediction_cases", "number_manifest"):
@@ -1218,6 +1274,105 @@ def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifa
         data = artifacts[reference["key"]]
         assert reference["size_bytes"] == len(data)
         assert reference["sha256"] == hashlib.sha256(data).hexdigest()
+    results = json.loads(artifacts["stats/results.json"])
+    assert results["numbers_file"] == "numbers.json"
+
+
+def test_process_end_to_end_number_detector_reaches_real_v2_stats_chain(monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    import pipeline.runner as runner
+    from pipeline.config import PipelineConfig
+    from pipeline.number_predictor import NumberPrediction
+
+    rows = [{
+        "observation_key": "60:7", "frame_index": 60, "raw_track_id": 7,
+        "stable_player_id": "stable-7", "bbox_xyxy": [5, 5, 25, 35],
+        "track_state": "tracked", "confidence": 0.95,
+    }]
+    info = types.SimpleNamespace(fps=30.0, frame_count=1, width=60, height=40, duration_seconds=1 / 30)
+
+    class Detector:
+        def __init__(self): self.frames = []
+        def detect(self, frame):
+            self.frames.append(int(frame[0, 0, 0]))
+            return {"predictions": [{
+                "class": "number", "x": 15, "y": 15, "width": 10, "height": 8,
+                "confidence": 0.91,
+            }]}
+
+    class Predictor:
+        name = "fake"
+        def __init__(self): self.samples = []
+        def predict(self, sample):
+            self.samples.append(sample)
+            return NumberPrediction("23", 0.99)
+
+    detector, predictor = Detector(), Predictor()
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setattr(PipelineConfig, "from_env", classmethod(lambda cls: PipelineConfig(
+        roboflow_api_key="test-key", frame_stride=1, team_embedder_backend="none",
+        number_predictor_backend="dummy", possession_engine="legacy",
+    )))
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: (rows, {}))
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **_kwargs: types.SimpleNamespace(
+        observations=observations, acceptance={}, acceptance_reasons=[], runtime_diagnostics={},
+    ))
+    monkeypatch.setattr(modal_app_v2, "build_detector", lambda _config: detector)
+    monkeypatch.setattr(modal_app_v2, "build_number_predictor", lambda _config: predictor)
+    monkeypatch.setattr(runner, "probe", lambda _path: info)
+
+    class Capture:
+        def __init__(self, _path): self.frame = None
+        def set(self, _property, frame): self.frame = frame
+        def read(self): return True, np.full((40, 60, 3), self.frame or 0, dtype=np.uint8)
+        def release(self): pass
+
+    monkeypatch.setitem(sys.modules, "cv2", types.SimpleNamespace(
+        VideoCapture=Capture, CAP_PROP_POS_FRAMES=1,
+    ))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+    monkeypatch.setattr(runner, "_attach_ball_evidence", lambda output_dir, **_kwargs: (
+        (output_dir / "shot_evidence.jsonl").write_text("")
+    ))
+
+    def write_possession(output_dir, *_args, **_kwargs):
+        events, transitions = output_dir / "possession_events.jsonl", output_dir / "possession_transitions.jsonl"
+        events.write_text("")
+        transitions.write_text("")
+        return events, transitions
+
+    monkeypatch.setattr(runner, "_write_possession_artifacts", write_possession)
+    monkeypatch.setattr(runner, "_write_v3_artifacts", lambda *_args, **_kwargs: {})
+
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+               if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__
+                                       if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
+    artifacts = payload["artifacts"]
+    assert detector.frames == [60]
+    assert [sample.frame_index for sample in predictor.samples] == [60]
+    assert predictor.samples[0].number_xyxy == (10.0, 11.0, 20.0, 19.0)
+
+    prediction = json.loads(artifacts["stats/number_predictions.json"])["predictions"][0]
+    assert prediction["stable_player_id"] == "stable-7"
+    assert prediction["evidence"]["source"] == "legacy_basketball_object_detector"
+    assert prediction["evidence"]["association_method"] == "object_detector_number_box"
+    number_manifest = json.loads(artifacts["stats/number_manifest.json"])
+    assert number_manifest["evidence_sources"] == ["legacy_basketball_object_detector"]
+    numbers = json.loads(artifacts["stats/numbers.json"])
+    assert numbers["players"][0]["stable_player_id"] == "stable-7"
+
+    manifest = json.loads(artifacts["manifest.json"])
+    stats = manifest["artifacts"]["legacy_stats"]
+    assert stats["numbers"]["key"] == "stats/numbers.json"
+    assert stats["number_predictions"]["key"] == "stats/number_predictions.json"
+    assert stats["number_manifest"]["key"] == "stats/number_manifest.json"
     results = json.loads(artifacts["stats/results.json"])
     assert results["numbers_file"] == "numbers.json"
 
@@ -1248,7 +1403,7 @@ def test_process_uses_v3_image_config_and_returns_v3_artifacts(monkeypatch):
         ),
     )
 
-    def fake_stats(_video_path, config, output_dir, _observations):
+    def fake_stats(_video_path, config, output_dir, _observations, **_kwargs):
         assert config.possession_v3_enabled is True
         output_dir.mkdir(parents=True, exist_ok=True)
         files = {
@@ -1438,7 +1593,7 @@ def test_segmented_conflicted_team_is_scoped_in_artifacts_and_manifest(monkeypat
         )).run(observations, **kwargs),
     )
 
-    def stats(_video_path, output_dir, observations):
+    def stats(_video_path, output_dir, observations, **_kwargs):
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "results.json").write_text("{}", encoding="utf-8")
         (output_dir / "tracks.jsonl").write_text("", encoding="utf-8")

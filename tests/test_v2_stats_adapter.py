@@ -507,6 +507,88 @@ def test_v2_number_sampling_uses_stable_ids_and_preserves_conflicts(tmp_path, mo
     assert player["conflicts"] == []
 
 
+def test_v2_numbers_reuses_object_detector_number_boxes_and_samples_only_matching_frames(tmp_path, monkeypatch):
+    import sys
+    import types
+    import pipeline.v2_numbers as numbers
+    from pipeline.number_predictor import NumberPrediction
+
+    class Capture:
+        def __init__(self, _path): self.frame = None
+        def set(self, _property, frame): self.frame = frame
+        def read(self): return True, np.full((40, 60, 3), int(self.frame or 0), dtype=np.uint8)
+        def release(self): pass
+
+    monkeypatch.setitem(sys.modules, "cv2", types.SimpleNamespace(
+        VideoCapture=Capture, CAP_PROP_POS_FRAMES=1,
+    ))
+
+    class Detector:
+        def __init__(self): self.frames = []
+        def detect(self, frame):
+            self.frames.append(int(frame[0, 0, 0]))
+            return {"predictions": [
+                {"class": "number", "x": 15, "y": 15, "width": 10, "height": 8, "confidence": 0.91},
+                {"class": "player", "x": 45, "y": 15, "width": 10, "height": 8, "confidence": 0.99},
+            ]}
+
+    class Predictor:
+        name = "fake"
+        def __init__(self): self.samples = []
+        def predict(self, sample):
+            self.samples.append(sample)
+            return NumberPrediction("23", 0.99)
+
+    detector, predictor = Detector(), Predictor()
+    rows = [
+        {"frame_index": frame, "track_id": 10, "stable_player_id": "stable-a",
+         "xyxy": [5, 5, 25, 35], "track_state": "tracked"}
+        for frame in range(4)
+    ]
+    config = PipelineConfig(roboflow_api_key="key", frame_stride=2, team_embedder_backend="none")
+    assert numbers.run_v2_number_evidence(
+        tmp_path / "video.mp4", rows, config, tmp_path, predictor=predictor, detector=detector
+    )
+
+    assert detector.frames == [0, 2]
+    assert [sample.frame_index for sample in predictor.samples] == [0, 2]
+    assert predictor.samples[0].number_xyxy == (10.0, 11.0, 20.0, 19.0)
+    evidence = json.loads((tmp_path / "number_predictions.json").read_text())["predictions"][0]["evidence"]
+    assert evidence["source"] == "legacy_basketball_object_detector"
+    assert evidence["association_method"] == "object_detector_number_box"
+    assert evidence["overlap_ratio"] == 1.0
+    assert evidence["player_overlap_ratio"] < 1.0
+
+
+def test_v2_numbers_with_detector_without_number_boxes_has_no_evidence(tmp_path, monkeypatch):
+    import sys
+    import types
+    import pipeline.v2_numbers as numbers
+
+    class Capture:
+        def __init__(self, _path): pass
+        def set(self, _property, _frame): pass
+        def read(self): return True, np.zeros((20, 20, 3), dtype=np.uint8)
+        def release(self): pass
+
+    monkeypatch.setitem(sys.modules, "cv2", types.SimpleNamespace(
+        VideoCapture=Capture, CAP_PROP_POS_FRAMES=1,
+    ))
+
+    class Detector:
+        def detect(self, _frame): return {"predictions": []}
+
+    class Predictor:
+        def predict(self, _sample): raise AssertionError("OCR must not run without a number box")
+
+    config = PipelineConfig(roboflow_api_key="key", frame_stride=1, team_embedder_backend="none")
+    row = {"frame_index": 0, "track_id": 1, "stable_player_id": "p-1", "xyxy": [1, 1, 10, 18]}
+    assert not numbers.run_v2_number_evidence(
+        tmp_path / "video.mp4", [row], config, tmp_path, predictor=Predictor(), detector=Detector()
+    )
+    assert all(not (tmp_path / name).exists() for name in numbers._NUMBER_ARTIFACTS)
+
+
 def test_v2_number_aggregation_marks_ambiguous_and_unknown():
     from pipeline.v2_numbers import _aggregate
 
@@ -616,3 +698,34 @@ def test_run_stats_v2_writes_number_artifacts_and_hashed_references(tmp_path, mo
         assert reference["sha256"] == hashlib.sha256(data).hexdigest()
     prediction = json.loads((output / "number_predictions.json").read_text())["predictions"][0]
     assert prediction["evidence"]["association_method"] == "masked_torso_roi"
+
+
+def test_run_stats_v2_disabled_numbers_skip_initialization_and_remove_reused_artifacts(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    output = tmp_path / "stats"
+    output.mkdir()
+    for name in ("numbers.json", "number_predictions.json", "number_prediction_cases.jsonl", "number_manifest.json"):
+        (output / name).write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(
+        fps=30.0, frame_count=1, width=40, height=40, duration_seconds=1 / 30,
+    ))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    class MustNotRun:
+        def predict(self, _sample): raise AssertionError("number predictor must stay disabled")
+        def detect(self, _frame): raise AssertionError("number detector must stay disabled")
+
+    config = PipelineConfig(
+        roboflow_api_key="key", team_embedder_backend="none", number_evidence_enabled=False,
+    )
+    result = run_stats_from_v2_observations(
+        tmp_path / "input.mp4", config, output,
+        [{"frame_index": 0, "raw_track_id": 1, "stable_player_id": "stable-1",
+          "bbox_xyxy": [2, 2, 30, 38], "track_state": "tracked"}],
+        number_predictor=MustNotRun(), number_detector=MustNotRun(),
+    )
+    assert result.numbers_file is None
+    assert all(not (output / name).exists() for name in (
+        "numbers.json", "number_predictions.json", "number_prediction_cases.jsonl", "number_manifest.json",
+    ))

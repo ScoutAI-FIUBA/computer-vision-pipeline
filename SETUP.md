@@ -76,13 +76,16 @@ The expected values are `tracknet_enabled: True` and at least one non-lost
 ball row for a clip where TrackNet detects the ball.
 
 V2 jersey numbers use the existing predictor settings but do not invoke the
-legacy pipeline. Player crops are sampled every `FRAME_STRIDE` frames and votes
-are grouped by `stable_player_id`; two consistent accepted reads are required
-for confirmation. Local/offline callers use `NUMBER_PREDICTOR_BACKEND=dummy` by
-default. The V2 Modal image sets `NUMBER_PREDICTOR_BACKEND=roboflow-hosted` and
-uses the configured `scoutai-roboflow` Modal secret for OCR. Inspect
-`stats/number_manifest.json`, `stats/number_predictions.json`, and
-`stats/numbers.json`; increasing `FRAME_STRIDE` reduces hosted inference cost.
+legacy pipeline. On every `FRAME_STRIDE` sample, V2 calls the configured
+basketball detector, associates its `number` box to the matching SAM3 player
+row, and sends that number crop to OCR. Votes are grouped by `stable_player_id`;
+two consistent accepted reads are required for confirmation. Local/offline
+callers use `NUMBER_PREDICTOR_BACKEND=dummy` by default. The V2 Modal image uses
+the configured `PLAYER_MODEL_ID` detector, hosted OCR, and the
+`scoutai-roboflow` Modal secret. Inspect `stats/number_manifest.json`,
+`stats/number_predictions.json`, and `stats/numbers.json`; increasing
+`FRAME_STRIDE` reduces detector and OCR inference cost. If the detector returns
+no `number` boxes, OCR is not invoked and no number artifacts are fabricated.
 
 The V2 image opts its existing stats adapter into Possession V3 without changing
 the legacy Modal image:

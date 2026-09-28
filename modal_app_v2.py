@@ -24,6 +24,7 @@ from pipeline.results import (
 )
 from pipeline.config import PipelineConfig
 from pipeline.number_predictor import build_number_predictor
+from pipeline.detection import build_detector
 from pipeline.runner import run_stats_from_v2_observations
 from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
@@ -264,18 +265,16 @@ def _load_video_frames(path: Path, frame_start: int, frame_end: int) -> dict[int
 
 
 def _run_v2_stats(video_path: Path, output_dir: Path, observations, *, masks=None, clean_masks=None,
-                  config=None, number_predictor=None):
+                  config=None, number_predictor=None, number_detector=None):
     """Run stats from SAM3.1 rows; never construct a legacy player tracker."""
     config = config or PipelineConfig.from_env()
     kwargs = {
         "masks_by_observation": masks,
         "clean_masks_by_observation": clean_masks,
         "number_predictor": number_predictor,
+        "number_detector": number_detector,
     }
-    parameters = inspect.signature(run_stats_from_v2_observations).parameters
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()) or "masks_by_observation" in parameters:
-        return run_stats_from_v2_observations(video_path, config, output_dir, observations, **kwargs)
-    return run_stats_from_v2_observations(video_path, config, output_dir, observations)
+    return run_stats_from_v2_observations(video_path, config, output_dir, observations, **kwargs)
 
 
 def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
@@ -551,23 +550,24 @@ class PipelineV2:
                     acceptance=result.acceptance,
                     acceptance_reasons=result.acceptance_reasons,
                 )
+                numbers_enabled = bool(getattr(config, "number_evidence_enabled", True))
+                has_stable_players = any(row.get("stable_player_id") for row in result.observations)
                 number_predictor = (
                     build_number_predictor(config)
-                    if any(row.get("stable_player_id") for row in result.observations)
-                    else None
+                    if numbers_enabled and has_stable_players else None
+                )
+                number_detector = (
+                    build_detector(config)
+                    if numbers_enabled and has_stable_players else None
                 )
                 stats_kwargs = {
                     "masks": masks, "clean_masks": clean_masks, "config": config,
                     "number_predictor": number_predictor,
+                    "number_detector": number_detector,
                 }
-                stats_parameters = inspect.signature(_run_v2_stats).parameters
-                if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in stats_parameters.values()) or "masks" in stats_parameters:
-                    stats_result = _run_v2_stats(
-                        video_path, output_dir / "stats", result.observations, **stats_kwargs
-                    )
-                else:
-                    # Keep lightweight integrations compatible with the original seam.
-                    stats_result = _run_v2_stats(video_path, output_dir / "stats", result.observations)
+                stats_result = _run_v2_stats(
+                    video_path, output_dir / "stats", result.observations, **stats_kwargs
+                )
                 stats_payload = stats_result.to_dict()
                 artifact_manifest["artifacts"]["legacy_stats"] = {
                     name: _artifact_ref(output_dir / "stats" / filename, f"stats/{filename}")

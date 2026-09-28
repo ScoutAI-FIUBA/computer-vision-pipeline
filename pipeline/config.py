@@ -307,6 +307,7 @@ class PipelineConfig:
     number_predictor_backend: str = DEFAULT_NUMBER_PREDICTOR_BACKEND
     number_predictor_roboflow_model_id: str = DEFAULT_NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID
     number_predictor_score_threshold: float = DEFAULT_NUMBER_PREDICTOR_SCORE_THRESHOLD
+    number_evidence_enabled: bool = True
 
     # COST: the detector call for segment N+1 is fired in a background thread
     # while SAM2 is still working on segment N, so the ~0.3s HTTP round-trip
@@ -498,6 +499,8 @@ class PipelineConfig:
                 "NUMBER_PREDICTOR_SCORE_THRESHOLD",
                 DEFAULT_NUMBER_PREDICTOR_SCORE_THRESHOLD,
             ),
+            "number_evidence_enabled": os.getenv("NUMBER_EVIDENCE_ENABLED", "1").lower()
+            in {"1", "true", "yes"},
         }
         values.update({key: value for key, value in overrides.items() if value is not None})
         return cls(**values)  # type: ignore[arg-type]
