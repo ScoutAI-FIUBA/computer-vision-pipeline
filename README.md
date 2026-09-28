@@ -422,7 +422,9 @@ sampled V2 player boxes are cropped from the video every `FRAME_STRIDE` source
 frames, associated directly with their `stable_player_id`, and aggregated with a
 minimum two-read support requirement. This keeps OCR spend proportional to the
 sampling stride. The dummy backend is safe for dry runs and produces unknown
-votes; hosted Roboflow is enabled only with `NUMBER_PREDICTOR_BACKEND=roboflow-hosted`.
+votes. The V2 Modal image sets `NUMBER_PREDICTOR_BACKEND=roboflow-hosted` and
+uses the attached `scoutai-roboflow` secret. Local and non-Modal callers still
+default to the dummy backend.
 
 What it does today:
 
@@ -434,9 +436,10 @@ What it does today:
 
 Confirmation is intentionally conservative:
 
-- A track is `confirmed` only when one accepted number wins cleanly.
+- A track is `confirmed` only when one number wins cleanly with at least two
+  accepted reads.
 - Conflicting accepted reads keep the track `ambiguous` instead of guessing.
-- One accepted valid read can still confirm a number when there are no competing accepted reads for that track.
+- A single accepted valid read remains ambiguous until a second matching read is available.
 - Non-digit, low-score, or unsupported-length OCR reads are ignored.
 
 Current number artifacts from one pipeline run:

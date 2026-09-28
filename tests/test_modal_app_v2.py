@@ -146,6 +146,37 @@ def test_v2_image_enables_v3_without_changing_legacy_config(monkeypatch):
     assert legacy.possession_v3_enabled is False
 
 
+def test_v2_image_enables_hosted_jersey_number_predictor_without_changing_local_default():
+    source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    env_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "env"
+    )
+    env = {
+        key.value: value.value
+        for key, value in zip(env_call.args[0].keys, env_call.args[0].values)
+        if isinstance(key, ast.Constant) and isinstance(value, ast.Constant)
+    }
+    assert env["NUMBER_PREDICTOR_BACKEND"] == "roboflow-hosted"
+
+    from pipeline.config import PipelineConfig
+
+    assert PipelineConfig.from_env(roboflow_api_key="test-key").number_predictor_backend == "dummy"
+
+
+def test_v2_runtime_declaration_attaches_roboflow_secret_without_hydrating_modal():
+    import modal_app_v2
+
+    service_function = modal_app_v2.PipelineV2._get_class_service_function()
+    secret_names = {secret._name for secret in service_function.spec.secrets}
+
+    assert "scoutai-roboflow" in secret_names
+
+
 def test_v2_image_pins_sam31_runtime_dependencies():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -1132,7 +1163,12 @@ def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifa
         "track_state": "tracked",
     }]
     predictor = object()
+    predictor_configs = []
     seen = []
+
+    monkeypatch.setenv("NUMBER_PREDICTOR_BACKEND", "roboflow-hosted")
+    monkeypatch.setenv("NUMBER_PREDICTOR_ROBOFLOW_MODEL_ID", "test-jersey-model/9")
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
 
     monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: (rows, {}))
     monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
@@ -1140,7 +1176,11 @@ def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifa
     monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **_kwargs: types.SimpleNamespace(
         observations=observations, acceptance={}, acceptance_reasons=[],
     ))
-    monkeypatch.setattr(modal_app_v2, "build_number_predictor", lambda _config: predictor)
+    def fake_build_number_predictor(config):
+        predictor_configs.append(config)
+        return predictor
+
+    monkeypatch.setattr(modal_app_v2, "build_number_predictor", fake_build_number_predictor)
 
     def fake_stats(_video, output_dir, _observations, **kwargs):
         seen.append(kwargs["number_predictor"])
@@ -1166,6 +1206,10 @@ def test_process_populated_v2_number_boundary_reuses_predictor_and_hashes_artifa
 
     payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
     artifacts = payload["artifacts"]
+    assert len(predictor_configs) == 1
+    assert predictor_configs[0].number_predictor_backend == "roboflow-hosted"
+    assert predictor_configs[0].number_predictor_roboflow_model_id == "test-jersey-model/9"
+    assert predictor_configs[0].roboflow_api_key == "test-key"
     assert seen == [predictor]
     manifest = json.loads(artifacts["manifest.json"])
     stats_refs = manifest["artifacts"]["legacy_stats"]

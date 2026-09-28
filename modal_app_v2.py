@@ -93,6 +93,7 @@ image = (
         "BALL_ALL_FRAMES": "1",
         "BBOX_SANITIZER_ENABLED": "1",
         "POSSESSION_ENGINE": "v3",
+        "NUMBER_PREDICTOR_BACKEND": "roboflow-hosted",
     })
     .add_local_python_source("pipeline")
     .add_local_file("scripts/ball/tracknet.py", remote_path="/root/scripts/ball/tracknet.py")
