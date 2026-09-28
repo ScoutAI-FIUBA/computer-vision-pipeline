@@ -192,6 +192,7 @@ class PossessionAudit:
     frame_end: int | None = None
     timestamp_start: float | None = None
     timestamp_end: float | None = None
+    reverted_switch_duration_seconds: float | None = None
     provenance: Provenance = field(default_factory=Provenance)
 
     def __post_init__(self) -> None:
@@ -222,6 +223,11 @@ class PossessionAudit:
         for value, name in ((self.timestamp_start, "timestamp_start"), (self.timestamp_end, "timestamp_end")):
             if value is not None and (type(value) not in {int, float} or not math.isfinite(value) or value < 0):
                 raise ValueError(f"{name} must be finite and non-negative")
+        if (self.reverted_switch_duration_seconds is not None and
+                (type(self.reverted_switch_duration_seconds) not in {int, float} or
+                 not math.isfinite(self.reverted_switch_duration_seconds) or
+                 self.reverted_switch_duration_seconds < 0)):
+            raise ValueError("reverted_switch_duration_seconds must be finite and non-negative")
         if self.frame_start is not None and self.frame_end is not None and self.frame_end < self.frame_start:
             raise ValueError("frame_end must not precede frame_start")
         if self.timestamp_start is not None and self.timestamp_end is not None and self.timestamp_end < self.timestamp_start:
@@ -878,7 +884,13 @@ def _holder_by_frame(states):
     result = {}
     for state in states or []:
         frame = state.frame_index if isinstance(state, PossessionObservation) else state.get("frame_index")
-        holder = state.stable_player_id if isinstance(state, PossessionObservation) else state.get("stable_player_id")
+        if isinstance(state, PossessionObservation):
+            holder = state.context.effective_holder_id
+        else:
+            context = state.get("context", {})
+            holder = context.get("effective_holder_id") if isinstance(context, dict) else None
+            if holder is None:
+                holder = state.get("stable_player_id")
         result[frame] = holder
     return result
 
@@ -890,6 +902,93 @@ def _team_by_frame(states):
         team = state.team_id if isinstance(state, PossessionObservation) else state.get("team_id")
         result[frame] = team
     return result
+
+
+def debounce_reverted_switches(observations, *, real_fps, window_seconds=.5):
+    """Collapse short, fully resolved A→B→A intervals without hiding evidence."""
+    if type(real_fps) not in {int, float} or not math.isfinite(float(real_fps)) or real_fps <= 0:
+        raise ValueError("real_fps must be positive")
+    if type(window_seconds) not in {int, float} or not math.isfinite(float(window_seconds)) or window_seconds < 0:
+        raise ValueError("window_seconds must be finite and non-negative")
+    rows = list(observations)
+    if not rows or not all(isinstance(row, (PossessionObservation, dict)) for row in rows):
+        return rows
+    rows.sort(key=lambda row: row.frame_index if isinstance(row, PossessionObservation) else row["frame_index"])
+
+    def holder(row):
+        if isinstance(row, PossessionObservation):
+            return row.context.effective_holder_id
+        context = row.get("context", {})
+        return context.get("effective_holder_id") if isinstance(context, dict) else None
+
+    def timestamp(row):
+        value = row.timestamp_seconds if isinstance(row, PossessionObservation) else row.get("timestamp_seconds")
+        return float(value) if type(value) in {int, float} and math.isfinite(float(value)) and value >= 0 else None
+
+    def frame(row):
+        return row.frame_index if isinstance(row, PossessionObservation) else row["frame_index"]
+
+    def team(row):
+        if isinstance(row, PossessionObservation):
+            return row.context.effective_holder_team
+        context = row.get("context", {})
+        return context.get("effective_holder_team") if isinstance(context, dict) else None
+
+    def duration(start, end):
+        left, right = timestamp(start), timestamp(end)
+        return right - left if left is not None and right is not None else (frame(end) - frame(start)) / float(real_fps)
+
+    def mark(row, effective_holder, effective_team, start, end, elapsed):
+        source_frames = [frame(start), frame(end)]
+        if isinstance(row, PossessionObservation):
+            context = replace(row.context, effective_holder_id=effective_holder, effective_holder_team=effective_team)
+            provenance = replace(row.audit.provenance,
+                                 frame_indices=list(dict.fromkeys(row.audit.provenance.frame_indices + source_frames)),
+                                 reason_codes=list(dict.fromkeys(row.audit.provenance.reason_codes + ["TRANSIENT_SWITCH", "reverted_switch"])))
+            audit = replace(row.audit, frame_start=frame(start), frame_end=frame(end),
+                            timestamp_start=timestamp(start), timestamp_end=timestamp(end),
+                            reverted_switch_duration_seconds=elapsed, provenance=provenance)
+            return replace(row, context=context, audit=audit)
+        copy = dict(row)
+        context = dict(copy.get("context") or {})
+        context["effective_holder_id"] = effective_holder
+        context["effective_holder_team"] = effective_team
+        copy["context"] = context
+        audit = dict(copy.get("audit") or {})
+        provenance = dict(audit.get("provenance") or {})
+        provenance["frame_indices"] = list(dict.fromkeys(list(provenance.get("frame_indices", [])) + source_frames))
+        provenance["reason_codes"] = list(dict.fromkeys(list(provenance.get("reason_codes", [])) + ["TRANSIENT_SWITCH", "reverted_switch"]))
+        audit.update(frame_start=frame(start), frame_end=frame(end), timestamp_start=timestamp(start),
+                    timestamp_end=timestamp(end), reverted_switch_duration_seconds=elapsed, provenance=provenance)
+        copy["audit"] = audit
+        return copy
+
+    output = list(rows)
+    i = 0
+    while i < len(rows):
+        first = holder(rows[i])
+        if first is None:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(rows) and holder(rows[j]) == first:
+            j += 1
+        if j >= len(rows) or holder(rows[j]) is None:
+            i = j
+            continue
+        challenger = holder(rows[j])
+        k = j + 1
+        while k < len(rows) and holder(rows[k]) == challenger:
+            k += 1
+        if k < len(rows) and holder(rows[k]) == first:
+            elapsed = duration(rows[j], rows[k])
+            if elapsed <= float(window_seconds) + 1e-9:
+                for index in range(j, k):
+                    output[index] = mark(output[index], first, team(rows[i]), rows[j], rows[k], elapsed)
+                i = k
+                continue
+        i = j
+    return output
 
 
 def _reject_duplicate_ball_frames(rows):
@@ -1032,6 +1131,8 @@ def classify_transition(transition, *, rapid_seconds=.3, proximity_threshold=80.
     """Classify one transition without upgrading ambiguous evidence to fact."""
     if not isinstance(transition, BallTransition):
         raise TypeError("transition must be BallTransition")
+    if "TRANSIENT_SWITCH" in transition.provenance.reason_codes or "reverted_switch" in transition.provenance.reason_codes:
+        return []
     frame = transition.frame_end if transition.frame_end is not None else transition.frame_start
     frame = frame if frame is not None else (transition.provenance.frame_indices[-1] if transition.provenance.frame_indices else 0)
     common = dict(transition_id=transition.transition_id, provenance=transition.provenance,

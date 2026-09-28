@@ -100,6 +100,27 @@ def test_from_env_reads_opt_in_v3_engine_and_profile(monkeypatch):
     assert (config.possession_engine, config.possession_v3_grace_seconds, config.possession_v3_calibration_profile) == ("v3", 0.4, "pilot")
 
 
+def test_v3_reverted_switch_window_defaults_and_reads_env(monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("POSSESSION_V3_REVERTED_SWITCH_WINDOW_SECONDS", "0.75")
+    assert PipelineConfig(roboflow_api_key="test-key").possession_v3_reverted_switch_window_seconds == .5
+    assert PipelineConfig.from_env().possession_v3_reverted_switch_window_seconds == .75
+
+
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
+def test_v3_reverted_switch_window_rejects_invalid_values(value):
+    with pytest.raises((ValueError, TypeError)):
+        PipelineConfig(roboflow_api_key="test-key", possession_v3_reverted_switch_window_seconds=value)
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "not-a-number"])
+def test_v3_reverted_switch_window_rejects_invalid_environment_values(monkeypatch, value):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("POSSESSION_V3_REVERTED_SWITCH_WINDOW_SECONDS", value)
+    with pytest.raises((ValueError, TypeError)):
+        PipelineConfig.from_env()
+
+
 def test_from_env_preserves_legacy_possession_default(monkeypatch):
     monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
     monkeypatch.delenv("POSSESSION_ENGINE", raising=False)

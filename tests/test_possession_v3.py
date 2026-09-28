@@ -15,9 +15,10 @@ from pipeline.possession_v3 import (
     score_candidates, PossessionResolver,
     normalize_ball_rows, derive_ball_primitives, derive_ball_transitions,
     classify_transition,
+    debounce_reverted_switches,
 )
 from pipeline.results import PipelineResults, RunSummary
-from pipeline.runner import _possession_result_config
+from pipeline.runner import _build_v3_artifacts, _possession_result_config
 
 
 def test_contract_serialization_is_versioned_and_stable():
@@ -224,6 +225,7 @@ def test_engine_is_opt_in_and_legacy_metadata_is_unchanged():
     assert _possession_result_config(legacy, base) == base
     assert _possession_result_config(v3, base) == {
         **base, "possession_engine": "v3", "possession_v3_schema_version": 1,
+        "possession_v3_reverted_switch_window_seconds": .5,
     }
 
 
@@ -454,6 +456,88 @@ def test_continuity_separates_effective_observed_and_challenger_for_006_007():
     assert observation.context.observed_candidate_id == "player-007"
     assert observation.context.challenger_id == "player-007"
     assert observation.stable_player_id == "player-006"
+
+
+def _resolved_row(frame, holder, timestamp, *, state=PossessionState.OBSERVED):
+    return PossessionObservation(
+        frame, state, EvidenceKind.OBSERVED,
+        stable_player_id=holder,
+        timestamp_seconds=timestamp,
+        context=PossessionContext(effective_holder_id=holder),
+    )
+
+
+@pytest.mark.parametrize("return_time,should_revert", [(0.8, True), (0.81, False)])
+def test_offline_reverted_switch_uses_real_timestamp_boundary(return_time, should_revert):
+    rows = [_resolved_row(0, "a", 0.0), _resolved_row(3, "b", 0.3), _resolved_row(5, "a", return_time)]
+    result = debounce_reverted_switches(rows, real_fps=10, window_seconds=.5)
+    assert result[1].context.effective_holder_id == ("a" if should_revert else "b")
+    if should_revert:
+        assert "TRANSIENT_SWITCH" in result[1].audit.provenance.reason_codes
+        assert "reverted_switch" in result[1].audit.provenance.reason_codes
+        assert result[1].audit.provenance.frame_indices == [3, 5]
+        assert result[1].audit.reverted_switch_duration_seconds == .5
+
+
+def test_offline_reverted_switch_preserves_raw_candidate_and_unknown_gap():
+    rows = [
+        _resolved_row(0, "a", 0.0),
+        _resolved_row(3, "b", 0.3),
+        _resolved_row(4, None, 0.4, state=PossessionState.UNKNOWN),
+        _resolved_row(5, "a", 0.5),
+    ]
+    result = debounce_reverted_switches(rows, real_fps=10, window_seconds=.5)
+    assert result[1].stable_player_id == "b"
+    assert result[1].context.effective_holder_id == "b"
+    assert result[1].audit.provenance.reason_codes == []
+
+
+def test_reverted_switch_audit_keeps_raw_state_and_artifact_events_use_effective_holder(tmp_path):
+    rows = [_resolved_row(0, "a", 0.0), _resolved_row(3, "b", 0.3), _resolved_row(8, "a", 0.8)]
+    result = debounce_reverted_switches(rows, real_fps=10, window_seconds=.5)
+    assert result[1].state is PossessionState.OBSERVED
+    assert result[1].stable_player_id == "b"
+    assert result[1].context.effective_holder_id == "a"
+    ball_rows = [{"frame_index": frame, "timestamp_seconds": frame / 10, "track_state": "detected",
+                  "ball_source": "detected", "quality": 1.0, "center_xy": [frame, 0],
+                  "source_records": [f"ball#{frame}"], "source_frame_indices": [frame]}
+                 for frame in (0, 3, 8)]
+    assert derive_ball_transitions(ball_rows, result, real_fps=10) == []
+
+
+def test_runner_artifact_boundary_collapses_dense_transient_switch(tmp_path):
+    config = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3")
+    rows = []
+    ball_rows = []
+    for frame in range(10):
+        ball_x = 5 if frame <= 2 or frame >= 6 else 25
+        rows.extend([
+            {"frame_index": frame, "stable_player_id": "a", "raw_track_id": 1, "team_id": 1,
+             "bbox": [0, 0, 10, 10], "confidence": 1.0},
+            {"frame_index": frame, "stable_player_id": "b", "raw_track_id": 2, "team_id": 2,
+             "bbox": [20, 0, 30, 10], "confidence": 1.0},
+        ])
+        ball_rows.append({
+            "frame_index": frame, "timestamp_seconds": frame / 10,
+            "track_state": "detected", "center_xy": [ball_x, 5], "confidence": 1.0,
+            "source_records": [f"ball#{frame}"], "source_frame_indices": [frame],
+        })
+
+    manifest = _build_v3_artifacts(tmp_path, rows, ball_rows, fps=10, config=config)
+    assert manifest["config"]["reverted_switch_window_seconds"] == .5
+    possession_path = tmp_path / manifest["artifacts"]["possession"]["path"]
+    event_path = tmp_path / manifest["artifacts"]["events"]["path"]
+    possession = [json.loads(line) for line in possession_path.read_text().splitlines()]
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+
+    transient = [row for row in possession if row["stable_player_id"] == "b"]
+    assert transient and all(row["context"]["effective_holder_id"] == "a" for row in transient)
+    assert all(row["state"] in {"OBSERVED", "TRANSITIONING"} for row in transient)
+    assert all({"TRANSIENT_SWITCH", "reverted_switch"} <= set(row["audit"]["provenance"]["reason_codes"])
+               for row in transient)
+    assert all({4, 8} <= set(row["audit"]["provenance"]["frame_indices"]) for row in transient)
+    assert all(row["audit"]["reverted_switch_duration_seconds"] == .4 for row in transient)
+    assert all(event["event_type"] not in {"PASS", "STEAL", "TURNOVER", "LOSS_OF_CONTROL"} for event in events)
 
 
 def test_exact_006_007_timeline_preserves_then_confirms_switch():

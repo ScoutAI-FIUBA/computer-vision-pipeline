@@ -116,6 +116,7 @@ DEFAULT_POSSESSION_V3_GRACE_SECONDS = 0.6
 DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN = 0.05
 DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS = 0.2
 DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS = 1.0
+DEFAULT_POSSESSION_V3_REVERTED_SWITCH_WINDOW_SECONDS = 0.5
 DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE = "default"
 DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION = 1
 DEFAULT_POSSESSION_V3_BALL_MAX_GAP = 3
@@ -180,6 +181,7 @@ class PipelineConfig:
     possession_v3_hysteresis_margin: float = DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN
     possession_v3_persistence_seconds: float = DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS
     possession_v3_event_window_seconds: float = DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS
+    possession_v3_reverted_switch_window_seconds: float = DEFAULT_POSSESSION_V3_REVERTED_SWITCH_WINDOW_SECONDS
     possession_v3_calibration_profile: str = DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE
     possession_v3_input_contract_version: int = DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION
     possession_v3_ball_max_gap: int = DEFAULT_POSSESSION_V3_BALL_MAX_GAP
@@ -322,6 +324,7 @@ class PipelineConfig:
         hysteresis = _finite_v3(self.possession_v3_hysteresis_margin, "possession_v3_hysteresis_margin")
         persistence = _finite_v3(self.possession_v3_persistence_seconds, "possession_v3_persistence_seconds")
         event_window = _finite_v3(self.possession_v3_event_window_seconds, "possession_v3_event_window_seconds")
+        reverted_window = _finite_v3(self.possession_v3_reverted_switch_window_seconds, "possession_v3_reverted_switch_window_seconds")
         if not 0 < grace <= 0.6:
             raise ValueError("possession_v3_grace_seconds must be between 0 and 0.6")
         if hysteresis < 0:
@@ -330,6 +333,8 @@ class PipelineConfig:
             raise ValueError("possession_v3_persistence_seconds must be non-negative")
         if event_window <= 0:
             raise ValueError("possession_v3_event_window_seconds must be positive")
+        if reverted_window < 0:
+            raise ValueError("possession_v3_reverted_switch_window_seconds must be non-negative")
         if type(self.possession_v3_calibration_profile) is not str or not self.possession_v3_calibration_profile.strip():
             raise ValueError("possession_v3_calibration_profile must not be empty")
         if type(self.possession_v3_input_contract_version) is not int or self.possession_v3_input_contract_version < 1:
@@ -457,6 +462,10 @@ class PipelineConfig:
             ),
             "possession_v3_event_window_seconds": _env_float(
                 "POSSESSION_V3_EVENT_WINDOW_SECONDS", DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS
+            ),
+            "possession_v3_reverted_switch_window_seconds": _env_float(
+                "POSSESSION_V3_REVERTED_SWITCH_WINDOW_SECONDS",
+                DEFAULT_POSSESSION_V3_REVERTED_SWITCH_WINDOW_SECONDS,
             ),
             "possession_v3_calibration_profile": os.getenv(
                 "POSSESSION_V3_CALIBRATION_PROFILE", DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE

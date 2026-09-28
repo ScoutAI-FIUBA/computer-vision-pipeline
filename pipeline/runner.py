@@ -50,7 +50,7 @@ from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.possession_v3 import (
     PossessionResolver, derive_ball_primitives, derive_ball_transitions, classify_transition,
-    normalize_ball_rows, score_candidates, V3_CONTRACT_VERSION,
+    normalize_ball_rows, score_candidates, debounce_reverted_switches, V3_CONTRACT_VERSION,
 )
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
@@ -92,6 +92,7 @@ def _possession_result_config(config: PipelineConfig, base: dict) -> dict:
         **base,
         "possession_engine": "v3",
         "possession_v3_schema_version": V3_CONTRACT_VERSION,
+        "possession_v3_reverted_switch_window_seconds": config.possession_v3_reverted_switch_window_seconds,
     }
 
 TRACKS_FILENAME = "tracks.jsonl"
@@ -153,16 +154,21 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
                                        ball_lost=ball is not None and ball.get("track_state") == "lost",
                                        timestamp=ball.get("timestamp_seconds") if ball else None)
         observations.append(observation)
+    observations = debounce_reverted_switches(
+        observations, real_fps=fps,
+        window_seconds=config.possession_v3_reverted_switch_window_seconds,
+    )
     normalized = normalize_ball_rows(ball_rows, real_fps=fps, config=config)
     primitives = derive_ball_primitives(normalized, observations, real_fps=fps)
     transitions = derive_ball_transitions(normalized, observations, real_fps=fps,
                                           event_window_seconds=config.possession_v3_event_window_seconds)
     events = [event for transition in transitions for event in classify_transition(transition)]
     manifest = write_v3_artifacts(output_dir, observations, primitives, transitions, events,
-                                  {"profile": config.possession_v3_calibration_profile,
-                                    "input_contract_version": config.possession_v3_input_contract_version,
-                                    "event_window_seconds": config.possession_v3_event_window_seconds,
-                                    "engine": "v3"})
+                                   {"profile": config.possession_v3_calibration_profile,
+                                     "input_contract_version": config.possession_v3_input_contract_version,
+                                     "event_window_seconds": config.possession_v3_event_window_seconds,
+                                     "reverted_switch_window_seconds": config.possession_v3_reverted_switch_window_seconds,
+                                     "engine": "v3"})
     manifest["observability"] = {"status": "complete", "phase": "artifact_write",
                                   "counts": {"observations": len(observations), "primitives": len(primitives),
                                              "transitions": len(transitions), "events": len(events)},
