@@ -1082,3 +1082,77 @@ def test_all_qualifying_loose_intervals_are_emitted():
 def test_single_frame_noise_does_not_emit_primitive():
     rows = normalize_ball_rows([_ball(0, 0, 0), _ball(1, 100, 100), _ball(2, 0, 0)], real_fps=10, max_gap_frames=1)
     assert derive_ball_primitives(rows, [_pos(0, "a"), _pos(1, None), _pos(2, "a")], real_fps=10) == []
+
+
+def _grace_observation(frame, state, effective, observed, team):
+    return PossessionObservation(
+        frame, state, EvidenceKind.OBSERVED if state is PossessionState.OBSERVED else EvidenceKind.INFERRED,
+        team_id=team,
+        context=PossessionContext(effective_holder_id=effective, effective_holder_team=1,
+                                  observed_candidate_id=observed),
+    )
+
+
+def test_grace_candidate_context_produces_authoritative_transition():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(5)], real_fps=10, max_gap_frames=1)
+    states = [
+        _grace_observation(0, PossessionState.OBSERVED, "a", "a", 1),
+        _grace_observation(1, PossessionState.INFERRED, "a", "b", 1),
+        _grace_observation(2, PossessionState.INFERRED, "a", "b", 1),
+        _grace_observation(3, PossessionState.OBSERVED, "a", "b", 2),
+        _grace_observation(4, PossessionState.OBSERVED, "a", "b", 2),
+    ]
+
+    primitives = derive_ball_primitives(rows, states, real_fps=10)
+    transitions = derive_ball_transitions(rows, states, real_fps=10)
+
+    assert [item["primitive_type"] for item in primitives] == ["BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"]
+    assert len(transitions) == 1
+    assert transitions[0].source_holder == "a"
+    assert transitions[0].destination_holder == "b"
+
+
+def test_persistent_observed_destination_is_consumed_once():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(6)], real_fps=10, max_gap_frames=1)
+    states = [
+        _grace_observation(0, PossessionState.OBSERVED, "a", "a", 1),
+        _grace_observation(1, PossessionState.INFERRED, "a", "b", 1),
+        _grace_observation(2, PossessionState.INFERRED, "a", "b", 1),
+        _grace_observation(3, PossessionState.OBSERVED, "a", "b", 2),
+        _grace_observation(4, PossessionState.OBSERVED, "a", "b", 2),
+        _grace_observation(5, PossessionState.OBSERVED, "a", "b", 2),
+    ]
+
+    primitives = derive_ball_primitives(rows, states, real_fps=10)
+    transitions = derive_ball_transitions(rows, states, real_fps=10)
+    semantic_events = [event for transition in transitions for event in classify_transition(transition)
+                       if event.event_type is not EventType.UNKNOWN]
+
+    assert [item["primitive_type"] for item in primitives].count("BALL_RELEASE") == 1
+    assert [item["primitive_type"] for item in primitives].count("BALL_IN_TRANSIT") == 1
+    assert [item["primitive_type"] for item in primitives].count("BALL_RECEPTION") == 1
+    assert len(transitions) == 1
+    assert len(semantic_events) <= 1
+
+
+def test_reverted_grace_candidate_is_not_a_semantic_transition():
+    rows = normalize_ball_rows([_ball(i, i * 10, 0) for i in range(5)], real_fps=10, max_gap_frames=1)
+    transient_audit = PossessionAudit(
+        observation_quality="inferred", observation_source="resolver", authority="stable",
+        grace_eligible=True,
+        provenance=Provenance(reason_codes=["TRANSIENT_SWITCH", "reverted_switch"]),
+    )
+    states = [
+        _grace_observation(0, PossessionState.OBSERVED, "a", "a", 1),
+        PossessionObservation(1, PossessionState.OBSERVED, EvidenceKind.OBSERVED, team_id=2,
+                              context=PossessionContext(effective_holder_id="a", effective_holder_team=1,
+                                                        observed_candidate_id="b"), audit=transient_audit),
+        PossessionObservation(2, PossessionState.OBSERVED, EvidenceKind.OBSERVED, team_id=2,
+                              context=PossessionContext(effective_holder_id="a", effective_holder_team=1,
+                                                        observed_candidate_id="b"), audit=transient_audit),
+        _grace_observation(3, PossessionState.OBSERVED, "a", "a", 1),
+        _grace_observation(4, PossessionState.OBSERVED, "a", "a", 1),
+    ]
+
+    assert derive_ball_primitives(rows, states, real_fps=10) == []
+    assert derive_ball_transitions(rows, states, real_fps=10) == []

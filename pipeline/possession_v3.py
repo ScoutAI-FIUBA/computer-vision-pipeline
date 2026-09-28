@@ -895,6 +895,33 @@ def _holder_by_frame(states):
     return result
 
 
+def _transition_context_by_frame(states):
+    """Keep effective continuity while exposing observed candidate evidence."""
+    result = {}
+    for state in states or []:
+        frame = state.frame_index if isinstance(state, PossessionObservation) else state.get("frame_index")
+        if isinstance(state, PossessionObservation):
+            context, quality, team, audit = state.context, state.state, state.team_id, state.audit
+            effective, observed = context.effective_holder_id, context.observed_candidate_id
+            effective_team = context.effective_holder_team
+        else:
+            context = state.get("context") or {}
+            effective = context.get("effective_holder_id") or state.get("stable_player_id")
+            observed = context.get("observed_candidate_id")
+            quality = state.get("state")
+            team = state.get("team_id")
+            effective_team = context.get("effective_holder_team")
+            audit = state.get("audit") or {}
+        if isinstance(quality, PossessionState):
+            quality = quality.value
+        audit_provenance = audit.provenance if isinstance(audit, PossessionAudit) else audit.get("provenance", {})
+        reason_codes = audit_provenance.reason_codes if isinstance(audit_provenance, Provenance) else (audit_provenance or {}).get("reason_codes", [])
+        result[frame] = {"effective": effective, "observed": observed, "state": quality,
+                         "team": team, "effective_team": effective_team,
+                         "transient": "TRANSIENT_SWITCH" in reason_codes or "reverted_switch" in reason_codes}
+    return result
+
+
 def _team_by_frame(states):
     result = {}
     for state in states or []:
@@ -1030,6 +1057,7 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
                    and (row.get("timestamp_seconds") is None or (type(row.get("timestamp_seconds")) in {int, float} and math.isfinite(float(row["timestamp_seconds"]))))), key=lambda row: row["frame_index"])
     holders = _holder_by_frame(possession_states)
     teams = _team_by_frame(possession_states)
+    context_by_frame = _transition_context_by_frame(possession_states)
     result = []
     i = 0
     while i < len(rows):
@@ -1066,6 +1094,70 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
                 i = destination_end
                 continue
         i += 1
+    # Grace deliberately keeps the effective holder. A persistent observed
+    # candidate still supplies release evidence, but only OBSERVED rows can
+    # become the reception.
+    for destination_start, row in enumerate(rows):
+        frame = row["frame_index"]
+        destination_context = context_by_frame.get(frame, {})
+        destination = destination_context.get("observed")
+        if destination is None or destination_context.get("state") != PossessionState.OBSERVED.value:
+            continue
+        if destination_start > 0:
+            previous = context_by_frame.get(rows[destination_start - 1]["frame_index"], {})
+            if (previous.get("observed") == destination
+                    and previous.get("state") == PossessionState.OBSERVED.value
+                    and previous.get("effective") == destination_context.get("effective")):
+                continue
+        source_index = destination_start - 1
+        if source_index < 0:
+            continue
+        source_context = context_by_frame.get(rows[source_index]["frame_index"], {})
+        source = source_context.get("effective")
+        if source is None or source == destination or destination_context.get("transient"):
+            continue
+        candidate_start = destination_start
+        while candidate_start > 0:
+            previous = context_by_frame.get(rows[candidate_start - 1]["frame_index"], {})
+            if previous.get("observed") != destination or previous.get("effective") != source:
+                break
+            candidate_start -= 1
+        # Candidate-only grace frames are the release persistence window.
+        if destination_start - candidate_start < release_persistence_frames:
+            continue
+        destination_end = destination_start
+        while (destination_end + 1 < len(rows)
+               and rows[destination_end + 1]["frame_index"] == rows[destination_end]["frame_index"] + 1):
+            next_context = context_by_frame.get(rows[destination_end + 1]["frame_index"], {})
+            if (next_context.get("observed") != destination
+                    or next_context.get("state") != PossessionState.OBSERVED.value
+                    or next_context.get("transient")):
+                break
+            destination_end += 1
+        if destination_end - destination_start + 1 < reception_persistence_frames:
+            continue
+        gap = rows[candidate_start:destination_start]
+        if not gap or any(rows[k]["frame_index"] != rows[k - 1]["frame_index"] + 1
+                          for k in range(candidate_start + 1, destination_start)):
+            continue
+        points = [_ball_center(rows[source_index]), *(_ball_center(item) for item in gap), _ball_center(rows[destination_start])]
+        points = [point for point in points if point is not None]
+        if len(points) < 2 or not any(points[n] != points[n - 1] for n in range(1, len(points))):
+            continue
+        evidence_rows = [rows[source_index], *gap, rows[destination_start]]
+        base = {"frame_index": gap[0]["frame_index"],
+                "source_frame_indices": sorted({item["frame_index"] for item in evidence_rows}),
+                "provenance": {"source_records": sorted({ref for item in evidence_rows for ref in item.get("source_records", [])}),
+                               "frame_indices": sorted({item["frame_index"] for item in evidence_rows}), "reason_codes": ["observed_candidate_grace"]}}
+        start, end = _timestamp_range([rows[source_index], *gap])
+        result.append(dict(base, primitive_type="BALL_RELEASE", reason_codes=["holder_separation"], timestamp_start=start, timestamp_end=end))
+        start, end = _timestamp_range(gap)
+        result.append(dict(base, primitive_type="BALL_IN_TRANSIT", reason_codes=["trajectory"], timestamp_start=start, timestamp_end=end,
+                           provenance=dict(base["provenance"], frame_indices=[item["frame_index"] for item in gap])))
+        start, end = _timestamp_range(rows[destination_start:destination_end + 1])
+        result.append(dict(base, primitive_type="BALL_RECEPTION", frame_index=rows[destination_end]["frame_index"], reason_codes=["unique_reception"],
+                           timestamp_start=start, timestamp_end=end,
+                           provenance=dict(base["provenance"], frame_indices=[rows[destination_end]["frame_index"]])))
     # A loose interval is emitted once, only after its real-FPS duration is met.
     empty = [row for row in rows if holders.get(row["frame_index"]) is None]
     start = 0
@@ -1098,6 +1190,7 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
         return []
     holders = _holder_by_frame(possession_states)
     teams = _team_by_frame(possession_states)
+    context_by_frame = _transition_context_by_frame(possession_states)
     transitions = []
     releases = [index for index, item in enumerate(grouped) if item["primitive_type"] == "BALL_RELEASE"]
     for release_index in releases:
@@ -1107,8 +1200,12 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
             continue
         end_index = grouped.index(reception, release_index + 1) + 1
         segment = grouped[release_index:end_index]
-        start_holder = holders.get(release["frame_index"] - 1)
-        end_holder = holders.get(reception["frame_index"])
+        start_context = context_by_frame.get(release["frame_index"] - 1, {})
+        end_context = context_by_frame.get(reception["frame_index"], {})
+        start_holder = start_context.get("effective") or start_context.get("observed") or holders.get(release["frame_index"] - 1)
+        end_holder = (end_context.get("observed")
+                      if end_context.get("state") == PossessionState.OBSERVED.value
+                      else end_context.get("effective") or holders.get(reception["frame_index"]))
         start_row = next(row for row in ball_rows if row.get("frame_index") == release["frame_index"])
         end_row = next(row for row in ball_rows if row.get("frame_index") == reception["frame_index"])
         start_time, end_time = start_row.get("timestamp_seconds"), end_row.get("timestamp_seconds")
@@ -1120,7 +1217,12 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
                              [item["primitive_type"] for item in segment],
                              Provenance(refs, sorted({frame for item in segment for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
                              frame_start=release["frame_index"], frame_end=reception["frame_index"], confidence=.5,
-                             source_team_id=teams.get(release["frame_index"] - 1), destination_team_id=teams.get(reception["frame_index"]),
+                              source_team_id=(start_context.get("effective_team")
+                                              if start_context.get("effective_team") is not None
+                                              else teams.get(release["frame_index"] - 1)),
+                              destination_team_id=(end_context.get("team")
+                                                  if end_context.get("team") is not None
+                                                  else teams.get(reception["frame_index"])),
                              duration_seconds=duration, timestamp_start=start_time, timestamp_end=end_time,
                              release_evidence=True, reception_evidence=True, trajectory_evidence=True, score_margin=None))
     return transitions
