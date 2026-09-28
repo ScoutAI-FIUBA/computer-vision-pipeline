@@ -623,12 +623,84 @@ def _write_projected_track_rows(handle, *, frame_index: int, rows: list[dict], h
                     "homography_frame_status": "ok",
                     "homography_inliers_count": int(homography_result.inliers_count),
                     "homography_reprojection_mean_m": float(homography_result.reprojection_mean_m),
+                    **({"stable_player_id": row["stable_player_id"]}
+                       if row.get("stable_player_id") is not None else {}),
+                    **({"team_id": int(row["team_id"])} if row.get("team_id") is not None else {}),
                 }
             )
             + "\n"
         )
         written += 1
     return written
+
+
+def _read_video_frames(video_path: Path, frame_indices: Sequence[int]) -> dict[int, object]:
+    """Read only the frames needed by an optional court projection pass."""
+    import cv2
+
+    capture = cv2.VideoCapture(str(video_path))
+    frames: dict[int, object] = {}
+    try:
+        for frame_index in sorted(set(int(value) for value in frame_indices)):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            if ok:
+                frames[frame_index] = frame
+    finally:
+        capture.release()
+    return frames
+
+
+def _project_v2_rows(
+    video_path: Path,
+    output_path: Path,
+    rows: list[dict],
+    *,
+    info,
+    config: PipelineConfig,
+    emit: Callable[[str], None],
+) -> int:
+    """Project authoritative V2 rows without creating a second player pipeline."""
+    if not config.court_model_id or not rows:
+        return 0
+    grouped: dict[int, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["frame_index"]), []).append(row)
+    try:
+        detector = _build_detector_for_model(config, model_id=config.court_model_id)
+        frames = _read_video_frames(video_path, grouped)
+        written = 0
+        with output_path.open("w", encoding="utf-8") as handle:
+            for frame_index in sorted(grouped):
+                frame = frames.get(frame_index)
+                if frame is None:
+                    continue
+                try:
+                    keypoints = parse_court_keypoints(
+                        detector.detect(frame),
+                        min_confidence=config.court_keypoint_confidence,
+                        width=info.width,
+                        height=info.height,
+                    )
+                    homography = compute_frame_homography(
+                        keypoints, min_confidence=config.court_keypoint_confidence
+                    )
+                except (RuntimeError, ValueError) as error:
+                    emit(f"court projection frame {frame_index} unavailable: {error}")
+                    continue
+                written += _write_projected_track_rows(
+                    handle, frame_index=frame_index, rows=grouped[frame_index], homography_result=homography
+                )
+        if written:
+            emit(f"court projection complete: {written} projected rows")
+        else:
+            output_path.unlink(missing_ok=True)
+            emit("court projection unavailable: no valid homography")
+        return written
+    except Exception as error:
+        output_path.unlink(missing_ok=True)
+        emit(f"court projection failed: {type(error).__name__}: {error}")
+        return 0
 
 
 def _maybe_write_projected_shots(output_dir: Path) -> tuple[str | None, str | None]:
@@ -926,6 +998,14 @@ def run_stats_from_v2_observations(
 
     phase("TrackNet/player artifact writing", write_tracks)
 
+    projected_tracks_path = output_dir / PROJECTED_TRACKS_FILENAME
+    projected_track_records = phase(
+        "court projection",
+        lambda: _project_v2_rows(
+            video_path, projected_tracks_path, rows, info=info, config=config, emit=emit
+        ),
+    )
+
     team_by_track_id: dict[int, int] = {}
     team_values: dict[int, set[int]] = {}
     for row in rows:
@@ -986,6 +1066,9 @@ def run_stats_from_v2_observations(
     phase("shot evidence", lambda: _attach_ball_evidence(
         output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id
     ))
+    projected_shots_file, projected_shots_image_file = phase(
+        "projected shot artifacts", lambda: _maybe_write_projected_shots(output_dir)
+    )
     emit("possession start")
     possession_path, transitions_path = phase("possession", lambda: _write_possession_artifacts(
         output_dir, rows, ball_rows, fps=info.fps, frame_step=1,
@@ -1008,7 +1091,9 @@ def run_stats_from_v2_observations(
                "width": info.width, "height": info.height, "duration_seconds": info.duration_seconds},
          config=_possession_result_config(
              config, {"source": "sam31_v2_observations", "tracknet_enabled": config.tracknet_enabled,
-                      "number_predictor_backend": config.number_predictor_backend,
+                       "court_model_id": config.court_model_id,
+                       "court_keypoint_confidence": config.court_keypoint_confidence,
+                       "number_predictor_backend": config.number_predictor_backend,
                       "number_predictor_score_threshold": config.number_predictor_score_threshold}
          ),
         summary=RunSummary(frames_processed=len(frame_indices), track_records=len(rows),
@@ -1016,8 +1101,11 @@ def run_stats_from_v2_observations(
          device="cpu", teams_file=TEAMS_FILENAME, shot_events_file=SHOT_EVENTS_FILENAME,
          numbers_file=NUMBERS_FILENAME if numbers_available else None,
          shot_evidence_file=SHOT_EVIDENCE_FILENAME, ball_tracks_file=BALL_TRACKS_FILENAME,
-        possession_events_file=POSSESSION_EVENTS_FILENAME,
-         possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
+         possession_events_file=POSSESSION_EVENTS_FILENAME,
+          possession_transitions_file=POSSESSION_TRANSITIONS_FILENAME,
+           projected_tracks_file=PROJECTED_TRACKS_FILENAME if projected_track_records else None,
+          projected_shots_file=projected_shots_file,
+          projected_shots_image_file=projected_shots_image_file,
          possession_v3_file=_v3_artifact_path(v3_manifest, "possession") if v3_manifest and v3_manifest.get("status") != "failed" else None,
          possession_v3_transitions_file=_v3_artifact_path(v3_manifest, "transitions") if v3_manifest and v3_manifest.get("status") != "failed" else None,
          possession_v3_events_file=_v3_artifact_path(v3_manifest, "events") if v3_manifest and v3_manifest.get("status") != "failed" else None,
@@ -1034,9 +1122,14 @@ def run_stats_from_v2_observations(
                                "source": "sam31_v2_observations",
                                "artifacts": json.loads((output_dir / "number_manifest.json").read_text(encoding="utf-8")).get("artifacts", {})}}
                 if numbers_available else {}),
-            **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
-                                   "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
-        },
+             **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
+                                    "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
+             **({"court_projection": {
+                 "projected_tracks": PROJECTED_TRACKS_FILENAME,
+                 "projected_shots": PROJECTED_SHOTS_FILENAME,
+                 "projected_shots_image": PROJECTED_SHOTS_IMAGE_FILENAME,
+             }} if projected_track_records else {}),
+         },
     )
     emit("artifact writing start")
     phase("artifact writing", lambda: results.write(output_dir / RESULTS_FILENAME))

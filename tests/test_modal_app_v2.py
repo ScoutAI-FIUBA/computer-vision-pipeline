@@ -1403,7 +1403,7 @@ def test_process_uses_v3_image_config_and_returns_v3_artifacts(monkeypatch):
         ),
     )
 
-    def fake_stats(_video_path, config, output_dir, _observations, **_kwargs):
+    def fake_stats(_video_path, output_dir, _observations, *, config, **_kwargs):
         assert config.possession_v3_enabled is True
         output_dir.mkdir(parents=True, exist_ok=True)
         files = {
@@ -1438,7 +1438,7 @@ def test_process_uses_v3_image_config_and_returns_v3_artifacts(monkeypatch):
             }
         )
 
-    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_observations", fake_stats)
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", fake_stats)
     cls = next(
         value for key, value in modal_app_v2.PipelineV2.__dict__.items()
         if key.startswith("_sync_original")
@@ -1457,6 +1457,77 @@ def test_process_uses_v3_image_config_and_returns_v3_artifacts(monkeypatch):
     manifest = json.loads(artifacts["stats/possession_v3_manifest.json"])
     pointer = manifest["artifacts"]["possession"]["path"]
     assert f"stats/{pointer}" in artifacts
+
+
+def test_process_court_projection_manifest_boundary(monkeypatch):
+    import hashlib
+    import modal_app_v2
+    import numpy as np
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("COURT_MODEL_ID", "court/1")
+    monkeypatch.setenv("NUMBER_EVIDENCE_ENABLED", "0")
+    row = {
+        "observation_key": "60:7",
+        "frame_index": 60,
+        "raw_track_id": 7,
+        "stable_player_id": "player-007",
+        "bbox_xyxy": [10, 10, 30, 50],
+        "team_id": 1,
+        "track_state": "tracked",
+    }
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: ([dict(row)], {row["observation_key"]: np.ones((2, 2), dtype=np.uint8)}))
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(
+        modal_app_v2, "run_v2",
+        lambda rows, **_kwargs: types.SimpleNamespace(observations=rows, acceptance={}, acceptance_reasons=[]),
+    )
+
+    def fake_stats(_video_path, output_dir, _observations, *, config, **_kwargs):
+        assert config.court_model_id == "court/1"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        contents = {
+                "results.json": json.dumps({
+                    "tracks_file": "tracks.jsonl", "teams_file": "teams.json",
+                    "numbers_file": None,
+                    "shot_events_file": "shot_events.jsonl", "projected_tracks_file": "projected_tracks.jsonl",
+                    "projected_shots_file": "projected_shots.json", "projected_shots_image_file": "projected_shots.png",
+                    "shot_evidence_file": None, "possession_events_file": None,
+                    "possession_transitions_file": None, "ball_tracks_file": None,
+                }),
+            "tracks.jsonl": "{}\n", "teams.json": "{}", "shot_events.jsonl": "",
+            "projected_tracks.jsonl": '{"frame_index":60}\n',
+            "projected_shots.json": '{"shots":[]}\n', "projected_shots.png": b"png-bytes",
+        }
+        for name, data in contents.items():
+            path = output_dir / name
+            path.write_bytes(data if isinstance(data, bytes) else data.encode())
+        return types.SimpleNamespace(to_dict=lambda: json.loads(contents["results.json"]))
+
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", fake_stats)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60, return_artifacts=True)
+    artifacts = payload["artifacts"]
+    manifest = json.loads(artifacts["manifest.json"])
+    stats_refs = manifest["artifacts"]["legacy_stats"]
+    expected = {
+        "projected_tracks": "stats/projected_tracks.jsonl",
+        "projected_shots": "stats/projected_shots.json",
+        "projected_shots_image": "stats/projected_shots.png",
+    }
+    results = json.loads(artifacts["stats/results.json"])
+    for name, relative_path in expected.items():
+        reference = stats_refs[name]
+        assert reference["key"] == relative_path
+        assert not relative_path.startswith("/")
+        data = artifacts[relative_path]
+        assert reference["size_bytes"] == len(data)
+        assert reference["sha256"] == hashlib.sha256(data).hexdigest()
+        assert results[f"{name}_file"] == relative_path.removeprefix("stats/")
 
 
 def test_process_passes_tracked_frames_and_masks_to_v2_runner(monkeypatch):

@@ -75,6 +75,14 @@ PY
 The expected values are `tracknet_enabled: True` and at least one non-lost
 ball row for a clip where TrackNet detects the ball.
 
+If `COURT_MODEL_ID` is configured, V2 samples the authoritative observation
+frames with that detector and writes `projected_tracks.jsonl`,
+`projected_shots.json`, and `projected_shots.png` only when a valid homography
+is available. These are optional: missing/invalid court evidence leaves the
+three pointers out of `stats/results.json` and the V2 manifest. Emitted
+manifest entries use relative paths, byte sizes, and SHA-256 hashes; projected
+rows retain `track_id`, `stable_player_id`, `team_id`, and pixel coordinates.
+
 V2 jersey numbers use the existing predictor settings but do not invoke the
 legacy pipeline. On every `FRAME_STRIDE` sample, V2 calls the configured
 basketball detector, associates its `number` box to the matching SAM3 player

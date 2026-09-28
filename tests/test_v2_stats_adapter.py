@@ -10,6 +10,13 @@ from pipeline.config import PipelineConfig
 from pipeline.runner import _BoundedProgress, run_stats_from_v2_observations
 
 
+def _court_enabled_config():
+    return PipelineConfig(
+        roboflow_api_key="test-key", court_model_id="court/1", team_embedder_backend="none",
+        number_evidence_enabled=False,
+    )
+
+
 def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, monkeypatch, capsys):
     import pipeline.runner as runner
 
@@ -64,6 +71,177 @@ def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, m
     assert "[v2-stats] possession start" in output
     assert "[v2-stats] artifact writing start" in output
     assert "[v2-stats] stats complete" in output
+
+
+def test_v2_stats_projects_authoritative_rows_and_shots(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner, "probe",
+        lambda _path: SimpleNamespace(fps=30.0, frame_count=1, width=100, height=100, duration_seconds=1 / 30),
+    )
+    monkeypatch.setattr(runner, "_read_video_frames", lambda _path, indices: {0: object()})
+    monkeypatch.setattr(runner, "build_detector", lambda _config, **_kwargs: SimpleNamespace(detect=lambda _frame: {}))
+    monkeypatch.setattr(
+        runner, "parse_court_keypoints",
+        lambda *_args, **_kwargs: [{"label": "01", "x": 0, "y": 0, "confidence": 1.0}],
+    )
+    monkeypatch.setattr(
+        runner, "compute_frame_homography",
+        lambda *_args, **_kwargs: SimpleNamespace(matrix="H", inliers_count=4, reprojection_mean_m=0.0),
+    )
+    monkeypatch.setattr(runner, "project_points", lambda _matrix, points: [[4.0, 2.0] for _ in points])
+    monkeypatch.setattr(
+        runner, "_write_shot_events",
+        lambda _video, path, **_kwargs: path.write_text(json.dumps({
+            "event_id": 1, "start_frame_index": 0, "start_image_xy": [20, 30], "outcome": "made"
+        }) + "\n"),
+    )
+
+    result = run_stats_from_v2_observations(
+        video, PipelineConfig(
+            roboflow_api_key="test-key", court_model_id="court/1", team_embedder_backend="none",
+            number_evidence_enabled=False,
+        ), tmp_path / "stats", [{
+            "frame_index": 0, "raw_track_id": 17, "stable_player_id": "player-001",
+            "team_id": 1, "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked",
+        }],
+    )
+
+    projected = json.loads((tmp_path / "stats" / "projected_tracks.jsonl").read_text().splitlines()[0])
+    assert projected["track_id"] == 17
+    assert projected["stable_player_id"] == "player-001"
+    assert projected["team_id"] == 1
+    assert projected["court_xy_m"] == [4.0, 2.0]
+    assert result.projected_tracks_file == "projected_tracks.jsonl"
+    assert result.projected_shots_file == "projected_shots.json"
+    assert result.projected_shots_image_file == "projected_shots.png"
+
+
+def test_v2_stats_omits_projection_when_court_evidence_is_invalid(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner, "probe",
+        lambda _path: SimpleNamespace(fps=30.0, frame_count=1, width=100, height=100, duration_seconds=1 / 30),
+    )
+    monkeypatch.setattr(runner, "_read_video_frames", lambda _path, indices: {0: object()})
+    monkeypatch.setattr(runner, "build_detector", lambda _config, **_kwargs: SimpleNamespace(detect=lambda _frame: {}))
+    monkeypatch.setattr(runner, "parse_court_keypoints", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runner, "compute_frame_homography", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("insufficient_points")))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    result = run_stats_from_v2_observations(
+        video, PipelineConfig(
+            roboflow_api_key="test-key", court_model_id="court/1", team_embedder_backend="none",
+            number_evidence_enabled=False,
+        ), tmp_path / "stats", [{
+            "frame_index": 0, "raw_track_id": 17, "stable_player_id": "player-001",
+            "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked",
+        }],
+    )
+
+    assert result.projected_tracks_file is None
+    assert result.projected_shots_file is None
+    assert result.projected_shots_image_file is None
+    payload = json.loads((tmp_path / "stats" / "results.json").read_text())
+    assert "projected_tracks_file" not in payload
+
+
+def test_v2_stats_uses_real_court_geometry_helpers(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(
+        fps=30.0, frame_count=1, width=1000, height=600, duration_seconds=1 / 30
+    ))
+    monkeypatch.setattr(runner, "_read_video_frames", lambda _path, _indices: {0: object()})
+
+    court_result = {"predictions": [
+        {"class": "01", "x": 100, "y": 100, "confidence": 1.0},
+        {"class": "08", "x": 100, "y": 500, "confidence": 1.0},
+        {"class": "34", "x": 900, "y": 100, "confidence": 1.0},
+        {"class": "41", "x": 900, "y": 500, "confidence": 1.0},
+    ]}
+    monkeypatch.setattr(runner, "build_detector", lambda _config, **_kwargs: SimpleNamespace(
+        detect=lambda _frame: court_result
+    ))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    result = run_stats_from_v2_observations(
+        video, _court_enabled_config(), tmp_path / "stats", [{
+            "frame_index": 0, "raw_track_id": 17, "stable_player_id": "player-001",
+            "team_id": 1, "bbox_xyxy": [480, 260, 520, 300], "track_state": "tracked",
+        }],
+    )
+
+    projected = json.loads((tmp_path / "stats" / "projected_tracks.jsonl").read_text().splitlines()[0])
+    assert projected["court_xy_m"] == pytest.approx([14.0, 7.5], abs=0.05)
+    assert result.projected_tracks_file == "projected_tracks.jsonl"
+
+
+@pytest.mark.parametrize("case", ["missing_frame", "detector_failure", "invalid_homography"])
+def test_v2_projection_omits_all_artifacts_without_valid_court_evidence(tmp_path, monkeypatch, case):
+    import pipeline.runner as runner
+
+    rows = [{"frame_index": 0, "track_id": 1, "xyxy": [10, 10, 30, 50]}]
+    output = tmp_path / "projected_tracks.jsonl"
+    if case == "missing_frame":
+        monkeypatch.setattr(runner, "_read_video_frames", lambda _path, _indices: {})
+    else:
+        monkeypatch.setattr(runner, "_read_video_frames", lambda _path, _indices: {0: object()})
+    if case == "detector_failure":
+        detector = SimpleNamespace(detect=lambda _frame: (_ for _ in ()).throw(RuntimeError("offline")))
+    else:
+        detector = SimpleNamespace(detect=lambda _frame: {})
+    monkeypatch.setattr(runner, "_build_detector_for_model", lambda *_args, **_kwargs: detector)
+    if case == "invalid_homography":
+        monkeypatch.setattr(runner, "parse_court_keypoints", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(runner, "compute_frame_homography", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad")))
+
+    written = runner._project_v2_rows(
+        tmp_path / "input.mp4", output, rows,
+        info=SimpleNamespace(width=100, height=100), config=_court_enabled_config(), emit=lambda _message: None,
+    )
+
+    assert written == 0
+    assert not output.exists()
+
+
+def test_v2_projection_keeps_only_valid_frames_when_homography_is_mixed(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    rows = [
+        {"frame_index": frame, "track_id": frame + 1, "xyxy": [10, 10, 30, 50]}
+        for frame in range(3)
+    ]
+    monkeypatch.setattr(runner, "_read_video_frames", lambda _path, _indices: {0: 0, 1: 1, 2: 2})
+    detector = SimpleNamespace(detect=lambda frame: frame != 1)
+    monkeypatch.setattr(runner, "_build_detector_for_model", lambda *_args, **_kwargs: detector)
+    monkeypatch.setattr(runner, "parse_court_keypoints", lambda result, **_kwargs: result)
+    monkeypatch.setattr(
+        runner, "compute_frame_homography",
+        lambda keypoints, **_kwargs: (
+            (_ for _ in ()).throw(ValueError("bad"))
+            if not keypoints else SimpleNamespace(matrix="H", inliers_count=4, reprojection_mean_m=0.0)
+        ),
+    )
+    monkeypatch.setattr(runner, "project_points", lambda _matrix, points: [[1.0, 2.0] for _ in points])
+
+    output = tmp_path / "projected_tracks.jsonl"
+    written = runner._project_v2_rows(
+        tmp_path / "input.mp4", output, rows,
+        info=SimpleNamespace(width=100, height=100), config=_court_enabled_config(), emit=lambda _message: None,
+    )
+
+    projected = [json.loads(line) for line in output.read_text().splitlines()]
+    assert written == 2
+    assert [row["frame_index"] for row in projected] == [0, 2]
 
 
 def test_v2_stats_adapter_serializes_scoped_team_conflicts_truthfully(tmp_path, monkeypatch):
