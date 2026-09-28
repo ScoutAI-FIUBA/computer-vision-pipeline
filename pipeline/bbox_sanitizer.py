@@ -128,7 +128,7 @@ def _mask_cleanup(
     """Keep a component only when geometry gives a conservative winner."""
     groups: dict[int, list[int]] = {}
     for index, row in enumerate(rows):
-        groups.setdefault(int(row["raw_track_id"]), []).append(index)
+        groups.setdefault(int(row.get("canonical_raw_track_id", row["raw_track_id"])), []).append(index)
     cleaned: dict[str, Any] = {}
     diagnostics: dict[int, dict[str, Any]] = {}
     for indices in groups.values():
@@ -275,7 +275,7 @@ def sanitize_temporal_bboxes(
         cleaned_masks, mask_diagnostics = _mask_cleanup(rows, masks_by_observation)
     groups: dict[int, list[int]] = {}
     for index, row in enumerate(rows):
-        groups.setdefault(int(row["raw_track_id"]), []).append(index)
+        groups.setdefault(int(row.get("canonical_raw_track_id", row["raw_track_id"])), []).append(index)
     candidates: set[int] = set()
     scores: dict[int, tuple[float, dict[str, float]]] = {}
     for indices in groups.values():

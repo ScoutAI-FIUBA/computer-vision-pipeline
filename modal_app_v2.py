@@ -30,11 +30,14 @@ from pipeline.runner_v2 import run_v2
 from pipeline.sam31_tracking import normalize_multiplex_output
 from pipeline.sam31_segments import (
     SAM31_MAX_NUM_OBJECTS,
+    DEFAULT_SEAM_AMBIGUITY_MARGIN,
+    DEFAULT_SEAM_MIN_SCORE,
     assert_segment_object_limit,
     deduplicate_segment_observations,
     extract_segment_video,
     plan_segment_windows,
     remap_segment_rows,
+    stitch_segment_seams,
 )
 
 SAM31_REPOSITORY = "git+https://github.com/facebookresearch/sam3.git"
@@ -398,6 +401,9 @@ def _track_segmented_video(
     *,
     window: int,
     overlap: int = 1,
+    seam_min_score: float = DEFAULT_SEAM_MIN_SCORE,
+    seam_ambiguity_margin: float = DEFAULT_SEAM_AMBIGUITY_MARGIN,
+    seam_diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run independent bounded SAM sessions, then stitch their raw output."""
 
@@ -416,7 +422,18 @@ def _track_segmented_video(
         remapped_rows, remapped_masks = remap_segment_rows(rows, masks, segment)
         all_rows.extend(remapped_rows)
         all_masks.update(remapped_masks)
-    return deduplicate_segment_observations(all_rows, all_masks)
+    stitched_rows, stitched_masks = stitch_segment_seams(
+        all_rows,
+        all_masks,
+        min_score=seam_min_score,
+        ambiguity_margin=seam_ambiguity_margin,
+        diagnostics=seam_diagnostics,
+    )
+    return deduplicate_segment_observations(
+        stitched_rows,
+        stitched_masks,
+        diagnostics=seam_diagnostics,
+    )
 
 
 def _segmented_enabled(value: bool | None) -> bool:
@@ -427,6 +444,12 @@ def _segmented_enabled(value: bool | None) -> bool:
 
 def _segment_setting(value: int | None, env_name: str, default: int) -> int:
     return default if value is None and os.getenv(env_name) is None else int(
+        value if value is not None else os.environ[env_name]
+    )
+
+
+def _segment_float_setting(value: float | None, env_name: str, default: float) -> float:
+    return default if value is None and os.getenv(env_name) is None else float(
         value if value is not None else os.environ[env_name]
     )
 
@@ -489,6 +512,8 @@ class PipelineV2:
         segmented: bool | None = None,
         segment_window: int | None = None,
         segment_overlap: int | None = None,
+        segment_seam_min_score: float | None = None,
+        segment_seam_ambiguity_margin: float | None = None,
     ) -> dict[str, Any]:
         validate_entrypoint_args(
             video_bytes=video_bytes,
@@ -504,11 +529,16 @@ class PipelineV2:
             started = time.perf_counter()
             print("[v2] progress=0")
             try:
-                if _segmented_enabled(segmented):
+                segmented_run = _segmented_enabled(segmented)
+                seam_diagnostics: list[dict[str, Any]] = []
+                if segmented_run:
                     rows, masks = _track_segmented_video(
                         self._ensure_predictor(), video_path, prompt, frame_start, frame_end, root,
                         window=_segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
                         overlap=_segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
+                        seam_min_score=_segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
+                        seam_ambiguity_margin=_segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
+                        seam_diagnostics=seam_diagnostics,
                     )
                 else:
                     rows, masks = _track_video(
@@ -522,16 +552,24 @@ class PipelineV2:
                 if hasattr(self, "seams"):
                     runner_kwargs["seams"] = self.seams
                 result = run_v2(rows, **runner_kwargs)
+                if segmented_run:
+                    result.runtime_diagnostics = {
+                        **(getattr(result, "runtime_diagnostics", {}) or {}),
+                        "seam_diagnostics": seam_diagnostics,
+                    }
                 clean_masks = getattr(result, "cleaned_masks_by_observation", {})
                 _add_clean_mask_references(result.observations, clean_masks)
                 video_metadata = _video_metadata(video_path)
                 artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
-                if _segmented_enabled(segmented):
+                if segmented_run:
                     artifact_config.update({
                         "sam31_segmented": True,
                         "sam31_segment_window": _segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
                         "sam31_segment_overlap": _segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
                         "sam31_max_num_objects": SAM31_MAX_NUM_OBJECTS,
+                        "sam31_seam_min_score": _segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
+                        "sam31_seam_ambiguity_margin": _segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
+                        "sam31_seam_diagnostics": seam_diagnostics,
                     })
                 sanitizer_metadata = getattr(result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
                 if sanitizer_metadata.get("corrected_count", 0) or sanitizer_metadata.get("unresolved_count", 0):

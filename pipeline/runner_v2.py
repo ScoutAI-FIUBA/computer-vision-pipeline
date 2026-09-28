@@ -286,7 +286,7 @@ class ConservativeStableIdentityResolver:
     def _fragments(self, rows: list[dict[str, Any]]) -> list[_IdentityFragment]:
         grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
-            grouped[int(row["raw_track_id"])].append(row)
+            grouped[_identity_group(row)].append(row)
         fragments = []
         for raw_track_id, fragment_rows in grouped.items():
             fragment_rows.sort(key=lambda row: (int(row["frame_index"]), str(row.get("observation_key", ""))))
@@ -328,6 +328,12 @@ def _copy_observations(observations: Iterable[Mapping[str, Any]]) -> list[dict[s
     return rows
 
 
+def _identity_group(row: Mapping[str, Any]) -> int:
+    """Use seam identity when present while retaining raw SAM provenance."""
+
+    return int(row.get("canonical_raw_track_id", row["raw_track_id"]))
+
+
 def _duplicate_observation_key_reasons(rows: list[dict[str, Any]]) -> list[str]:
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -361,14 +367,15 @@ def _resolve_identity(
         if existing is not None and existing != stable_id:
             reasons.append(f"conflicting_stable_player_id:{key}")
         row["stable_player_id"] = stable_id
-        stable_by_raw[row["raw_track_id"]].add(stable_id)
+        stable_by_raw[_identity_group(row)].add(stable_id)
         frame_index = int(row["frame_index"])
         previous_raw = stable_by_frame[frame_index].get(stable_id)
-        if previous_raw is not None and previous_raw != row["raw_track_id"]:
+        identity_group = _identity_group(row)
+        if previous_raw is not None and previous_raw != identity_group:
             reasons.append(
                 f"conflicting_stable_player_id:frame={frame_index}:stable_player_id={stable_id}"
             )
-        stable_by_frame[frame_index][stable_id] = row["raw_track_id"]
+        stable_by_frame[frame_index][stable_id] = identity_group
 
     for raw_id, stable_ids in stable_by_raw.items():
         if len(stable_ids) > 1:

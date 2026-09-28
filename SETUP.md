@@ -109,6 +109,31 @@ and events. `modal_app.py` remains on the legacy possession engine, and local
 or other callers still default to legacy unless they explicitly set
 `POSSESSION_ENGINE=v3`.
 
+For bounded SAM3.1 V2 runs, seam stitching uses mask IoU first and bbox
+IoU/center fallback to make one-to-one local-ID matches. Set
+`SAM31_V2_SEAM_MIN_SCORE` and `SAM31_V2_SEAM_AMBIGUITY_MARGIN` to tune the
+physical-evidence gate. Ambiguous, crossing, or missing overlap is kept as
+separate qualified fragments; IDs are never joined from local-ID equality alone.
+Segmented rows use `raw_track_id` for the namespaced segment-local SAM ID and
+preserve the original model ID/key in `local_raw_track_id` and
+`raw_observation_key`. The separate `canonical_raw_track_id` is used only for
+seam grouping and identity resolution.
+When the later overlap owner lacks a mask, the mask is omitted and diagnosed;
+the earlier segment's mask is never reassigned to the later observation.
+
+## Verification
+
+Focused checks are useful while editing, but do not count as full verification.
+Run the repository-wide guard from the project root and report its actual totals:
+
+```bash
+PYTHONPATH=. .venv/bin/pytest -q
+```
+
+The configured `testpaths = tests` makes this command collect the complete test
+suite; a focused path such as `tests/test_sam31_segments.py` is intentionally not
+a substitute.
+
 To review V3 state together with recognized jersey numbers without loading the
 legacy possession overlays, render the saved bundle with explicit inputs:
 

@@ -1605,13 +1605,64 @@ def test_process_segmented_boundary_passes_rows_masks_and_artifacts(monkeypatch)
     payload = process(cls(), video_bytes=b"fake-video", frame_start=0, frame_end=0,
                       segmented=True, segment_window=4, segment_overlap=1, return_artifacts=True)
 
-    assert calls and calls[0][1] == {"window": 4, "overlap": 1}
+    assert calls and {key: calls[0][1][key] for key in (
+        "window", "overlap", "seam_min_score", "seam_ambiguity_margin"
+    )} == {
+        "window": 4,
+        "overlap": 1,
+        "seam_min_score": 0.5,
+        "seam_ambiguity_margin": 0.05,
+    }
+    assert calls[0][1]["seam_diagnostics"] == []
     assert captured["rows"] == rows
     assert np.array_equal(captured["masks_by_observation"]["0:7"], masks["0:7"])
     assert "0:7" in json.loads(payload["artifacts"]["tracks.jsonl"].decode())["observation_key"]
     assert any(name.startswith("masks/") for name in payload["artifacts"])
     manifest = json.loads(payload["artifacts"]["manifest.json"])
     assert manifest["config"]["sam31_segmented"] is True
+
+
+def test_process_segmented_serializes_seam_diagnostics_without_mask_mismatch(monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result
+
+    rows = [{
+        "observation_key": "0:7", "frame_index": 0, "raw_track_id": 7,
+        "bbox_xyxy": [0, 0, 1, 1], "track_state": "tracked",
+    }]
+    masks = {"0:7": np.ones((2, 2), dtype=np.uint8)}
+    diagnostics = [
+        {"event": "matched", "segment_index": 1, "previous_raw_track_id": 7,
+         "current_raw_track_id": 1000007, "score": 0.91},
+        {"event": "ambiguous", "segment_index": 2},
+        {"event": "ownership", "frame_index": 2, "owner_segment_index": 1},
+        {"event": "owned_observation_missing_mask", "frame_index": 3},
+    ]
+
+    def segmented(*_args, seam_diagnostics, **_kwargs):
+        seam_diagnostics.extend(diagnostics)
+        return rows, masks
+
+    monkeypatch.setattr(modal_app_v2, "_track_segmented_video", segmented)
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args, **_kwargs: pytest.fail("full-video path used"))
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {0: np.zeros((2, 2, 3), dtype=np.uint8)})
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **_kwargs: RunnerV2Result(observations))
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+
+    payload = process(
+        cls(), video_bytes=b"fake-video", frame_start=0, frame_end=0,
+        segmented=True, return_artifacts=True, return_diagnostics=True,
+    )
+
+    assert payload["debug_diagnostics"]["seam_diagnostics"] == diagnostics
+    manifest = json.loads(payload["artifacts"]["manifest.json"])
+    assert manifest["config"]["sam31_seam_diagnostics"] == diagnostics
+    track = json.loads(payload["artifacts"]["tracks.jsonl"].decode())
+    assert track["mask_ref"] in payload["artifacts"]
 
 
 def test_segmented_conflicted_team_is_scoped_in_artifacts_and_manifest(monkeypatch):

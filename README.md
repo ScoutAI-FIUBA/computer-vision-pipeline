@@ -49,6 +49,21 @@ SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py \
   --segment-window 32 --segment-overlap 1 --output-dir outputs/v2-segmented
 ```
 
+At each seam, current local IDs receive the previous stitching identity only
+after a unique physical match: mask IoU is primary, with bbox IoU/center fallback.
+`SAM31_V2_SEAM_MIN_SCORE` (default `0.5`) and
+`SAM31_V2_SEAM_AMBIGUITY_MARGIN` (default `0.05`) tune the gate. Missing,
+crossing, or ambiguous evidence fails closed, retaining separate fragments
+instead of guessing an identity. In segmented output, `raw_track_id` is the
+namespaced segment-local SAM ID; `local_raw_track_id` is the original model
+local ID, and `raw_observation_key` preserves its original unique observation
+key. Seam grouping uses the separate `canonical_raw_track_id`. Mask keys remain
+lossless raw observation keys, and the later segment still owns duplicate
+overlap rows.
+If the later owner has no usable mask, its observation remains the owner but is
+marked mask-missing; the earlier mask is discarded for that key rather than
+being reused.
+
 `--segment-window` and `--segment-overlap` may also be set with
 `SAM31_V2_SEGMENT_WINDOW` and `SAM31_V2_SEGMENT_OVERLAP`. The default overlap is
 one frame. SAM3.1 remains configured with `max_num_objects=16`; a segment that
