@@ -101,6 +101,22 @@ and events. `modal_app.py` remains on the legacy possession engine, and local
 or other callers still default to legacy unless they explicitly set
 `POSSESSION_ENGINE=v3`.
 
+To review V3 state together with recognized jersey numbers without loading the
+legacy possession overlays, render the saved bundle with explicit inputs:
+
+```bash
+./.venv/bin/python scripts/tracking/debug_v2.py \
+  --video-path path/to/input.mp4 \
+  --artifact-dir outputs/v2-game \
+  --v3-dir outputs/v2-game/stats/possession_v3/generations/<generation-id> \
+  --numbers-json outputs/v2-game/stats/numbers.json \
+  --output outputs/v2-game/v3-number-debug.mp4
+```
+
+When using `--stats-dir`, the renderer automatically uses an existing
+`numbers.json` from that directory and keeps the legacy possession overlays.
+Omit `--numbers-json` when number overlays are not needed.
+
 How to get the pipeline running on Modal GPUs. Follow it in order — each step
 gets cheaper to debug if the previous one worked.
 

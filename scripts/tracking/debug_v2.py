@@ -22,6 +22,7 @@ TEAM_COLORS = {
 NEUTRAL_COLOR = (160, 255, 160)
 POSSESSION_STATUSES = {"confirmed", "unknown", "lost", "unassigned"}
 V3_STATES = {"OBSERVED", "INFERRED", "GRACE", "CONTESTED", "NO_POSSESSION", "UNKNOWN", "CANDIDATE", "TRANSITIONING", "LOST_NO_DETECTION"}
+NUMBER_STATUSES = {"confirmed", "ambiguous", "unknown"}
 
 
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
@@ -74,6 +75,54 @@ def load_v3_jsonl(path: Path | None) -> dict[int, list[dict[str, Any]]]:
         if type(frame) is int:
             rows[frame].append(row)
     return dict(rows)
+
+
+def load_numbers_json(path: Path | None) -> dict[str | int, dict[str, Any]]:
+    """Load stable-ID records and exact legacy raw-track records."""
+    if path is None:
+        return {}
+    if not path.is_file():
+        raise ValueError(f"numbers artifact is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read numbers artifact: {path}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("invalid numbers artifact structure: expected an object")
+    players = payload.get("players", [])
+    tracks = payload.get("tracks", [])
+    if not isinstance(players, list) or not isinstance(tracks, list):
+        raise ValueError("invalid numbers artifact structure: players must be a list")
+    records: dict[str | int, dict[str, Any]] = {}
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        stable_player_id = player.get("stable_player_id")
+        if isinstance(stable_player_id, str) and stable_player_id.strip():
+            records[stable_player_id.strip()] = player
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        track_id = track.get("track_id")
+        if isinstance(track_id, int) and not isinstance(track_id, bool):
+            records[track_id] = track
+    return records
+
+
+def _number_label(record: Mapping[str, Any]) -> str | None:
+    status = str(record.get("status", "unknown")).strip().lower()
+    if status not in NUMBER_STATUSES:
+        status = "unknown"
+    number = record.get("number")
+    if number is None or str(number).strip().lower() in {"", "unknown", "none"}:
+        value = "UNKNOWN"
+    else:
+        value = str(number).strip()
+    if status == "ambiguous":
+        return f"NUMBER?: {value} (ambiguous)"
+    if status == "unknown":
+        return "NUMBER: UNKNOWN"
+    return f"NUMBER: {value}"
 
 
 def color_for_track(raw_track_id: int) -> tuple[int, int, int]:
@@ -309,6 +358,7 @@ def render_frame(
     v3_observation: Mapping[str, Any] | None = None,
     v3_transition: Mapping[str, Any] | None = None,
     v3_events: Iterable[Mapping[str, Any]] = (),
+    number_records: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> np.ndarray:
     """Draw masks and provenance labels without running identity logic."""
     rendered = frame.copy()
@@ -343,8 +393,20 @@ def render_frame(
             labels.append("TEMP_FIX")
         elif row.get("bbox_outlier"):
             labels.append("OUTLIER?")
-        if row.get("stable_player_id"):
-            labels.append(f"PLAYER: {row['stable_player_id']}")
+        number_record = None
+        stable_player_id = row.get("stable_player_id")
+        if stable_player_id:
+            labels.append(f"PLAYER: {stable_player_id}")
+            if number_records:
+                normalized_stable_player_id = stable_player_id.strip() if isinstance(stable_player_id, str) else ""
+                number_record = number_records.get(normalized_stable_player_id)
+        elif number_records:
+            raw_track_id = row.get("raw_track_id", row.get("track_id"))
+            number_record = number_records.get(raw_track_id)
+        if number_record is not None:
+            number_label = _number_label(number_record)
+            if number_label is not None:
+                labels.append(number_label)
         if row.get("team_id") is not None:
             labels.append(f"TEAM: {row['team_id']}")
         if row.get("rejection_state"):
@@ -380,6 +442,7 @@ def render_debug_video(
     possession_jsonl: Path | None = None,
     stats_tracks_jsonl: Path | None = None,
     v3_dir: Path | None = None,
+    numbers_json: Path | None = None,
 ) -> dict[str, int | None]:
     """Render the selected inclusive source-frame range to an MP4."""
     if start_frame is not None and start_frame < 0:
@@ -399,6 +462,7 @@ def render_debug_video(
     observations = load_observations(tracks_jsonl)
     possession_events = load_possession_events(possession_jsonl) if possession_jsonl else {}
     stats_observations = load_observations(stats_tracks_jsonl) if stats_tracks_jsonl else {}
+    number_records = load_numbers_json(numbers_json)
     v3_observations = load_v3_jsonl(v3_dir / "possession_v3.jsonl") if v3_dir else {}
     v3_transitions = load_v3_jsonl(v3_dir / "ball_transitions_v3.jsonl") if v3_dir else {}
     v3_events = load_v3_jsonl(v3_dir / "possession_events_v3.jsonl") if v3_dir else {}
@@ -437,6 +501,7 @@ def render_debug_video(
                 v3_observation=(v3_observations.get(frame_index) or [None])[0],
                 v3_transition=(v3_transitions.get(frame_index) or [None])[0],
                 v3_events=v3_events.get(frame_index, ()),
+                number_records=number_records,
             ))
             first_written = frame_index if first_written is None else first_written
             last_written = frame_index
@@ -458,6 +523,7 @@ def main() -> None:
     parser.add_argument("--possession-jsonl", type=Path)
     parser.add_argument("--stats-tracks-jsonl", type=Path)
     parser.add_argument("--v3-dir", type=Path, help="Optional directory containing versioned V3 artifacts")
+    parser.add_argument("--numbers-json", type=Path, help="Optional stats/numbers.json jersey-number summary")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--start-frame", type=int)
     parser.add_argument("--end-frame", type=int)
@@ -482,6 +548,8 @@ def main() -> None:
         parser.error("provide both --possession-jsonl and --stats-tracks-jsonl")
     possession_jsonl = args.possession_jsonl or (args.stats_dir / "possession_events.jsonl" if args.stats_dir else None)
     stats_tracks_jsonl = args.stats_tracks_jsonl or (args.stats_dir / "tracks.jsonl" if args.stats_dir else None)
+    auto_numbers_json = args.stats_dir / "numbers.json" if args.stats_dir else None
+    numbers_json = args.numbers_json or (auto_numbers_json if auto_numbers_json and auto_numbers_json.is_file() else None)
     if (possession_jsonl is None) != (stats_tracks_jsonl is None):
         parser.error("provide --stats-dir or both --possession-jsonl and --stats-tracks-jsonl")
     stats = render_debug_video(
@@ -495,6 +563,7 @@ def main() -> None:
         possession_jsonl=possession_jsonl,
         stats_tracks_jsonl=stats_tracks_jsonl,
         v3_dir=args.v3_dir,
+        numbers_json=numbers_json,
     )
     print(f"Wrote {stats['frames_written']} frames to {args.output}")
 

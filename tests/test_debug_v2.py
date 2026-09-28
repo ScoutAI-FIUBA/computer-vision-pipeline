@@ -10,6 +10,7 @@ import pytest
 
 from scripts.tracking import debug_v2
 from scripts.tracking.debug_v2 import (
+    load_numbers_json,
     load_possession_events,
     render_debug_video,
     render_frame,
@@ -85,6 +86,134 @@ def test_render_frame_draws_stable_team_and_rejection_labels(tmp_path: Path):
 
     assert not np.array_equal(rendered, frame)
     assert rendered[20, 10].any()
+
+
+def test_render_frame_overlays_numbers_by_stable_player_id_and_status(tmp_path: Path, monkeypatch):
+    calls = []
+    original_put_text = cv2.putText
+    monkeypatch.setattr(
+        cv2, "putText",
+        lambda image, text, *args, **kwargs: (calls.append(text), original_put_text(image, text, *args, **kwargs))[1],
+    )
+
+    render_frame(
+        np.zeros((120, 180, 3), dtype=np.uint8),
+        [
+            {"raw_track_id": 7, "stable_player_id": "confirmed", "bbox_xyxy": [5, 30, 50, 80]},
+            {"raw_track_id": 8, "stable_player_id": "ambiguous", "bbox_xyxy": [60, 30, 105, 80]},
+            {"raw_track_id": 9, "stable_player_id": "unknown", "bbox_xyxy": [110, 30, 155, 80]},
+            {"raw_track_id": 10, "stable_player_id": "missing", "bbox_xyxy": [5, 90, 50, 115]},
+            {"raw_track_id": 11, "bbox_xyxy": [60, 90, 105, 115]},
+        ],
+        tmp_path,
+        number_records={
+            "confirmed": {"stable_player_id": "confirmed", "status": "confirmed", "number": "14"},
+            "ambiguous": {"stable_player_id": "ambiguous", "status": "ambiguous", "number": "14"},
+            "unknown": {"stable_player_id": "unknown", "status": "unknown", "number": "unknown"},
+            "raw-7": {"stable_player_id": "raw-7", "status": "confirmed", "number": "99"},
+        },
+    )
+
+    assert "NUMBER: 14" in calls
+    assert "NUMBER?: 14 (ambiguous)" in calls
+    assert "NUMBER: UNKNOWN" in calls
+    assert all("99" not in call for call in calls)
+
+
+def test_load_numbers_json_is_keyed_by_stable_player_id(tmp_path: Path):
+    path = tmp_path / "numbers.json"
+    path.write_text(json.dumps({"players": [
+        {"stable_player_id": " p1 ", "status": "confirmed", "number": "14"},
+        {"stable_player_id": "", "status": "confirmed", "number": "99"},
+        {"status": "confirmed", "number": "88"},
+    ]}))
+
+    assert load_numbers_json(path) == {
+        "p1": {"stable_player_id": " p1 ", "status": "confirmed", "number": "14"},
+    }
+
+
+def test_load_numbers_json_supports_legacy_track_records(tmp_path: Path):
+    path = tmp_path / "numbers.json"
+    path.write_text(json.dumps({"tracks": [
+        {"track_id": 7, "status": "ambiguous", "number": "23"},
+        {"track_id": True, "status": "confirmed", "number": "99"},
+    ]}))
+
+    records = load_numbers_json(path)
+
+    assert records[7]["status"] == "ambiguous"
+    assert True not in records
+
+
+def test_render_debug_video_v3_only_loads_numbers_and_draws_label(tmp_path: Path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    artifacts = tmp_path / "artifacts"
+    v3_dir = tmp_path / "v3"
+    numbers = tmp_path / "numbers.json"
+    output = tmp_path / "v3-number-debug.mp4"
+    _write_video(video, count=1)
+    _write_artifacts(artifacts)
+    v3_dir.mkdir()
+    (v3_dir / "possession_v3.jsonl").write_text(json.dumps({
+        "frame_index": 0, "state": "OBSERVED", "stable_player_id": "player-14",
+    }) + "\n")
+    (artifacts / "tracks.jsonl").write_text(json.dumps({
+        "frame_index": 0, "raw_track_id": 7, "stable_player_id": " player-14 ",
+        "bbox_xyxy": [5, 5, 20, 20],
+    }) + "\n")
+    numbers.write_text(json.dumps({"players": [{
+        "stable_player_id": "player-14", "status": "confirmed", "number": "14",
+    }]}))
+    calls = []
+    original_put_text = cv2.putText
+    monkeypatch.setattr(
+        cv2, "putText",
+        lambda image, text, *args, **kwargs: (calls.append(text), original_put_text(image, text, *args, **kwargs))[1],
+    )
+
+    monkeypatch.setattr(sys, "argv", [
+        "debug_v2.py", "--video-path", str(video), "--artifact-dir", str(artifacts),
+        "--v3-dir", str(v3_dir), "--numbers-json", str(numbers), "--output", str(output),
+    ])
+    debug_v2.main()
+
+    assert "NUMBER: 14" in calls
+    capture = cv2.VideoCapture(str(output))
+    try:
+        ok, rendered = capture.read()
+    finally:
+        capture.release()
+    assert ok
+    assert np.any(rendered[0:24, 0:32] != np.full((24, 32, 3), (20, 30, 200), dtype=np.uint8))
+
+
+def test_render_debug_video_uses_legacy_track_id_when_stable_id_is_unavailable(tmp_path: Path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    artifacts = tmp_path / "artifacts"
+    numbers = tmp_path / "numbers.json"
+    output = tmp_path / "legacy-number-debug.mp4"
+    _write_video(video, count=1)
+    _write_artifacts(artifacts)
+    (artifacts / "tracks.jsonl").write_text(json.dumps({
+        "frame_index": 0, "raw_track_id": 7, "bbox_xyxy": [5, 5, 20, 20],
+    }) + "\n")
+    numbers.write_text(json.dumps({"tracks": [{
+        "track_id": 7, "status": "ambiguous", "number": "23",
+    }]}))
+    calls = []
+    original_put_text = cv2.putText
+    monkeypatch.setattr(
+        cv2, "putText",
+        lambda image, text, *args, **kwargs: (calls.append(text), original_put_text(image, text, *args, **kwargs))[1],
+    )
+
+    render_debug_video(
+        video, artifacts / "tracks.jsonl", artifacts / "masks", output,
+        numbers_json=numbers,
+    )
+
+    assert "NUMBER?: 23 (ambiguous)" in calls
 
 
 def test_render_frame_uses_one_color_for_players_on_same_team(tmp_path: Path):
@@ -523,6 +652,48 @@ def test_cli_without_stats_input_remains_backward_compatible(tmp_path: Path, mon
 
     assert captured["kwargs"]["possession_jsonl"] is None
     assert captured["kwargs"]["stats_tracks_jsonl"] is None
+    assert captured["kwargs"]["numbers_json"] is None
+
+
+def test_cli_passes_explicit_numbers_without_legacy_stats_overlays(tmp_path: Path, monkeypatch):
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        debug_v2, "render_debug_video",
+        lambda *args, **kwargs: (captured.update(kwargs) or {"frames_written": 0}),
+    )
+    numbers = tmp_path / "numbers.json"
+    monkeypatch.setattr(sys, "argv", [
+        "debug_v2.py", "--video-path", str(tmp_path / "input.mp4"),
+        "--artifact-dir", str(tmp_path / "artifacts"), "--v3-dir", str(tmp_path / "v3"),
+        "--numbers-json", str(numbers), "--output", str(tmp_path / "debug.mp4"),
+    ])
+
+    debug_v2.main()
+
+    assert captured["numbers_json"] == numbers
+    assert captured["possession_jsonl"] is None
+    assert captured["stats_tracks_jsonl"] is None
+
+
+def test_cli_auto_resolves_numbers_from_stats_dir(tmp_path: Path, monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(
+        debug_v2, "render_debug_video",
+        lambda *args, **kwargs: (captured.update(kwargs) or {"frames_written": 0}),
+    )
+    stats_dir = tmp_path / "stats"
+    stats_dir.mkdir()
+    (stats_dir / "numbers.json").write_text(json.dumps({"players": []}))
+    monkeypatch.setattr(sys, "argv", [
+        "debug_v2.py", "--video-path", str(tmp_path / "input.mp4"),
+        "--artifact-dir", str(tmp_path / "artifacts"), "--stats-dir", str(stats_dir),
+        "--output", str(tmp_path / "debug.mp4"),
+    ])
+
+    debug_v2.main()
+
+    assert captured["numbers_json"] == stats_dir / "numbers.json"
 
 
 @pytest.mark.parametrize("explicit", ["--possession-jsonl", "--stats-tracks-jsonl"])

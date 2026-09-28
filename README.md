@@ -67,6 +67,22 @@ Render possession from a saved V2 bundle with the root SAM3.1 video overlay and 
 
 The renderer matches possession events by exact `frame_index`. It displays only the event's authoritative `stable_player_id`, `team_id`, or explicit `UNKNOWN`/`LOST`/`UNASSIGNED` status; it never infers a holder.
 
+To inspect V3 plus recognized V2 jersey numbers without loading legacy possession
+overlays, provide the V3 directory and the stats number summary directly:
+
+```bash
+./.venv/bin/python scripts/tracking/debug_v2.py \
+  --video-path path/to/input.mp4 \
+  --artifact-dir outputs/v2-bundle \
+  --v3-dir outputs/v2-bundle/stats/possession_v3/generations/<generation-id> \
+  --numbers-json outputs/v2-bundle/stats/numbers.json \
+  --output outputs/v2-bundle/v3-number-debug.mp4
+```
+
+`--numbers-json` is optional. When `--stats-dir` is used, an existing
+`<stats-dir>/numbers.json` is picked up automatically; legacy possession overlays
+still load as before. Without a numbers file, rendering remains backward-compatible.
+
 ## Phase status
 
 - **Completed for this phase:** production ball detection and production team identification.
