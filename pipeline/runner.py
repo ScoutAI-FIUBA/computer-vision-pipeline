@@ -50,7 +50,7 @@ from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.possession_v3 import (
     PossessionResolver, derive_ball_primitives, derive_ball_transitions, classify_transition,
-    normalize_ball_rows, score_candidates, debounce_reverted_switches, V3_CONTRACT_VERSION,
+    normalize_ball_rows, score_candidates, debounce_reverted_switches, V3_CONTRACT_VERSION, _point,
 )
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
@@ -130,6 +130,20 @@ def _frame_timestamp_seconds(frame_index: int, fps: float) -> float | None:
     return None if fps <= 0 else frame_index / fps
 
 
+def _v3_ball_row_invalid(ball: object) -> bool:
+    """Keep malformed evidence fail-closed without treating authoritative loss as invalid."""
+    if not isinstance(ball, dict):
+        return True
+    state = ball.get("track_state")
+    if state == "lost":
+        geometry_fields = ("center_xy", "center", "ball_center", "x", "y", "center_x", "center_y", "xyxy")
+        return ball.get("confidence") is not None or any(ball.get(field) is not None for field in geometry_fields)
+    if state not in {"detected", "fallback"} or _point(ball) is None:
+        return True
+    confidence = ball.get("confidence", ball.get("score"))
+    return type(confidence) not in {int, float} or not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1
+
+
 def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig) -> dict:
     """Run the additive V3 path; legacy files are never read or rewritten."""
     if not config.possession_v3_enabled:
@@ -148,9 +162,9 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
     for frame in sorted(set(by_frame) | set(balls)):
         ball = balls.get(frame)
         candidates = score_candidates(by_frame.get(frame, []), ball, previous_holder=resolver.holder_stable,
-                                      ambiguity_margin=config.possession_v3_hysteresis_margin)
+                                       ambiguity_margin=config.possession_v3_hysteresis_margin)
         observation = resolver.resolve(frame, candidates, missing=ball is None,
-                                       invalid=ball is not None and ball.get("track_state") == "lost",
+                                       invalid=_v3_ball_row_invalid(ball),
                                        ball_lost=ball is not None and ball.get("track_state") == "lost",
                                        timestamp=ball.get("timestamp_seconds") if ball else None)
         observations.append(observation)

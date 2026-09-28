@@ -540,6 +540,67 @@ def test_runner_artifact_boundary_collapses_dense_transient_switch(tmp_path):
     assert all(event["event_type"] not in {"PASS", "STEAL", "TURNOVER", "LOSS_OF_CONTROL"} for event in events)
 
 
+def test_runner_lost_tracknet_row_uses_grace_and_allows_subsequent_transition(tmp_path):
+    config = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3")
+    rows = []
+    for frame in range(5):
+        rows.extend([
+            {"frame_index": frame, "stable_player_id": "a", "raw_track_id": 1, "team_id": 1,
+             "bbox": [0, 0, 10, 10], "confidence": 1.0},
+            {"frame_index": frame, "stable_player_id": "b", "raw_track_id": 2, "team_id": 2,
+             "bbox": [20, 0, 30, 10], "confidence": 1.0},
+        ])
+    ball_rows = [
+        {"frame_index": 0, "timestamp_seconds": 0.0, "track_state": "detected",
+         "confidence": 1.0, "center_xy": [5, 5], "source_records": ["ball#0"],
+         "source_frame_indices": [0]},
+        {"frame_index": 1, "timestamp_seconds": 0.1, "track_state": "lost",
+         "confidence": None, "center_xy": None, "source_records": ["ball#1"],
+         "source_frame_indices": [1]},
+        {"frame_index": 2, "timestamp_seconds": 0.2, "track_state": "detected",
+         "confidence": 1.0, "center_xy": [25, 5], "source_records": ["ball#2"],
+         "source_frame_indices": [2]},
+        {"frame_index": 3, "timestamp_seconds": 0.3, "track_state": "detected",
+         "confidence": 1.0, "center_xy": [25, 5], "source_records": ["ball#3"],
+         "source_frame_indices": [3]},
+        {"frame_index": 4, "timestamp_seconds": 0.4, "track_state": "detected",
+         "confidence": 1.0, "center_xy": [25, 5], "source_records": ["ball#4"],
+         "source_frame_indices": [4]},
+    ]
+
+    manifest = _build_v3_artifacts(tmp_path, rows, ball_rows, fps=10, config=config)
+    possession_path = tmp_path / manifest["artifacts"]["possession"]["path"]
+    possession = [json.loads(line) for line in possession_path.read_text().splitlines()]
+
+    gap = next(row for row in possession if row["frame_index"] == 1)
+    assert gap["state"] == "INFERRED"
+    assert gap["context"]["effective_holder_id"] == "a"
+    switched = next(row for row in possession if row["frame_index"] == 4)
+    assert switched["state"] == "OBSERVED"
+    assert switched["context"]["effective_holder_id"] == "b"
+    assert switched["audit"]["switch_confirmed"] is True
+
+
+def test_runner_malformed_ball_geometry_clears_holder_fail_closed(tmp_path):
+    config = PipelineConfig(roboflow_api_key="test-key", possession_engine="v3")
+    rows = [{"frame_index": frame, "stable_player_id": "a", "raw_track_id": 1, "team_id": 1,
+             "bbox": [0, 0, 10, 10], "confidence": 1.0} for frame in range(2)]
+    ball_rows = [
+        {"frame_index": 0, "timestamp_seconds": 0.0, "track_state": "detected",
+         "confidence": 1.0, "center_xy": [5, 5]},
+        {"frame_index": 1, "timestamp_seconds": 0.1, "track_state": "detected",
+         "confidence": 1.0, "center_xy": [float("nan"), 5]},
+    ]
+
+    manifest = _build_v3_artifacts(tmp_path, rows, ball_rows, fps=10, config=config)
+    possession_path = tmp_path / manifest["artifacts"]["possession"]["path"]
+    possession = [json.loads(line) for line in possession_path.read_text().splitlines()]
+    malformed = next(row for row in possession if row["frame_index"] == 1)
+    assert malformed["state"] == "UNKNOWN"
+    assert malformed["context"]["effective_holder_id"] is None
+    assert "invalid_evidence" in malformed["provenance"]["reason_codes"]
+
+
 def test_exact_006_007_timeline_preserves_then_confirms_switch():
     resolver = PossessionResolver(real_fps=20, persistence_seconds=.15)
     holder = CandidateEvidence("player-006", 6, 1, .9, {"geometry": .9})
