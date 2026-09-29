@@ -1,6 +1,6 @@
 """V4 spatial contract and fusion tests."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 
 import pytest
@@ -209,8 +209,9 @@ def test_v4_challenger_acquisition_persists_before_switch():
                                   acquisition_persistence_seconds=.2)
     assert resolver.resolve(0, score_candidates_v4([evidence_player("p1", 10, continuity=1)],
                                                      {"x": 10, "y": 20})).state is PossessionState.OBSERVED
-    challenger = score_candidates_v4([evidence_player("p2", 10, approach=1, continuity=1)],
-                                     {"x": 10, "y": 20})
+    challenger = score_candidates_v4([
+        evidence_player("p1", 100), evidence_player("p2", 10, approach=1, continuity=1)
+    ], {"x": 10, "y": 20})
     assert resolver.resolve(1, challenger).context.effective_holder_id == "p1"
     assert resolver.resolve(2, challenger).context.effective_holder_id == "p2"
 
@@ -289,6 +290,92 @@ def test_v4_invalid_authority_cannot_replace_holder(challenger):
     result = resolver.resolve(1, [candidate])
     assert result.context.effective_holder_id == "p1"
     assert result.state is PossessionState.CONTESTED
+
+
+def test_v4_crossing_candidate_without_release_or_acquisition_keeps_holder():
+    resolver = PossessionResolver(real_fps=10, v4=True, acquisition_persistence_seconds=0)
+    holder = score_candidates_v4([evidence_player("004", 10, continuity=1)], {"x": 10, "y": 20})
+    resolver.resolve(0, holder)
+    crossing = score_candidates_v4([
+        evidence_player("004", 100), evidence_player("007", 10)
+    ], {"x": 10, "y": 20})
+    result = resolver.resolve(1, crossing)
+    assert result.context.effective_holder_id == "004"
+    assert result.context.challenger_id == "007"
+    assert result.score == crossing[0].score
+    assert "acquisition_evidence_required" in result.provenance.reason_codes
+
+
+def test_v4_real_switch_requires_both_evidence_and_persistence():
+    resolver = PossessionResolver(real_fps=10, v4=True, acquisition_persistence_seconds=.2)
+    resolver.resolve(0, score_candidates_v4([evidence_player("004", 10, continuity=1)], {"x": 10, "y": 20}))
+    switch = score_candidates_v4([
+        evidence_player("004", 100), evidence_player("007", 10, approach=1, continuity=1)
+    ], {"x": 10, "y": 20})
+    assert resolver.resolve(1, switch).context.effective_holder_id == "004"
+    result = resolver.resolve(2, switch)
+    assert result.context.effective_holder_id == "007"
+    assert result.audit.switch_confirmed is True
+    assert result.audit.previous_holder_score == switch[1].score
+    assert result.audit.new_holder_score == switch[0].score
+    assert "confirmed_switch" in result.audit.provenance.reason_codes
+
+
+def test_v4_dribble_release_cancellation_keeps_holder_and_clears_pending_gate():
+    resolver = PossessionResolver(real_fps=10, v4=True, release_persistence_seconds=.2)
+    resolver.resolve(0, score_candidates_v4([evidence_player("004", 10, continuity=1)], {"x": 10, "y": 20}))
+    weak = score_candidates_v4([evidence_player("004", 100)], {"x": 10, "y": 20})
+    assert resolver.resolve(1, weak).context.effective_holder_id == "004"
+    returned = score_candidates_v4([evidence_player("004", 10, continuity=1)], {"x": 10, "y": 20})
+    result = resolver.resolve(2, returned)
+    assert result.context.effective_holder_id == "004"
+    assert resolver.release_pending is None
+
+
+def test_v4_malformed_switch_evidence_fails_closed_with_auditable_scores():
+    resolver = PossessionResolver(real_fps=10, v4=True)
+    resolver.resolve(0, score_candidates_v4([evidence_player("004", 10, continuity=1)], {"x": 10, "y": 20}))
+    malformed = score_candidates_v4([{
+        "stable_player_id": "007", "raw_track_id": 7, "team_id": 1,
+        "bbox": [0, 0, 20, 40], "mask_valid": True, "mask_contains": True,
+        "relative_motion": 1, "confidence": float("nan")
+    }], {"x": 10, "y": 20})
+    result = resolver.resolve(1, malformed)
+    assert result.context.effective_holder_id == "004"
+    assert result.score == 0
+    assert result.context.challenger_id == "007"
+    assert "invalid_candidate_evidence" in result.provenance.reason_codes
+
+
+def test_v4_seeded_holder_survives_passing_front_overlap_as_contested_diagnostic():
+    resolver = PossessionResolver(real_fps=10, v4=True)
+    holder = score_candidates_v4([evidence_player("004", 10, continuity=1)], {"x": 10, "y": 20})[0]
+    resolver.confirm_switch(holder)
+    overlap = score_candidates_v4([
+        evidence_player("004", 10, continuity=1), evidence_player("007", 10)
+    ], {"x": 10, "y": 20})
+    result = resolver.resolve(1, overlap)
+    assert result.state is PossessionState.CONTESTED
+    assert result.context.effective_holder_id == "004"
+    assert result.context.challenger_id == "007"
+    assert resolver.holder == "004"
+    assert not result.audit.switch_confirmed
+
+
+def test_v4_seeded_holder_survives_near_tie_without_switching():
+    resolver = PossessionResolver(real_fps=10, v4=True, ambiguity_margin=.1)
+    holder = score_candidates_v4([evidence_player("004", 10, continuity=1)], {"x": 10, "y": 20})[0]
+    resolver.confirm_switch(holder)
+    candidates = score_candidates_v4([
+        evidence_player("004", 10, continuity=1), evidence_player("007", 10, approach=1)
+    ], {"x": 10, "y": 20})
+    candidates = [replace(candidate, score=(.75 if candidate.stable_player_id == "004" else .81))
+                  for candidate in candidates]
+    result = resolver.resolve(1, candidates)
+    assert result.state is PossessionState.CONTESTED
+    assert result.context.effective_holder_id == "004"
+    assert result.context.challenger_id == "007"
+    assert result.audit.switch_confirmed is False
 
 
 @pytest.mark.parametrize("name,value", [("holder_control_score", -0.1),

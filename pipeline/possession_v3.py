@@ -820,13 +820,28 @@ class PossessionResolver:
     def _key(self, candidate):
         return candidate.stable_player_id or candidate.fallback_identity or (f"raw:{candidate.raw_track_id}" if candidate.raw_track_id else None)
 
+    def _challenger(self, candidates):
+        return next((candidate for candidate in candidates if self._key(candidate) != self.holder), None)
+
     def _v4_ready(self, candidate, candidates=()):
         prior = next((item for item in candidates if self._key(item) == self.holder), None)
-        release_ready = (prior is None or not isinstance(prior, V4CandidateEvidence)
-                         or prior.holder_release_score >= self.holder_release_score)
+        release_ready = (isinstance(prior, V4CandidateEvidence)
+                         and prior.holder_release_score >= self.holder_release_score)
         return (self.v4 and isinstance(candidate, V4CandidateEvidence) and release_ready
                 and candidate.challenger_acquisition_score >= self.challenger_acquisition_score
                 and candidate.relative_motion > 0)
+
+    def _v4_gate_reasons(self, candidate, candidates=()):
+        """Explain why a V4 challenger cannot replace the effective holder."""
+        prior = next((item for item in candidates if self._key(item) == self.holder), None)
+        reasons = []
+        if not isinstance(prior, V4CandidateEvidence) or prior.holder_release_score < self.holder_release_score:
+            reasons.append("release_evidence_required")
+        if (not isinstance(candidate, V4CandidateEvidence)
+                or candidate.challenger_acquisition_score < self.challenger_acquisition_score
+                or candidate.relative_motion <= 0):
+            reasons.append("acquisition_evidence_required")
+        return tuple(reasons)
 
     def _v4_invalid_candidate(self, candidate):
         if self.v4 and isinstance(candidate, CandidateEvidence) and not isinstance(candidate, V4CandidateEvidence):
@@ -907,9 +922,10 @@ class PossessionResolver:
                         return self._lost_no_detection(frame_index, candidates, "grace_expired")
                 return self._observation(frame_index, PossessionState.CONTESTED,
                                          candidates=candidates, observed=top,
+                                         challenger=self._challenger(candidates) if self.v4 else None,
                                          reason=("legacy_candidate_without_v4_evidence"
-                                                 if not isinstance(top, V4CandidateEvidence)
-                                                 else "invalid_candidate_evidence",))
+                                                  if not isinstance(top, V4CandidateEvidence)
+                                                  else "invalid_candidate_evidence",))
             if {"ambiguous_margin", "mask_bbox_disagreement"}.intersection(top.rejected_reasons):
                 self.pending = None
                 if self.holder:
@@ -917,7 +933,8 @@ class PossessionResolver:
                     if self.gap_seconds >= self.grace:
                         return self._lost_no_detection(frame_index, candidates, "grace_expired")
                 return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
-                                         observed=top, reason=("ambiguous_spatial_evidence",))
+                                         observed=top, challenger=self._challenger(candidates) if self.v4 else None,
+                                         reason=("ambiguous_spatial_evidence",))
             if self._key(top) == self.holder and top.score >= self.keep_threshold:
                 self.release_pending = None
                 if self.v4 and isinstance(top, V4CandidateEvidence) and top.holder_control_score < self.holder_control_score:
@@ -955,9 +972,11 @@ class PossessionResolver:
                     if self.gap_seconds >= self.grace:
                         return self._lost_no_detection(frame_index, candidates, "grace_expired")
                     return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
-                                             observed=top, reason=("insufficient_margin",))
+                                             observed=top, challenger=self._challenger(candidates) if self.v4 else None,
+                                             reason=("insufficient_margin",))
                 return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
-                                         observed=top, reason=("insufficient_margin",))
+                                         observed=top, challenger=self._challenger(candidates) if self.v4 else None,
+                                         reason=("insufficient_margin",))
             if top.score < self.keep_threshold and self.holder is None:
                 return self._observation(frame_index, PossessionState.CANDIDATE, top, candidates, ("weak_candidate",))
             if self.holder is None:
@@ -984,13 +1003,14 @@ class PossessionResolver:
                 if self.v4 and not self._v4_ready(top, candidates):
                     self.pending = None
                     return self._observation(frame_index, PossessionState.TRANSITIONING,
-                                             candidates=candidates, observed=top,
-                                             reason=("acquisition_evidence_required",))
+                                             candidates=candidates, observed=top, challenger=top,
+                                             reason=self._v4_gate_reasons(top, candidates))
                 key = self._key(top)
                 required_persistence = self.acquisition_persistence if self.v4 else self.persistence
                 accumulated = self.pending[1] + elapsed if self.pending and self.pending[0] == key else elapsed
                 if self.pending and self.pending[0] == key and accumulated >= required_persistence:
-                    self.confirm_switch(top, frame_index=frame_index, timestamp=timestamp)
+                    self.confirm_switch(top, frame_index=frame_index, timestamp=timestamp,
+                                        candidates=candidates, persistence_elapsed=accumulated)
                     self.gap_seconds = 0.0
                     self.last_observed_frame, self.last_observed_score = frame_index, top.score
                     self.last_observed_timestamp = timestamp
@@ -1011,7 +1031,8 @@ class PossessionResolver:
             return self._observation(frame_index, PossessionState.UNKNOWN, candidates=candidates,
                                      observed=top, reason=("challenger_rejected",))
 
-    def confirm_switch(self, candidate, *, frame_index=None, timestamp=None):
+    def confirm_switch(self, candidate, *, frame_index=None, timestamp=None, candidates=(),
+                       persistence_elapsed=None):
         """The sole mutation path for an effective holder change."""
         if self._v4_invalid_candidate(candidate):
             return self.holder
@@ -1021,6 +1042,12 @@ class PossessionResolver:
             raise ValueError("confirmed switch requires stable identity")
         if candidate.score < self.keep_threshold:
             raise ValueError("confirmed switch requires keep_threshold score")
+        if self.v4 and self.holder is not None:
+            gate_reasons = self._v4_gate_reasons(candidate, candidates)
+            if gate_reasons:
+                raise ValueError("V4 switch gate rejected: " + ", ".join(gate_reasons))
+            if persistence_elapsed is None or persistence_elapsed < self.acquisition_persistence:
+                raise ValueError("V4 switch gate requires temporal persistence")
         previous = self.holder
         previous_team = self.holder_team
         start_frame = self.pending[2] if self.pending and self.pending[0] == self._key(candidate) else frame_index
@@ -1032,7 +1059,8 @@ class PossessionResolver:
         self._audit_for_last_transition = PossessionAudit(
             previous_holder_id=previous, previous_holder_team=previous_team,
             new_holder_id=self.holder, new_holder_team=self.holder_team,
-            previous_holder_score=self.last_observed_score,
+            previous_holder_score=next((item.score for item in candidates
+                                        if self._key(item) == previous), self.last_observed_score),
             new_holder_score=candidate.score,
             challenger_start_frame=start_frame,
             challenger_confirmation_frame=frame_index,

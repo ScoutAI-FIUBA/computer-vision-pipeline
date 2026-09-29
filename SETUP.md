@@ -124,7 +124,8 @@ the earlier segment's mask is never reassigned to the later observation.
 ## Verification
 
 Focused checks are useful while editing, but do not count as full verification.
-Run the repository-wide guard from the project root and report its actual totals:
+The canonical full-suite command is the repository-wide guard from the project root;
+run it and report its actual totals:
 
 ```bash
 PYTHONPATH=. .venv/bin/pytest -q
