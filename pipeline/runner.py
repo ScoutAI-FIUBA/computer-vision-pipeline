@@ -21,6 +21,8 @@ from numbers import Real
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 from pipeline import appearance
 from pipeline.ball import (
     ball_track_record,
@@ -145,7 +147,72 @@ def _v3_ball_row_invalid(ball: object) -> bool:
     return type(confidence) not in {int, float} or not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1
 
 
-def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig) -> dict:
+def _mask_probe(mask, box, *, frame_width=None, frame_height=None):
+    try:
+        shape = tuple(int(value) for value in mask.shape)
+        if len(shape) != 2 or not all(shape):
+            return None
+        if getattr(mask.dtype, "kind", None) not in "biuf" or not np.isfinite(mask).all():
+            return None
+        values = mask.astype(bool, copy=False)
+        if not values.any():
+            return None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    x1, y1, x2, y2 = (float(value) for value in box)
+    height, width = shape
+    crop_width = round(x2 - x1)
+    crop_height = round(y2 - y1)
+    is_frame_mask = (
+        type(frame_width) is int and type(frame_height) is int
+        and width == frame_width and height == frame_height
+    )
+    if not is_frame_mask and (width != crop_width or height != crop_height):
+        return None
+
+    def location(x, y):
+        if width == round(x2 - x1) and height == round(y2 - y1):
+            return int(math.floor(x - x1)), int(math.floor(y - y1))
+        return int(math.floor(x)), int(math.floor(y))
+
+    def contains(x, y):
+        px, py = location(x, y)
+        return 0 <= px < width and 0 <= py < height and bool(values[py, px])
+
+    foreground = [(int(x), int(y)) for y, x in zip(*values.nonzero())]
+
+    def distance(x, y):
+        px, py = location(x, y)
+        return min(math.hypot(px - fx, py - fy) for fx, fy in foreground)
+
+    return contains, distance
+
+
+def _attach_v3_mask_evidence(rows, *, masks_by_observation=None, clean_masks_by_observation=None,
+                             frame_width=None, frame_height=None):
+    clean_masks_by_observation = clean_masks_by_observation or {}
+    masks_by_observation = masks_by_observation or {}
+    for row in rows:
+        key = str(row.get("observation_key", f"{row.get('frame_index')}:{row.get('track_id')}"))
+        mask = clean_masks_by_observation.get(key)
+        clean = mask is not None
+        box = row.get("xyxy")
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        probe = _mask_probe(mask, box, frame_width=frame_width, frame_height=frame_height) if mask is not None else None
+        if probe is None:
+            mask = masks_by_observation.get(key)
+            clean = False
+            probe = _mask_probe(mask, box, frame_width=frame_width, frame_height=frame_height) if mask is not None else None
+        if probe is not None:
+            row["mask_contains"], row["mask_distance"] = probe
+            row["mask_valid"] = True
+            row["clean_mask"] = clean
+
+
+def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig,
+                        masks_by_observation=None, clean_masks_by_observation=None,
+                        frame_width=None, frame_height=None) -> dict:
     """Run the additive V3 path; legacy files are never read or rewritten."""
     if not config.possession_v3_enabled:
         return {}
@@ -154,6 +221,13 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
         item = dict(row)
         item["xyxy"] = item.get("xyxy", item.get("bbox", item.get("box")))
         by_frame.setdefault(int(item["frame_index"]), []).append(item)
+    _attach_v3_mask_evidence(
+        [item for frame_rows in by_frame.values() for item in frame_rows],
+        masks_by_observation=masks_by_observation,
+        clean_masks_by_observation=clean_masks_by_observation,
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
     balls = {int(row["frame_index"]): row for row in ball_rows if isinstance(row, dict) and type(row.get("frame_index")) is int}
     resolver = PossessionResolver(real_fps=fps, grace_seconds=config.possession_v3_grace_seconds,
                                   recovery_window_seconds=config.possession_v3_recovery_window_seconds,
@@ -193,13 +267,21 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
     return manifest
 
 
-def _write_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig) -> dict:
+def _write_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict], *, fps: float, config: PipelineConfig,
+                        masks_by_observation=None, clean_masks_by_observation=None,
+                        frame_width=None, frame_height=None) -> dict:
     """Keep optional V3 diagnostics non-authoritative when they fail."""
     if not config.possession_v3_enabled:
         return {}
     started = time.monotonic()
     try:
-        manifest = _build_v3_artifacts(output_dir, rows, ball_rows, fps=fps, config=config)
+        manifest = _build_v3_artifacts(
+            output_dir, rows, ball_rows, fps=fps, config=config,
+            masks_by_observation=masks_by_observation,
+            clean_masks_by_observation=clean_masks_by_observation,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
         manifest["observability"]["elapsed_seconds"] = round(time.monotonic() - started, 6)
         try:
             (output_dir / "possession_v3_failure.json").unlink(missing_ok=True)
@@ -1092,7 +1174,13 @@ def run_stats_from_v2_observations(
         team_ids_by_track_id=team_by_track_id,
         max_frame_gap=config.possession_transition_max_gap,
     ))
-    v3_manifest = phase("possession V3", lambda: _write_v3_artifacts(output_dir, rows, ball_rows, fps=info.fps, config=config))
+    v3_manifest = phase("possession V3", lambda: _write_v3_artifacts(
+        output_dir, rows, ball_rows, fps=info.fps, config=config,
+        masks_by_observation=masks_by_observation,
+        clean_masks_by_observation=clean_masks_by_observation,
+        frame_width=info.width,
+        frame_height=info.height,
+    ))
     _remove_artifacts(output_dir)
     numbers_available = False
     if getattr(config, "number_evidence_enabled", True) and number_predictor is not None:

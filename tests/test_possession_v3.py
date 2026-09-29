@@ -308,6 +308,44 @@ def test_scoring_prefers_clean_mask_and_falls_back_to_dynamic_bbox_margin():
     assert result[1].contributions["bbox"] > 0  # height-scaled margin admits a dribble edge
 
 
+def test_scoring_uses_valid_mask_as_authority_over_overlapping_boxes():
+    players = [
+        _player("wrong", (0, 0, 30, 30), raw_track_id=1,
+                clean_mask=True, mask_contains=False),
+        _player("holder", (0, 0, 30, 30), raw_track_id=2,
+                clean_mask=True, mask_contains=True),
+    ]
+    result = score_candidates(players, {"x": 15, "y": 15, "confidence": .9})
+    assert result[0].stable_player_id == "holder"
+    assert result[1].score == 0.0
+
+
+def test_scoring_falls_back_to_bbox_when_mask_is_missing():
+    result = score_candidates(
+        [_player("holder", (0, 0, 30, 30))],
+        {"x": 15, "y": 15, "confidence": .9},
+    )
+    assert result[0].score > 0
+    assert result[0].contributions["bbox"] > 0
+
+
+def test_equal_valid_masks_remain_contested_despite_unrelated_score_terms():
+    players = [
+        _player("a", (0, 0, 30, 30), confidence=.99,
+                mask_valid=True, mask_contains=lambda _x, _y: True),
+        _player("b", (0, 0, 30, 30), confidence=.10,
+                mask_valid=True, mask_contains=lambda _x, _y: True),
+    ]
+    candidates = score_candidates(
+        players, {"x": 15, "y": 15, "confidence": 1.0},
+        previous_holder="a", ambiguity_margin=.05,
+    )
+    resolver = PossessionResolver(real_fps=30, hysteresis_margin=.05)
+    observation = resolver.resolve(0, candidates)
+    assert observation.state is PossessionState.CONTESTED
+    assert all("ambiguous_margin" in candidate.rejected_reasons for candidate in candidates)
+
+
 def test_scoring_rejects_bad_identity_and_persists_competition_margin():
     result = score_candidates([_player("a", (0, 0, 20, 20)), _player("b", (0, 0, 20, 20)),
                                _player(None, None)], {"x": 10, "y": 10})

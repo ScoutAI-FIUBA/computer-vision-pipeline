@@ -585,6 +585,114 @@ def test_v2_stats_normalization_preserves_mask_provenance():
     assert rows[0]["clean_mask_ref"] == "masks_clean/0_3.png"
 
 
+def test_v2_stats_v3_uses_clean_mask_for_correct_segmented_id(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(
+        fps=30.0, frame_count=1, width=40, height=40, duration_seconds=1 / 30,
+    ))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+    monkeypatch.setattr(runner, "build_tracknet_detector", lambda _checkpoint: object())
+    config = PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none", possession_engine="v3",
+                            tracknet_enabled=True, tracknet_checkpoint="test.pt")
+    observations = [
+        {"frame_index": 0, "raw_track_id": 1, "stable_player_id": "wrong",
+         "observation_key": "0:1", "bbox_xyxy": [2, 2, 30, 30], "team_id": 1},
+        {"frame_index": 0, "raw_track_id": 2, "stable_player_id": "holder",
+         "observation_key": "0:2", "bbox_xyxy": [2, 2, 30, 30], "team_id": 1},
+    ]
+    clean = {}
+    for key, x in (("0:1", 5), ("0:2", 15)):
+        mask = np.zeros((40, 40), dtype=bool)
+        mask[10:25, x:x + 5] = True
+        clean[key] = mask
+    monkeypatch.setattr(runner, "_collect_tracknet_rows", lambda *args, **kwargs: (
+        kwargs["output_path"].write_text(json.dumps({
+            "frame_index": 0, "track_id": 1, "track_state": "detected",
+            "class_name": "ball", "confidence": .9, "center_xy": [17, 17],
+        }) + "\n") or 1
+    ))
+    result = run_stats_from_v2_observations(
+        video, config, tmp_path / "stats", observations,
+        clean_masks_by_observation=clean,
+    )
+    rows = [json.loads(line) for line in (tmp_path / "stats" / result.possession_v3_file).read_text().splitlines()]
+    assert rows[0]["context"]["observed_candidate_id"] == "holder"
+
+
+@pytest.mark.parametrize("clean_kind", ["object", "nan", "inf"])
+def test_v2_stats_v3_falls_back_to_raw_mask_when_clean_mask_is_invalid(tmp_path, monkeypatch, clean_kind):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(
+        fps=30.0, frame_count=1, width=40, height=40, duration_seconds=1 / 30,
+    ))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+    monkeypatch.setattr(runner, "build_tracknet_detector", lambda _checkpoint: object())
+    monkeypatch.setattr(runner, "_collect_tracknet_rows", lambda *args, **kwargs: (
+        kwargs["output_path"].write_text(json.dumps({
+            "frame_index": 0, "track_id": 1, "track_state": "detected",
+            "class_name": "ball", "confidence": .9, "center_xy": [17, 17],
+        }) + "\n") or 1
+    ))
+    config = PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none", possession_engine="v3",
+                            tracknet_enabled=True, tracknet_checkpoint="test.pt")
+    observations = [{
+        "frame_index": 0, "raw_track_id": 1, "stable_player_id": "holder",
+        "observation_key": "0:1", "bbox_xyxy": [2, 2, 30, 30], "team_id": 1,
+    }]
+    raw = np.zeros((40, 40), dtype=bool)
+    raw[10:25, 15:20] = True
+    clean = np.zeros((40, 40), dtype=object if clean_kind == "object" else float)
+    clean[0, 0] = "mask" if clean_kind == "object" else (np.nan if clean_kind == "nan" else np.inf)
+    result = run_stats_from_v2_observations(
+        video, config, tmp_path / "stats", observations,
+        masks_by_observation={"0:1": raw},
+        clean_masks_by_observation={"0:1": clean},
+    )
+    rows = [json.loads(line) for line in (tmp_path / "stats" / result.possession_v3_file).read_text().splitlines()]
+    assert rows[0]["context"]["observed_candidate_id"] == "holder"
+
+
+def test_v2_stats_v3_falls_back_to_raw_mask_when_clean_shape_mismatches_frame(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(
+        fps=30.0, frame_count=1, width=40, height=40, duration_seconds=1 / 30,
+    ))
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+    monkeypatch.setattr(runner, "build_tracknet_detector", lambda _checkpoint: object())
+    monkeypatch.setattr(runner, "_collect_tracknet_rows", lambda *args, **kwargs: (
+        kwargs["output_path"].write_text(json.dumps({
+            "frame_index": 0, "track_id": 1, "track_state": "detected",
+            "class_name": "ball", "confidence": .9, "center_xy": [17, 17],
+        }) + "\n") or 1
+    ))
+    config = PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none", possession_engine="v3",
+                            tracknet_enabled=True, tracknet_checkpoint="test.pt")
+    observations = [{
+        "frame_index": 0, "raw_track_id": 1, "stable_player_id": "holder",
+        "observation_key": "0:1", "bbox_xyxy": [2, 2, 30, 30], "team_id": 1,
+    }]
+    raw = np.zeros((40, 40), dtype=bool)
+    raw[10:25, 15:20] = True
+    clean = np.zeros((20, 20), dtype=bool)
+    clean[0:2, 0:2] = True
+    result = run_stats_from_v2_observations(
+        video, config, tmp_path / "stats", observations,
+        masks_by_observation={"0:1": raw},
+        clean_masks_by_observation={"0:1": clean},
+    )
+    rows = [json.loads(line) for line in (tmp_path / "stats" / result.possession_v3_file).read_text().splitlines()]
+    assert rows[0]["context"]["observed_candidate_id"] == "holder"
+
+
 def test_v2_stats_adapter_requires_checkpoint_when_tracknet_enabled(tmp_path, monkeypatch):
     import pipeline.runner as runner
 

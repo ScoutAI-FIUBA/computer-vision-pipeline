@@ -478,20 +478,33 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
         mask_contains = row.get("mask_contains") if isinstance(row, dict) else None
         mask_hit = False
         mask_available = False
+        mask_distance = None
         if callable(mask_contains) and point is not None:
             try:
                 mask_result = mask_contains(*point)
             except Exception:
                 mask_result = None
             if type(mask_result) is bool:
-                mask_hit, mask_available = mask_result, clean
+                mask_hit, mask_available = mask_result, bool(row.get("mask_valid", True))
+                distance_fn = row.get("mask_distance")
+                if mask_available and callable(distance_fn):
+                    try:
+                        value = distance_fn(*point)
+                        if type(value) in {int, float} and math.isfinite(float(value)):
+                            mask_distance = max(0.0, float(value))
+                    except Exception:
+                        mask_distance = None
         elif type(mask_contains) is bool:
             mask_hit, mask_available = mask_contains, point is not None and clean
         height = (box[3] - box[1]) if isinstance(box, (list, tuple)) and len(box) == 4 else 0
         speed = float(ball.get("speed", 0.0)) if isinstance(ball, dict) and isinstance(ball.get("speed", 0), (int, float)) else 0.0
         margin = max(2.0, height * .15 + speed * .02)
         box_hit = point is not None and _inside_box(point, box, margin)
-        if clean and mask_hit: geometry, mask = 1.0, 1.0
+        if mask_available and mask_hit: geometry, mask = 1.0, 1.0
+        elif mask_available and mask_distance is not None:
+            # A valid mask remains authoritative just outside its foreground.
+            proximity = max(0.0, 1.0 - mask_distance / max(2.0, margin))
+            geometry, mask = proximity, proximity
         elif box_hit: geometry, mask = .7, 0.0
         else: geometry, mask = 0.0, 0.0
         if not geometry: reasons.append("outside_dynamic_player_region")
@@ -513,7 +526,8 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
         prior = 1.0 if stable == previous_holder else 0.0
         active = {
             "mask": mask_available,
-            "bbox": point is not None and isinstance(box, (list, tuple)) and len(box) == 4,
+            "bbox": (not mask_available and point is not None and
+                     isinstance(box, (list, tuple)) and len(box) == 4),
             "player_confidence": confidence_available,
             "ball_quality": point is not None,
             "previous_holder": previous_holder is not None,
@@ -530,6 +544,10 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
         contributions = {name: (value / denominator if active[name] and denominator else 0.0)
                          for name, value in raw_contributions.items()}
         score = sum(contributions.values()) if not reasons or reasons == ["outside_dynamic_player_region"] else 0.0
+        if mask_available:
+            # Equal mask evidence must remain equal; confidence, prior, and ball
+            # quality cannot manufacture a winner over an indistinguishable mask.
+            score = mask
         if reasons and reasons != ["outside_dynamic_player_region"]: score = 0.0
         fallback = f"raw:{raw}" if stable is None and raw is not None else None
         output.append(CandidateEvidence(stable, raw, team if type(team) is int and team >= 0 else None,
