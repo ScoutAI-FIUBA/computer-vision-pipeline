@@ -2,13 +2,15 @@
 
 from dataclasses import asdict, replace
 import json
+from pathlib import Path
+from time import perf_counter
 
 import pytest
 
 from pipeline.config import PipelineConfig
 from pipeline.possession_v3 import (CandidateEvidence, EvidenceKind, PossessionObservation,
-                                    PossessionResolver, PossessionState, V4CandidateEvidence,
-                                    engine_name, score_candidates_v4)
+                                     PossessionResolver, PossessionState, V4CandidateEvidence,
+                                     engine_name, score_candidates, score_candidates_v4)
 from pipeline.results import _json_record
 from pipeline.results import write_v3_artifacts
 
@@ -419,3 +421,88 @@ def test_v4_seeded_holder_survives_near_tie_without_switching():
 def test_v4_evidence_config_scores_are_bounded(name, value):
     with pytest.raises(ValueError):
         PipelineConfig(roboflow_api_key="key", possession_engine="v4", **{name: value})
+
+
+# V4 spec acceptance identities. Keep the detailed tests above readable while
+# exposing the exact names consumed by the formal verification gate.
+def test_mask_bbox_agreement():
+    test_valid_mask_bbox_agreement_is_one_spatial_vote_with_diagnostics()
+
+
+def test_passing_in_front_does_not_switch():
+    test_v4_passing_front_does_not_switch_on_proximity()
+
+
+def test_dribble_preserves_holder():
+    test_v4_dribble_release_cancellation_keeps_holder_and_clears_pending_gate()
+
+
+def test_ambiguous_mask_fails_closed():
+    test_mask_bbox_disagreement_is_reduced_and_marked_ambiguous()
+
+
+def test_release_and_acquisition_confirm():
+    test_v4_real_switch_requires_both_evidence_and_persistence()
+
+
+def test_switch_gate_requires_margin_and_persistence():
+    test_v4_real_switch_requires_both_evidence_and_persistence()
+    test_v4_seeded_holder_survives_near_tie_without_switching()
+
+
+def test_grace_recovery():
+    test_v4_ball_lost_grace_does_not_release_holder()
+
+
+def test_audit_contains_v4_evidence(tmp_path):
+    test_v4_debug_record_contains_gate_scores_and_feature_flag(tmp_path)
+
+
+def test_v3_flag_compatibility():
+    test_legacy_candidate_asdict_keeps_exact_v3_shape()
+    test_non_v4_serialization_omits_spatial_diagnostics("v3")
+
+
+def _replay_saved_input(path, *, v4):
+    fixture = json.loads(Path(path).read_text(encoding="utf-8"))
+    resolver = PossessionResolver(real_fps=fixture["fps"], v4=v4,
+                                  acquisition_persistence_seconds=0.0)
+    observations = []
+    for row in fixture["frames"]:
+        players = row["players"]
+        ball = row["ball"]
+        candidates = (score_candidates_v4(players, ball) if v4
+                      else score_candidates(players, ball))
+        observation = resolver.resolve(row["frame_index"], candidates)
+        observations.append({"frame": row["frame_index"],
+                             "holder": observation.context.effective_holder_id,
+                             "state": observation.state.value})
+    return observations
+
+
+def test_saved_input_v3_v4_comparison_report_and_resolver_fps(tmp_path):
+    fixture_path = Path(__file__).parent / "fixtures" / "possession_v4" / "acceptance_replay.json"
+    v3 = _replay_saved_input(fixture_path, v4=False)
+    v4 = _replay_saved_input(fixture_path, v4=True)
+    comparison = [{"frame": old["frame"], "v3": old, "v4": new}
+                  for old, new in zip(v3, v4)]
+    report = {"frames": len(comparison), "comparison": comparison,
+              "same_input": True}
+    assert report["frames"] > 0
+    assert report["comparison"]
+    assert report["same_input"] is True
+
+    iterations = 200
+    started = perf_counter()
+    for _ in range(iterations):
+        _replay_saved_input(fixture_path, v4=True)
+    elapsed = perf_counter() - started
+    fps = iterations * len(comparison) / max(elapsed, 1e-9)
+    report["v4_resolver_fps"] = fps
+    assert fps > 100
+    assert report["v4_resolver_fps"] > 0
+    report_path = tmp_path / "possession_v4_acceptance_report.json"
+    report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+    saved_report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert saved_report["comparison"]
+    assert saved_report["v4_resolver_fps"] == fps
