@@ -93,6 +93,7 @@ def _possession_result_config(config: PipelineConfig, base: dict) -> dict:
         "possession_engine": "v3",
         "possession_v3_schema_version": V3_CONTRACT_VERSION,
         "possession_v3_reverted_switch_window_seconds": config.possession_v3_reverted_switch_window_seconds,
+        "possession_v3_recovery_window_seconds": config.possession_v3_recovery_window_seconds,
     }
 
 TRACKS_FILENAME = "tracks.jsonl"
@@ -155,6 +156,7 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
         by_frame.setdefault(int(item["frame_index"]), []).append(item)
     balls = {int(row["frame_index"]): row for row in ball_rows if isinstance(row, dict) and type(row.get("frame_index")) is int}
     resolver = PossessionResolver(real_fps=fps, grace_seconds=config.possession_v3_grace_seconds,
+                                  recovery_window_seconds=config.possession_v3_recovery_window_seconds,
                                   hysteresis_margin=config.possession_v3_hysteresis_margin,
                                   persistence_seconds=config.possession_v3_persistence_seconds,
                                   profile=config.possession_v3_calibration_profile)
@@ -180,7 +182,8 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
     manifest = write_v3_artifacts(output_dir, observations, primitives, transitions, events,
                                    {"profile": config.possession_v3_calibration_profile,
                                      "input_contract_version": config.possession_v3_input_contract_version,
-                                     "event_window_seconds": config.possession_v3_event_window_seconds,
+                                      "event_window_seconds": config.possession_v3_event_window_seconds,
+                                      "recovery_window_seconds": config.possession_v3_recovery_window_seconds,
                                      "reverted_switch_window_seconds": config.possession_v3_reverted_switch_window_seconds,
                                      "engine": "v3"})
     manifest["observability"] = {"status": "complete", "phase": "artifact_write",

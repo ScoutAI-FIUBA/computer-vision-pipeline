@@ -32,6 +32,7 @@ class PossessionState(_ValueEnum):
     INFERRED = "INFERRED"
     TRANSITIONING = "TRANSITIONING"
     LOST_NO_DETECTION = "LOST_NO_DETECTION"
+    UNKNOWN_RECOVERY = "UNKNOWN_RECOVERY"
 class EvidenceKind(_ValueEnum):
     OBSERVED = "observed"
     INFERRED = "inferred"
@@ -44,6 +45,7 @@ class EventType(_ValueEnum):
     LOSS_OF_CONTROL = "LOSS_OF_CONTROL"
     TURNOVER = "TURNOVER"
     UNKNOWN = "UNKNOWN"
+    UNKNOWN_RECOVERY = "UNKNOWN_RECOVERY"
 class ClearReason(_ValueEnum):
     GRACE_EXPIRED = "GRACE_EXPIRED"
     LOOSE_BALL_CONFIRMED = "LOOSE_BALL_CONFIRMED"
@@ -142,6 +144,10 @@ class PossessionContext:
     grace_remaining_seconds: float = 0.0
     last_observed_holder_frame: int | None = None
     last_observed_holder_score: float | None = None
+    recovery_source_id: str | None = None
+    recovery_source_team: int | None = None
+    recovery_reason: str | None = None
+    recovery_remaining_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         _holder(self.effective_holder_id)
@@ -169,6 +175,15 @@ class PossessionContext:
             raise ValueError("grace_remaining_seconds must be finite and non-negative")
         _optional_nonnegative_frame(self.last_observed_holder_frame, "last_observed_holder_frame")
         _score(self.last_observed_holder_score, "last_observed_holder_score")
+        _holder(self.recovery_source_id)
+        if self.recovery_source_team is not None and (type(self.recovery_source_team) is not int or self.recovery_source_team < 0):
+            raise ValueError("recovery_source_team must be a non-negative integer when set")
+        if self.recovery_reason is not None:
+            _required_text(self.recovery_reason, "recovery_reason")
+        if (type(self.recovery_remaining_seconds) not in {int, float}
+                or not math.isfinite(self.recovery_remaining_seconds)
+                or self.recovery_remaining_seconds < 0):
+            raise ValueError("recovery_remaining_seconds must be finite and non-negative")
 @dataclass(frozen=True)
 class PossessionAudit:
     last_holder_id: str | None = None
@@ -194,6 +209,10 @@ class PossessionAudit:
     timestamp_end: float | None = None
     reverted_switch_duration_seconds: float | None = None
     provenance: Provenance = field(default_factory=Provenance)
+    recovery_source_id: str | None = None
+    recovery_source_team: int | None = None
+    recovery_reason: str | None = None
+    recovery_window_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         _holder(self.last_holder_id)
@@ -234,6 +253,15 @@ class PossessionAudit:
             raise ValueError("timestamp_end must not precede timestamp_start")
         if not isinstance(self.provenance, Provenance):
             raise ValueError("provenance must be Provenance")
+        _holder(self.recovery_source_id)
+        if self.recovery_source_team is not None and (type(self.recovery_source_team) is not int or self.recovery_source_team < 0):
+            raise ValueError("recovery_source_team must be a non-negative integer when set")
+        if self.recovery_reason is not None:
+            _required_text(self.recovery_reason, "recovery_reason")
+        if (type(self.recovery_window_seconds) not in {int, float}
+                or not math.isfinite(self.recovery_window_seconds)
+                or self.recovery_window_seconds < 0):
+            raise ValueError("recovery_window_seconds must be finite and non-negative")
 @dataclass(frozen=True)
 class PossessionObservation:
     frame_index: int
@@ -301,6 +329,9 @@ class BallTransition:
     loss_of_control_evidence: bool = False
     timestamp_start: float | None = None
     timestamp_end: float | None = None
+    recovery_source_id: str | None = None
+    recovery_reason: str | None = None
+    recovery_window_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if type(self.transition_id) is not str or not self.transition_id.strip():
@@ -334,6 +365,16 @@ class BallTransition:
             raise ValueError("timestamp_end must not precede timestamp_start")
         if type(self.loss_of_control_evidence) is not bool:
             raise ValueError("loss_of_control_evidence must be boolean")
+        _holder(self.recovery_source_id)
+        if self.recovery_reason is not None:
+            _required_text(self.recovery_reason, "recovery_reason")
+        if (type(self.recovery_window_seconds) not in {int, float}
+                or not math.isfinite(self.recovery_window_seconds)
+                or self.recovery_window_seconds < 0):
+            raise ValueError("recovery_window_seconds must be finite and non-negative")
+        if ((self.recovery_source_id is not None or self.state is PossessionState.UNKNOWN_RECOVERY)
+                and self.recovery_window_seconds <= 0):
+            raise ValueError("recovery transitions require positive recovery time")
         object.__setattr__(self, "primitive_types", list(self.primitive_types))
 @dataclass(frozen=True)
 class PossessionEvent:
@@ -502,10 +543,13 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
 
 class PossessionResolver:
     """Small deterministic temporal resolver; no ball/event semantics live here."""
-    def __init__(self, *, real_fps, grace_seconds=.6, hysteresis_margin=.1, persistence_seconds=0.0,
+    def __init__(self, *, real_fps, grace_seconds=.6, recovery_window_seconds=.8, hysteresis_margin=.1, persistence_seconds=0.0,
                  keep_threshold=MIN_CANDIDATE_SCORE, profile="default"):
         if not isinstance(real_fps, (int, float)) or real_fps <= 0: raise ValueError("real_fps must be positive")
         self.fps = float(real_fps); self.grace = min(.6, max(0.0, grace_seconds))
+        if type(recovery_window_seconds) not in {int, float} or not math.isfinite(float(recovery_window_seconds)) or recovery_window_seconds < 0:
+            raise ValueError("recovery_window_seconds must be finite and non-negative")
+        self.recovery_window = float(recovery_window_seconds)
         self.hysteresis = max(0.0, hysteresis_margin); self.persistence = max(0.0, persistence_seconds)
         if (type(keep_threshold) not in {int, float} or not math.isfinite(float(keep_threshold))
                 or not 0 <= float(keep_threshold) <= 1):
@@ -518,6 +562,17 @@ class PossessionResolver:
         self.last_observed_timestamp = None
         self.history = []; self.last_timestamp = None
         self._audit_for_last_transition = PossessionAudit()
+        self.recovery_source_id = self.recovery_source_team = self.recovery_reason = None
+        self.recovery_start_frame = self.recovery_start_timestamp = None
+
+    def _recovery_elapsed(self, frame, timestamp):
+        if self.recovery_source_id is None:
+            return 0.0
+        if timestamp is not None and self.recovery_start_timestamp is not None:
+            return max(0.0, float(timestamp) - float(self.recovery_start_timestamp))
+        if self.recovery_start_frame is not None:
+            return max(0.0, (frame - self.recovery_start_frame) / self.fps)
+        return 0.0
 
     def _observation(self, frame, state, candidate=None, candidates=(), reason=(), observed=None,
                      challenger=None, clear_reason=None, switch_confirmed=False):
@@ -542,16 +597,24 @@ class PossessionResolver:
                                      challenger_elapsed_seconds=pending[1] if pending else 0.0,
                                     grace_start_frame=self.last_frame - int(self.gap_seconds * self.fps) if self.gap_seconds else None,
                                     grace_remaining_seconds=max(0.0, self.grace - self.gap_seconds),
-                                    last_observed_holder_frame=self.last_observed_frame,
-                                    last_observed_holder_score=self.last_observed_score)
+                                     last_observed_holder_frame=self.last_observed_frame,
+                                     last_observed_holder_score=self.last_observed_score,
+                                     recovery_source_id=self.recovery_source_id,
+                                     recovery_source_team=self.recovery_source_team,
+                                     recovery_reason=self.recovery_reason,
+                                     recovery_remaining_seconds=max(0.0, self.recovery_window - self._recovery_elapsed(frame, self.last_timestamp)))
         authority = "stable" if (direct and direct.stable_player_id) else "raw" if direct else "unknown"
-        audit = PossessionAudit(last_holder_id=effective if state is PossessionState.LOST_NO_DETECTION else None,
-                                 last_holder_team=self.holder_team if state is PossessionState.LOST_NO_DETECTION else None,
+        audit = PossessionAudit(last_holder_id=(effective if state is PossessionState.LOST_NO_DETECTION else self.recovery_source_id),
+                                 last_holder_team=(self.holder_team if state is PossessionState.LOST_NO_DETECTION else self.recovery_source_team),
                                  clear_reason=clear_reason or self._audit_for_last_transition.clear_reason,
                                  switch_confirmed=switch_confirmed or self._audit_for_last_transition.new_holder_id is not None,
                                 observation_quality=quality.value, observation_source="resolver",
                                  authority=authority, grace_eligible=bool(effective and self.gap_seconds < self.grace),
-                                 grace_elapsed_seconds=self.gap_seconds)
+                                  grace_elapsed_seconds=self.gap_seconds,
+                                  recovery_source_id=self.recovery_source_id,
+                                  recovery_source_team=self.recovery_source_team,
+                                  recovery_reason=self.recovery_reason,
+                                  recovery_window_seconds=self.recovery_window)
         audit = replace(audit, **{name: getattr(self._audit_for_last_transition, name)
                                   for name in ("previous_holder_id", "previous_holder_team", "new_holder_id",
                                                "new_holder_team", "previous_holder_score", "new_holder_score",
@@ -594,14 +657,17 @@ class PossessionResolver:
             if timestamp is not None:
                 self.last_time = timestamp
             self.last_timestamp = timestamp
+        if self.recovery_source_id is not None and self._recovery_elapsed(frame_index, timestamp) >= self.recovery_window:
+            self.recovery_source_id = self.recovery_source_team = self.recovery_reason = None
+            self.recovery_start_frame = self.recovery_start_timestamp = None
         invalid_input = invalid or authoritative_loss or duplicate or missing or timestamp_invalid
         if invalid_input:
             last = self.holder_stable or self.holder_fallback or (f"raw:{self.holder_raw}" if self.holder_raw else None)
             team = self.holder_team
             previous = self.holder
             self.clear_effective_holder(ClearReason.EXPLICIT_RESET, frame_index=frame_index, timestamp=timestamp,
-                                        frame_start=self.last_observed_frame,
-                                        timestamp_start=self.last_observed_timestamp)
+                                         frame_start=self.last_observed_frame,
+                                         timestamp_start=self.last_observed_timestamp)
             reason = ("invalid_timestamp" if not timestamp_valid else "reverse_timestamp" if timestamp_reversed
                       else "missing_authoritative_frame" if missing else "invalid_evidence")
             observation = self._observation(frame_index, PossessionState.UNKNOWN, candidates=candidates,
@@ -721,8 +787,9 @@ class PossessionResolver:
         return self.holder
 
     def clear_effective_holder(self, reason, *, frame_index=None, timestamp=None,
-                               frame_start=None, timestamp_start=None):
-        """The sole mutation path for removing an effective holder."""
+                               frame_start=None, timestamp_start=None, recovery_reason=None,
+                               recovery_eligible=False):
+        """Remove an effective holder; recovery is seeded only by _lost_no_detection."""
         reason = _enum(reason, ClearReason, "clear reason")
         if reason not in {ClearReason.GRACE_EXPIRED, ClearReason.LOOSE_BALL_CONFIRMED,
                           ClearReason.OUT_OF_BOUNDS, ClearReason.END_OF_SEGMENT,
@@ -739,8 +806,13 @@ class PossessionResolver:
             timestamp_start=timestamp_start, timestamp_end=valid_end,
             clear_reason=reason,
             provenance=Provenance(frame_indices=[x for x in (frame_start, frame_index) if x is not None],
-                                  reason_codes=[reason.value]),
+                                   reason_codes=[reason.value]),
         )
+        # Compatibility keywords are intentionally ignored: public clear calls
+        # cannot manufacture recovery provenance or eligibility.
+        del recovery_reason, recovery_eligible, previous, team
+        self.recovery_source_id = self.recovery_source_team = self.recovery_reason = None
+        self.recovery_start_frame = self.recovery_start_timestamp = None
         self.holder = None; self.pending = None; self.gap_seconds = 0.0
         self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
 
@@ -748,9 +820,15 @@ class PossessionResolver:
         prior, team = self.holder, self.holder_team
         elapsed = self.gap_seconds
         self.clear_effective_holder(ClearReason.GRACE_EXPIRED, frame_index=frame,
-                                    timestamp=self.last_timestamp,
-                                    frame_start=self.last_observed_frame,
-                                    timestamp_start=self.last_observed_timestamp)
+                                     timestamp=self.last_timestamp,
+                                     frame_start=self.last_observed_frame,
+                                     timestamp_start=self.last_observed_timestamp)
+        if prior is not None and self.recovery_window > 0:
+            self.recovery_source_id = prior
+            self.recovery_source_team = team
+            self.recovery_reason = "lost_no_detection"
+            self.recovery_start_frame = frame
+            self.recovery_start_timestamp = self.last_timestamp
         observation = self._observation(frame, PossessionState.LOST_NO_DETECTION,
                                         candidates=candidates, reason=(reason,),
                                         clear_reason=ClearReason.LOST_NO_DETECTION)
@@ -904,6 +982,10 @@ def _transition_context_by_frame(states):
             context, quality, team, audit = state.context, state.state, state.team_id, state.audit
             effective, observed = context.effective_holder_id, context.observed_candidate_id
             effective_team = context.effective_holder_team
+            recovery_source = context.recovery_source_id
+            recovery_team = context.recovery_source_team
+            recovery_reason = context.recovery_reason
+            recovery_remaining = context.recovery_remaining_seconds
         else:
             context = state.get("context") or {}
             effective = context.get("effective_holder_id") or state.get("stable_player_id")
@@ -912,13 +994,26 @@ def _transition_context_by_frame(states):
             team = state.get("team_id")
             effective_team = context.get("effective_holder_team")
             audit = state.get("audit") or {}
+            recovery_source = (context.get("recovery_source_id")
+                               if context.get("recovery_source_id") is not None
+                               else audit.get("recovery_source_id"))
+            recovery_team = (context.get("recovery_source_team")
+                             if context.get("recovery_source_team") is not None
+                             else audit.get("recovery_source_team"))
+            recovery_reason = (context.get("recovery_reason")
+                               if context.get("recovery_reason") is not None
+                               else audit.get("recovery_reason"))
+            recovery_remaining = context.get("recovery_remaining_seconds", 0.0)
         if isinstance(quality, PossessionState):
             quality = quality.value
         audit_provenance = audit.provenance if isinstance(audit, PossessionAudit) else audit.get("provenance", {})
         reason_codes = audit_provenance.reason_codes if isinstance(audit_provenance, Provenance) else (audit_provenance or {}).get("reason_codes", [])
         result[frame] = {"effective": effective, "observed": observed, "state": quality,
                          "team": team, "effective_team": effective_team,
-                         "transient": "TRANSIENT_SWITCH" in reason_codes or "reverted_switch" in reason_codes}
+                         "transient": "TRANSIENT_SWITCH" in reason_codes or "reverted_switch" in reason_codes,
+                         "recovery_source": recovery_source, "recovery_team": recovery_team,
+                         "recovery_reason": recovery_reason,
+                         "recovery_remaining": recovery_remaining}
     return result
 
 
@@ -1075,7 +1170,9 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
                 destination_end += 1
             if (j < len(rows) and destination not in {None, holder}
                     and len(rows[i + 1:j]) >= release_persistence_frames
-                    and destination_end - j + 1 >= reception_persistence_frames):
+                    and destination_end - j + 1 >= reception_persistence_frames
+                    and not any(context_by_frame.get(rows[k]["frame_index"], {}).get("recovery_source") == holder
+                                for k in range(i + 1, j))):
                 gap = rows[i + 1:j]
                 if gap and all(rows[k]["frame_index"] == rows[k - 1]["frame_index"] + 1 for k in range(i + 2, j)):
                     destination = holders[rows[j]["frame_index"]]
@@ -1114,16 +1211,32 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
             continue
         source_context = context_by_frame.get(rows[source_index]["frame_index"], {})
         source = source_context.get("effective")
-        if source is None or source == destination or destination_context.get("transient"):
+        recovery = False
+        source_team = source_context.get("effective_team")
+        if source is None and destination_context.get("recovery_source") is not None:
+            if destination_context.get("recovery_remaining", 0.0) <= 0:
+                continue
+            source = destination_context.get("recovery_source")
+            source_team = destination_context.get("recovery_team")
+            recovery = destination_context.get("recovery_remaining", 0.0) > 0
+            source_index = next((index for index in range(destination_start - 1, -1, -1)
+                                 if context_by_frame.get(rows[index]["frame_index"], {}).get("effective") == source), -1)
+            if source_index < 0:
+                continue
+        if source is None or source == destination or destination_context.get("transient") or (recovery and source_team is None):
             continue
         candidate_start = destination_start
-        while candidate_start > 0:
+        while candidate_start > (source_index + 1 if recovery else 0):
             previous = context_by_frame.get(rows[candidate_start - 1]["frame_index"], {})
-            if previous.get("observed") != destination or previous.get("effective") != source:
+            if recovery:
+                if (previous.get("observed") != destination or previous.get("effective") is not None
+                        or previous.get("recovery_source") != source):
+                    break
+            elif previous.get("observed") != destination or previous.get("effective") != source:
                 break
             candidate_start -= 1
-        # Candidate-only grace frames are the release persistence window.
-        if destination_start - candidate_start < release_persistence_frames:
+        # Candidate-only grace/recovery frames are the release persistence window.
+        if (destination_start - candidate_start if not recovery else destination_start - source_index - 1) < release_persistence_frames:
             continue
         destination_end = destination_start
         while (destination_end + 1 < len(rows)
@@ -1136,7 +1249,7 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
             destination_end += 1
         if destination_end - destination_start + 1 < reception_persistence_frames:
             continue
-        gap = rows[candidate_start:destination_start]
+        gap = rows[(source_index + 1 if recovery else candidate_start):destination_start]
         if not gap or any(rows[k]["frame_index"] != rows[k - 1]["frame_index"] + 1
                           for k in range(candidate_start + 1, destination_start)):
             continue
@@ -1148,9 +1261,10 @@ def derive_ball_primitives(ball_rows, possession_states, *, real_fps, loose_seco
         base = {"frame_index": gap[0]["frame_index"],
                 "source_frame_indices": sorted({item["frame_index"] for item in evidence_rows}),
                 "provenance": {"source_records": sorted({ref for item in evidence_rows for ref in item.get("source_records", [])}),
-                               "frame_indices": sorted({item["frame_index"] for item in evidence_rows}), "reason_codes": ["observed_candidate_grace"]}}
+                                "frame_indices": sorted({item["frame_index"] for item in evidence_rows}),
+                                "reason_codes": ["recovery_source" if recovery else "observed_candidate_grace"]}}
         start, end = _timestamp_range([rows[source_index], *gap])
-        result.append(dict(base, primitive_type="BALL_RELEASE", reason_codes=["holder_separation"], timestamp_start=start, timestamp_end=end))
+        result.append(dict(base, primitive_type="BALL_RELEASE", reason_codes=["recovery_source" if recovery else "holder_separation"], timestamp_start=start, timestamp_end=end))
         start, end = _timestamp_range(gap)
         result.append(dict(base, primitive_type="BALL_IN_TRANSIT", reason_codes=["trajectory"], timestamp_start=start, timestamp_end=end,
                            provenance=dict(base["provenance"], frame_indices=[item["frame_index"] for item in gap])))
@@ -1183,14 +1297,57 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
     if event_window_seconds is not None and (type(event_window_seconds) not in {int, float} or not math.isfinite(float(event_window_seconds)) or event_window_seconds <= 0):
         raise ValueError("event_window_seconds must be positive and finite")
     primitives = derive_ball_primitives(ball_rows, possession_states, real_fps=real_fps, loose_seconds=loose_seconds, release_persistence_frames=release_persistence_frames, reception_persistence_frames=reception_persistence_frames)
-    if not primitives:
-        return []
-    grouped = [item for item in primitives if item["primitive_type"] != "LOOSE_BALL"]
-    if not {item["primitive_type"] for item in grouped}.issuperset({"BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"}):
-        return []
     holders = _holder_by_frame(possession_states)
     teams = _team_by_frame(possession_states)
     context_by_frame = _transition_context_by_frame(possession_states)
+
+    def incomplete_recovery():
+        ordered = sorted((row for row in ball_rows if type(row.get("frame_index")) is int), key=lambda row: row["frame_index"])
+        for destination_row in ordered:
+            context = context_by_frame.get(destination_row["frame_index"], {})
+            destination = context.get("observed")
+            source = context.get("recovery_source")
+            if (context.get("state") != PossessionState.OBSERVED.value or not source or not destination
+                    or source == destination or context.get("recovery_remaining", 0.0) <= 0):
+                continue
+            source_index = next((index for index in range(len(ordered) - 1, -1, -1)
+                                 if ordered[index]["frame_index"] < destination_row["frame_index"]
+                                 and context_by_frame.get(ordered[index]["frame_index"], {}).get("effective") == source), None)
+            if source_index is None:
+                continue
+            segment_rows = ordered[source_index:ordered.index(destination_row) + 1]
+            refs = sorted({ref for row in segment_rows for ref in row.get("source_records", [])})
+            frames = [row["frame_index"] for row in segment_rows]
+            start_time = segment_rows[0].get("timestamp_seconds")
+            end_time = segment_rows[-1].get("timestamp_seconds")
+            duration = ((float(end_time) - float(start_time)) if start_time is not None and end_time is not None
+                        else (frames[-1] - frames[0]) / float(real_fps))
+            if event_window_seconds is not None and duration > event_window_seconds:
+                continue
+            primitive_types = [item["primitive_type"] for item in primitives
+                               if frames[0] <= item["frame_index"] <= frames[-1]]
+            return BallTransition(
+                f"ball-recovery-{destination_row['frame_index']}", source, destination,
+                primitive_types or ["RECOVERY_PENDING"],
+                Provenance(refs, frames, ["raw_ball_provenance", "recovery_source"]),
+                state=PossessionState.UNKNOWN_RECOVERY,
+                frame_start=frames[0], frame_end=frames[-1], source_team_id=context.get("recovery_team"),
+                destination_team_id=context.get("team"), duration_seconds=duration,
+                timestamp_start=start_time, timestamp_end=end_time,
+                release_evidence="BALL_RELEASE" in primitive_types,
+                reception_evidence="BALL_RECEPTION" in primitive_types,
+                trajectory_evidence="BALL_IN_TRANSIT" in primitive_types,
+                recovery_source_id=source, recovery_reason=context.get("recovery_reason"),
+                recovery_window_seconds=context.get("recovery_remaining", 0.0))
+        return None
+
+    if not primitives:
+        pending = incomplete_recovery()
+        return [pending] if pending is not None else []
+    grouped = [item for item in primitives if item["primitive_type"] != "LOOSE_BALL"]
+    if not {item["primitive_type"] for item in grouped}.issuperset({"BALL_RELEASE", "BALL_IN_TRANSIT", "BALL_RECEPTION"}):
+        pending = incomplete_recovery()
+        return [pending] if pending is not None else []
     transitions = []
     releases = [index for index, item in enumerate(grouped) if item["primitive_type"] == "BALL_RELEASE"]
     for release_index in releases:
@@ -1203,6 +1360,12 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
         start_context = context_by_frame.get(release["frame_index"] - 1, {})
         end_context = context_by_frame.get(reception["frame_index"], {})
         start_holder = start_context.get("effective") or start_context.get("observed") or holders.get(release["frame_index"] - 1)
+        if start_holder is None:
+            start_holder = end_context.get("recovery_source")
+            if start_holder is not None:
+                start_context = {**start_context, "effective_team": end_context.get("recovery_team"),
+                                 "recovery_source": start_holder, "recovery_reason": end_context.get("recovery_reason"),
+                                 "recovery_remaining": end_context.get("recovery_remaining", 0.0)}
         end_holder = (end_context.get("observed")
                       if end_context.get("state") == PossessionState.OBSERVED.value
                       else end_context.get("effective") or holders.get(reception["frame_index"]))
@@ -1213,6 +1376,9 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
         if event_window_seconds is not None and duration > event_window_seconds:
             continue
         refs = sorted({ref for item in segment for ref in item["provenance"]["source_records"]})
+        recovery_source = (start_holder if any("recovery_source" in item.get("reason_codes", [])
+                                               or "recovery_source" in item.get("provenance", {}).get("reason_codes", [])
+                                               for item in segment) else None)
         transitions.append(BallTransition(f"ball-transition-{release['frame_index']}", start_holder, end_holder,
                              [item["primitive_type"] for item in segment],
                              Provenance(refs, sorted({frame for item in segment for frame in item["provenance"]["frame_indices"]}), ["raw_ball_provenance", "primitive_geometry"]),
@@ -1223,8 +1389,11 @@ def derive_ball_transitions(ball_rows, possession_states, *, real_fps, loose_sec
                               destination_team_id=(end_context.get("team")
                                                   if end_context.get("team") is not None
                                                   else teams.get(reception["frame_index"])),
-                             duration_seconds=duration, timestamp_start=start_time, timestamp_end=end_time,
-                             release_evidence=True, reception_evidence=True, trajectory_evidence=True, score_margin=None))
+                              duration_seconds=duration, timestamp_start=start_time, timestamp_end=end_time,
+                              release_evidence=True, reception_evidence=True, trajectory_evidence=True, score_margin=None,
+                              recovery_source_id=recovery_source,
+                              recovery_reason=end_context.get("recovery_reason") if recovery_source else None,
+                              recovery_window_seconds=end_context.get("recovery_remaining", 0.0) if recovery_source else 0.0))
     return transitions
 
 
@@ -1245,7 +1414,10 @@ def classify_transition(transition, *, rapid_seconds=.3, proximity_threshold=80.
                   timestamp_start=transition.timestamp_start, timestamp_end=transition.timestamp_end)
     def event(kind, reasons):
         return PossessionEvent(kind, frame, transition.provenance, transition_id=transition.transition_id,
-                                reason_codes=list(reasons), **{key: value for key, value in common.items() if key != "transition_id" and key != "provenance"})
+                                 reason_codes=list(reasons), **{key: value for key, value in common.items() if key != "transition_id" and key != "provenance"})
+
+    if transition.state is PossessionState.UNKNOWN_RECOVERY:
+        return [event(EventType.UNKNOWN_RECOVERY, ("UNKNOWN_RECOVERY", transition.recovery_reason or "recovery_evidence_insufficient"))]
 
     aliases = {"RELEASE": "BALL_RELEASE", "TRANSIT": "BALL_IN_TRANSIT",
                "RECEPTION": "BALL_RECEPTION", "LOOSE": "LOOSE_BALL"}

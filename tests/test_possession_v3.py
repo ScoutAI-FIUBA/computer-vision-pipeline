@@ -210,6 +210,12 @@ def test_loss_unknown_and_out_of_bounds_fail_closed():
     assert boundary[0].event_type is EventType.UNKNOWN
 
 
+def test_unknown_recovery_transition_requires_positive_remaining_window():
+    with pytest.raises(ValueError, match="positive recovery time"):
+        _semantic_transition(state=PossessionState.UNKNOWN_RECOVERY,
+                             recovery_source_id="p1", recovery_window_seconds=0.0)
+
+
 def test_known_destination_without_destination_team_is_unknown():
     events = classify_transition(_semantic_transition(source_team_id=1, destination_team_id=None))
     assert events[-1].event_type is EventType.UNKNOWN
@@ -225,8 +231,9 @@ def test_engine_is_opt_in_and_legacy_metadata_is_unchanged():
     assert _possession_result_config(legacy, base) == base
     assert _possession_result_config(v3, base) == {
         **base, "possession_engine": "v3", "possession_v3_schema_version": 1,
-        "possession_v3_reverted_switch_window_seconds": .5,
-    }
+            "possession_v3_reverted_switch_window_seconds": .5,
+            "possession_v3_recovery_window_seconds": .8,
+        }
 
 
 def test_disabled_results_have_no_v3_pointers():
@@ -1156,3 +1163,171 @@ def test_reverted_grace_candidate_is_not_a_semantic_transition():
 
     assert derive_ball_primitives(rows, states, real_fps=10) == []
     assert derive_ball_transitions(rows, states, real_fps=10) == []
+
+
+def test_recovery_preserves_last_holder_after_lost_detection_and_marks_new_observation():
+    resolver = PossessionResolver(real_fps=10, grace_seconds=.1, recovery_window_seconds=.8)
+    source = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    destination = CandidateEvidence("b", 2, 1, .9, {"geometry": .9})
+
+    resolver.resolve(0, [source], timestamp=0.0)
+    lost = resolver.resolve(2, [], ball_lost=True, timestamp=.2)
+    recovered = resolver.resolve(4, [destination], timestamp=.4)
+
+    assert lost.state is PossessionState.LOST_NO_DETECTION
+    assert lost.audit.last_holder_id == "a"
+    assert recovered.state is PossessionState.OBSERVED
+    assert recovered.context.effective_holder_id == "b"
+    assert recovered.context.recovery_source_id == "a"
+    assert recovered.context.recovery_remaining_seconds == pytest.approx(.6)
+    assert recovered.audit.recovery_reason == "lost_no_detection"
+
+
+def test_recovery_bridge_uses_last_holder_but_requires_geometry_and_persistence():
+    resolver = PossessionResolver(real_fps=10, grace_seconds=.1, recovery_window_seconds=.8)
+    source = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    destination = CandidateEvidence("b", 2, 1, .9, {"geometry": .9})
+    states = [resolver.resolve(0, [source], timestamp=0.0)]
+    states.append(resolver.resolve(2, [], ball_lost=True, timestamp=.2))
+    states.append(resolver.resolve(3, [], timestamp=.3))
+    states.append(resolver.resolve(4, [destination], timestamp=.4))
+    states.append(resolver.resolve(5, [destination], timestamp=.5))
+    rows = normalize_ball_rows([_ball(frame, frame * 10, 0) for frame in (0, 2, 3, 4, 5)], real_fps=10, max_gap_frames=1)
+
+    transitions = derive_ball_transitions(rows, states, real_fps=10, release_persistence_frames=1,
+                                          reception_persistence_frames=2)
+
+    assert len(transitions) == 1
+    assert transitions[0].source_holder == "a"
+    assert transitions[0].destination_holder == "b"
+    assert transitions[0].recovery_source_id == "a"
+    assert classify_transition(transitions[0])[0].event_type is EventType.TRANSFER
+
+
+def test_recovery_does_not_classify_proximity_without_release_transit_reception():
+    resolver = PossessionResolver(real_fps=10, grace_seconds=.1, recovery_window_seconds=.8)
+    source = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    destination = CandidateEvidence("b", 2, 1, .9, {"geometry": .9})
+    states = [resolver.resolve(0, [source], timestamp=0.0),
+              resolver.resolve(2, [], ball_lost=True, timestamp=.2),
+              resolver.resolve(3, [destination], timestamp=.3)]
+    rows = normalize_ball_rows([_ball(0, 0, 0), _ball(2, 0, 0), _ball(3, 0, 0)], real_fps=10, max_gap_frames=1)
+
+    transitions = derive_ball_transitions(rows, states, real_fps=10, release_persistence_frames=1,
+                                          reception_persistence_frames=2)
+
+    assert len(transitions) == 1
+    assert transitions[0].state is PossessionState.UNKNOWN_RECOVERY
+    assert classify_transition(transitions[0])[0].event_type is EventType.UNKNOWN_RECOVERY
+    assert "UNKNOWN_RECOVERY" in classify_transition(transitions[0])[0].reason_codes
+
+
+def test_ambiguous_holder_gap_recovers_from_last_stable_source():
+    resolver = PossessionResolver(real_fps=10, grace_seconds=.1, recovery_window_seconds=.8,
+                                  hysteresis_margin=.1)
+    source = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    first = CandidateEvidence("b", 2, 2, .9, {"geometry": .9})
+    second = CandidateEvidence("c", 3, 2, .9, {"geometry": .9})
+    destination = CandidateEvidence("b", 2, 2, .9, {"geometry": .9})
+
+    resolver.resolve(0, [source], timestamp=0.0)
+    ambiguous = resolver.resolve(2, [first, second], timestamp=.2)
+    recovered = resolver.resolve(3, [destination], timestamp=.3)
+
+    assert ambiguous.state is PossessionState.LOST_NO_DETECTION
+    assert ambiguous.audit.last_holder_id == "a"
+    assert recovered.state is PossessionState.OBSERVED
+    assert recovered.context.recovery_source_id == "a"
+
+
+def test_recovery_expiry_boundary_fails_closed_for_unknown_recovery():
+    rows = normalize_ball_rows([_ball(2, 0, 0), _ball(3, 10, 0), _ball(4, 20, 0)], real_fps=10, max_gap_frames=1)
+    states = [
+        _grace_observation(2, PossessionState.OBSERVED, "a", "a", 1),
+        PossessionObservation(3, PossessionState.LOST_NO_DETECTION, EvidenceKind.UNKNOWN,
+                              context=PossessionContext(recovery_source_id="a", recovery_source_team=1,
+                                                        recovery_reason="lost_no_detection", recovery_remaining_seconds=0.0)),
+        PossessionObservation(4, PossessionState.OBSERVED, EvidenceKind.OBSERVED, stable_player_id="b", team_id=1,
+                              context=PossessionContext(effective_holder_id="b", effective_holder_team=1,
+                                                        observed_candidate_id="b", recovery_source_id="a",
+                                                        recovery_source_team=1, recovery_reason="lost_no_detection",
+                                                        recovery_remaining_seconds=0.0)),
+    ]
+
+    assert derive_ball_transitions(rows, states, real_fps=10, release_persistence_frames=1,
+                                   reception_persistence_frames=2) == []
+
+
+@pytest.mark.parametrize("reason", [ClearReason.EXPLICIT_RESET, ClearReason.LOOSE_BALL_CONFIRMED,
+                                     ClearReason.OUT_OF_BOUNDS, ClearReason.END_OF_SEGMENT])
+def test_terminal_and_invalid_clears_do_not_seed_recovery(reason):
+    resolver = PossessionResolver(real_fps=10, recovery_window_seconds=.8)
+    resolver.resolve(0, [CandidateEvidence("a", 1, 1, .9, {"geometry": .9})])
+
+    resolver.clear_effective_holder(reason, frame_index=1, timestamp=.1)
+
+    assert resolver.recovery_source_id is None
+    assert resolver.recovery_source_team is None
+
+
+def test_public_clear_cannot_seed_recovery_with_attempted_eligibility():
+    resolver = PossessionResolver(real_fps=10, recovery_window_seconds=.8)
+    resolver.resolve(0, [CandidateEvidence("a", 1, 0, .9, {"geometry": .9})])
+
+    resolver.clear_effective_holder(ClearReason.GRACE_EXPIRED, frame_index=1,
+                                    timestamp=.1, recovery_eligible=True)
+
+    assert resolver.recovery_source_id is None
+
+
+def test_resolver_expiry_is_fail_closed_at_boundary_and_beyond():
+    def run(timestamp):
+        resolver = PossessionResolver(real_fps=10, grace_seconds=.1, recovery_window_seconds=.8)
+        resolver.resolve(0, [CandidateEvidence("a", 1, 1, .9, {"geometry": .9})], timestamp=0.0)
+        resolver.resolve(1, [], ball_lost=True, timestamp=.1)
+        return resolver.resolve(9, [], ball_lost=True, timestamp=timestamp)
+
+    at_boundary = run(.9)
+    beyond = run(.91)
+
+    assert at_boundary.context.recovery_source_id is None
+    assert beyond.context.recovery_source_id is None
+
+
+def test_invalid_association_clears_existing_recovery_source():
+    resolver = PossessionResolver(real_fps=10, grace_seconds=.1, recovery_window_seconds=.8)
+    holder = CandidateEvidence("a", 1, 1, .9, {"geometry": .9})
+    resolver.resolve(0, [holder])
+    resolver.resolve(2, [], ball_lost=True)
+    assert resolver.recovery_source_id == "a"
+
+    invalid = resolver.resolve(3, [], invalid=True)
+
+    assert invalid.context.recovery_source_id is None
+
+
+@pytest.mark.parametrize("source_frame,destination_frame", [(2, 4), (4, 9)])
+def test_ball_detected_boundary_recovery_transitions(source_frame, destination_frame):
+    resolver = PossessionResolver(real_fps=10, grace_seconds=.1, recovery_window_seconds=.8)
+    source = CandidateEvidence("source", 1, 0, .9, {"geometry": .9})
+    destination = CandidateEvidence("destination", 2, 0, .9, {"geometry": .9})
+    states = [resolver.resolve(source_frame, [source], timestamp=source_frame / 10)]
+    for frame in range(source_frame + 1, destination_frame):
+        states.append(resolver.resolve(frame, [], ball_lost=True, timestamp=frame / 10))
+    states.extend([
+        resolver.resolve(destination_frame, [destination], timestamp=destination_frame / 10),
+        resolver.resolve(destination_frame + 1, [destination], timestamp=(destination_frame + 1) / 10),
+    ])
+    rows = normalize_ball_rows([_ball(frame, (frame - source_frame) * 10, 0)
+                                for frame in range(source_frame, destination_frame + 2)],
+                               real_fps=10, max_gap_frames=1)
+
+    transitions = derive_ball_transitions(rows, states, real_fps=10,
+                                          release_persistence_frames=1,
+                                          reception_persistence_frames=2)
+
+    assert len(transitions) == 1
+    assert transitions[0].source_holder == "source"
+    assert transitions[0].destination_holder == "destination"
+    assert transitions[0].source_team_id == 0
+    assert transitions[0].recovery_source_id == "source"

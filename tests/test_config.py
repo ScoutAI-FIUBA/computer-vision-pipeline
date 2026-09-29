@@ -113,6 +113,12 @@ def test_v3_reverted_switch_window_rejects_invalid_values(value):
         PipelineConfig(roboflow_api_key="test-key", possession_v3_reverted_switch_window_seconds=value)
 
 
+def test_v3_recovery_window_defaults_and_reads_env(monkeypatch):
+    assert PipelineConfig(roboflow_api_key="test-key").possession_v3_recovery_window_seconds == .8
+    monkeypatch.setenv("POSSESSION_V3_RECOVERY_WINDOW_SECONDS", ".9")
+    assert PipelineConfig.from_env(roboflow_api_key="test-key").possession_v3_recovery_window_seconds == .9
+
+
 @pytest.mark.parametrize("value", ["-1", "nan", "inf", "not-a-number"])
 def test_v3_reverted_switch_window_rejects_invalid_environment_values(monkeypatch, value):
     monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")

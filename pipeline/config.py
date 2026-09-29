@@ -113,6 +113,7 @@ DEFAULT_BBOX_SIGNAL_THRESHOLD = 3.0
 DEFAULT_POSSESSION_TRANSITION_MAX_GAP = 15
 DEFAULT_POSSESSION_ENGINE = "legacy"
 DEFAULT_POSSESSION_V3_GRACE_SECONDS = 0.6
+DEFAULT_POSSESSION_V3_RECOVERY_WINDOW_SECONDS = 0.8
 DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN = 0.05
 DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS = 0.2
 DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS = 1.0
@@ -178,6 +179,7 @@ class PipelineConfig:
     possession_transition_max_gap: int = DEFAULT_POSSESSION_TRANSITION_MAX_GAP
     possession_engine: str = DEFAULT_POSSESSION_ENGINE
     possession_v3_grace_seconds: float = DEFAULT_POSSESSION_V3_GRACE_SECONDS
+    possession_v3_recovery_window_seconds: float = DEFAULT_POSSESSION_V3_RECOVERY_WINDOW_SECONDS
     possession_v3_hysteresis_margin: float = DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN
     possession_v3_persistence_seconds: float = DEFAULT_POSSESSION_V3_PERSISTENCE_SECONDS
     possession_v3_event_window_seconds: float = DEFAULT_POSSESSION_V3_EVENT_WINDOW_SECONDS
@@ -321,12 +323,15 @@ class PipelineConfig:
         if self.possession_engine not in {"legacy", "v3"}:
             raise ValueError("Unknown possession_engine: expected 'legacy' or 'v3'")
         grace = _finite_v3(self.possession_v3_grace_seconds, "possession_v3_grace_seconds")
+        recovery_window = _finite_v3(self.possession_v3_recovery_window_seconds, "possession_v3_recovery_window_seconds")
         hysteresis = _finite_v3(self.possession_v3_hysteresis_margin, "possession_v3_hysteresis_margin")
         persistence = _finite_v3(self.possession_v3_persistence_seconds, "possession_v3_persistence_seconds")
         event_window = _finite_v3(self.possession_v3_event_window_seconds, "possession_v3_event_window_seconds")
         reverted_window = _finite_v3(self.possession_v3_reverted_switch_window_seconds, "possession_v3_reverted_switch_window_seconds")
         if not 0 < grace <= 0.6:
             raise ValueError("possession_v3_grace_seconds must be between 0 and 0.6")
+        if recovery_window < 0:
+            raise ValueError("possession_v3_recovery_window_seconds must be non-negative")
         if hysteresis < 0:
             raise ValueError("possession_v3_hysteresis_margin must be non-negative")
         if persistence < 0:
@@ -453,6 +458,9 @@ class PipelineConfig:
             "possession_engine": os.getenv("POSSESSION_ENGINE", DEFAULT_POSSESSION_ENGINE),
             "possession_v3_grace_seconds": _env_float(
                 "POSSESSION_V3_GRACE_SECONDS", DEFAULT_POSSESSION_V3_GRACE_SECONDS
+            ),
+            "possession_v3_recovery_window_seconds": _env_float(
+                "POSSESSION_V3_RECOVERY_WINDOW_SECONDS", DEFAULT_POSSESSION_V3_RECOVERY_WINDOW_SECONDS
             ),
             "possession_v3_hysteresis_margin": _env_float(
                 "POSSESSION_V3_HYSTERESIS_MARGIN", DEFAULT_POSSESSION_V3_HYSTERESIS_MARGIN
