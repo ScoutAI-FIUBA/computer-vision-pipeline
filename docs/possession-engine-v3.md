@@ -57,3 +57,29 @@ possession and transition artifacts remain authoritative; no migration is
 required. Disabled/legacy runs omit V3 pointers and files; re-enabling V3
 produces additive continuity records without upstream model or semantic-event
 changes.
+# V4 opt-in and rollback
+
+V4 is diagnostic and opt-in; it does not change upstream detections, player
+numbers, court data, or semantic event labels.
+
+```bash
+POSSESSION_ENGINE=v4
+```
+
+Use the existing V3 path for comparison or rollback:
+
+```bash
+POSSESSION_ENGINE=v3   # V3 artifacts and behavior
+POSSESSION_ENGINE=legacy
+```
+
+V4 keeps the existing generation-backed V3 artifact paths and adds
+`possession_v4_diagnostics.jsonl` only when enabled. Each diagnostic row
+contains holder control/release, challenger acquisition, spatial contributions,
+gate decision/reason codes, provenance, and the `v4` feature flag. The existing
+overlay/JSONL fields are unchanged when V4 is disabled.
+
+For rollout, replay the same saved inputs once with `v3` and once with `v4`,
+compare holder/switch counts and inspect the V4 diagnostics. If the gate is not
+acceptable, change the flag back to `v3` or `legacy`; no migration or artifact
+rewriting is required.

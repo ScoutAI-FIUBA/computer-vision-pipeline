@@ -10,6 +10,7 @@ from pipeline.possession_v3 import (CandidateEvidence, EvidenceKind, PossessionO
                                     PossessionResolver, PossessionState, V4CandidateEvidence,
                                     engine_name, score_candidates_v4)
 from pipeline.results import _json_record
+from pipeline.results import write_v3_artifacts
 
 
 def player(name, box, **values):
@@ -107,6 +108,40 @@ def test_v4_serialization_keeps_spatial_diagnostics():
     record = _json_record(PossessionObservation(1, PossessionState.OBSERVED, EvidenceKind.OBSERVED,
                                                 candidates=[candidate]), {"engine": "v4"})
     assert record["candidates"][0]["spatial_score"] == 1.0
+
+
+def test_v4_debug_record_contains_gate_scores_and_feature_flag(tmp_path):
+    candidate = score_candidates_v4([evidence_player("p1", 10, approach=1, continuity=1)],
+                                    {"x": 10, "y": 20})[0]
+    observation = PossessionObservation(1, PossessionState.OBSERVED, EvidenceKind.OBSERVED,
+                                        candidates=[candidate])
+    manifest = write_v3_artifacts(tmp_path, [observation], [], [], [], {"engine": "v4"})
+    assert manifest["v4"]["enabled"] is True
+    row = json.loads((tmp_path / manifest["artifacts"]["v4_diagnostics"]["path"]).read_text())
+    assert row["v4"]["feature_flag"] is True
+    assert {"holder_control_score", "holder_release_score", "challenger_acquisition_score"} <= row["candidates"][0].keys()
+    assert "gate_reason_codes" in row["audit"]
+
+
+def test_v4_artifact_omits_optional_diagnostics_when_disabled(tmp_path):
+    candidate = CandidateEvidence("p1", 1, 1, .8)
+    observation = PossessionObservation(1, PossessionState.OBSERVED, EvidenceKind.OBSERVED,
+                                        candidates=[candidate])
+    manifest = write_v3_artifacts(tmp_path, [observation], [], [], [], {"engine": "v3"})
+    assert "v4" not in manifest and "v4_diagnostics" not in manifest["artifacts"]
+    row = json.loads((tmp_path / manifest["artifacts"]["possession"]["path"]).read_text())
+    assert "v4" not in row
+
+
+def test_v3_and_v4_saved_input_rows_keep_semantic_fields_compatible():
+    candidate = score_candidates_v4([evidence_player("p1", 10, continuity=1)], {"x": 10, "y": 20})[0]
+    v3 = _json_record(PossessionObservation(1, PossessionState.OBSERVED, EvidenceKind.OBSERVED,
+                                            candidates=[candidate]), {"engine": "v3"})
+    v4 = _json_record(PossessionObservation(1, PossessionState.OBSERVED, EvidenceKind.OBSERVED,
+                                            candidates=[candidate]), {"engine": "v4"})
+    for key in ("state", "evidence_kind", "frame_index"):
+        assert v3[key] == v4[key]
+    assert v3["candidates"][0]["score"] == v4["candidates"][0]["score"]
 
 
 def test_disagreement_is_contested_even_when_score_exceeds_keep_threshold():

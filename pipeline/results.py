@@ -80,6 +80,8 @@ class PipelineResults:
     possession_v3_events_file: str | None = None
     possession_v3_manifest_file: str | None = None
     possession_v3_observability: dict[str, Any] | None = None
+    possession_v4_diagnostics_file: str | None = None
+    possession_v4_schema_version: int | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -113,6 +115,10 @@ class PipelineResults:
             payload.pop("possession_v3_schema_version", None)
         if payload.get("possession_v3_observability") is None:
             payload.pop("possession_v3_observability", None)
+        if payload.get("possession_v4_diagnostics_file") is None:
+            payload.pop("possession_v4_diagnostics_file", None)
+        if payload.get("possession_v4_schema_version") is None:
+            payload.pop("possession_v4_schema_version", None)
         return payload
 
     def write(self, path: Path) -> None:
@@ -120,7 +126,13 @@ class PipelineResults:
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
 
-_V4_DIAGNOSTIC_FIELDS = {"spatial_score", "mask_score", "bbox_score", "mask_bbox_agreement", "source"}
+_V4_DIAGNOSTIC_FIELDS = {
+    "spatial_score", "mask_score", "bbox_score", "mask_bbox_agreement", "source",
+    "control_evidence", "release_evidence", "acquisition_evidence", "ball_in_transit",
+    "evidence_window_start", "evidence_window_end", "v4_schema_version", "feature_flag",
+    "control_score", "release_score", "acquisition_score", "gate_decision",
+    "gate_reason_codes", "spatial_contributions", "evidence_sources",
+}
 
 
 def _without_v4_diagnostics(value: Any) -> Any:
@@ -138,6 +150,13 @@ def _json_record(value: Any, config: Mapping[str, Any]) -> dict[str, Any]:
     if config.get("engine", config.get("possession_engine")) != "v4":
         value = _without_v4_diagnostics(value)
     record = dict(value)
+    if config.get("engine", config.get("possession_engine")) == "v4":
+        audit = record.setdefault("audit", {})
+        reasons = list(audit.get("provenance", {}).get("reason_codes", []))
+        audit.setdefault("gate_reason_codes", reasons)
+        audit.setdefault("gate_decision", "allow" if audit.get("switch_confirmed") else "hold")
+        audit.setdefault("feature_flag", "v4")
+        record["v4"] = {"feature_flag": True, "schema_version": 1}
     record.setdefault("schema", "possession-engine-v3")
     record.setdefault("schema_version", V3_CONTRACT_VERSION)
     frame = record.get("frame_index")
@@ -172,12 +191,17 @@ def write_v3_artifacts(
         "transitions": [_json_record(row, config) for row in transitions],
         "events": [_json_record(row, config) for row in events],
     }
+    v4_enabled = config.get("engine", config.get("possession_engine")) == "v4"
+    if v4_enabled:
+        datasets["v4_diagnostics"] = datasets["possession"]
     filenames = {
         "possession": "possession_v3.jsonl",
         "primitives": "possession_primitives_v3.jsonl",
         "transitions": "ball_transitions_v3.jsonl",
         "events": "possession_events_v3.jsonl",
     }
+    if v4_enabled:
+        filenames["v4_diagnostics"] = "possession_v4_diagnostics.jsonl"
     generation_id = hashlib.sha256(json.dumps({"datasets": datasets, "config": config}, sort_keys=True,
                                                separators=(",", ":")).encode()).hexdigest()[:16]
     generation_root = output_dir / "possession_v3" / "generations"
@@ -197,6 +221,10 @@ def write_v3_artifacts(
                                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "count": len(rows)}
         manifest: dict[str, Any] = {"schema": "possession-engine-v3", "schema_version": V3_CONTRACT_VERSION,
                                     "generation": generation_id, "config": config, "artifacts": artifacts}
+        if v4_enabled:
+            manifest["v4"] = {"enabled": True, "schema_version": 1, "feature_flag": "v4",
+                              "overlay_fields": ["holder_control", "holder_release", "challenger_acquisition",
+                                                  "mask_bbox_agreement", "gate_reason_codes"]}
         manifest["artifacts"]["manifest"] = {"path": "possession_v3_manifest.json"}
         manifest["artifacts"]["manifest"]["sha256"] = hashlib.sha256(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

@@ -311,6 +311,43 @@ def test_v3_results_pointers_are_additive_only_when_set():
     assert payload["possession_v3_events_file"] == "possession_events_v3.jsonl"
 
 
+def test_runner_v4_artifacts_publish_public_pointer_hash_and_replay(tmp_path: Path):
+    config = PipelineConfig(roboflow_api_key="test-key", possession_engine="v4")
+    players = [
+        {"frame_index": frame, "raw_track_id": 6, "stable_player_id": "player-006",
+         "team_id": 1, "xyxy": [0, 0, 20, 40], "confidence": .9,
+         "mask_valid": True, "mask_contains": True}
+        for frame in range(3)
+    ]
+    balls = [{"frame_index": frame, "timestamp_seconds": frame / 10,
+              "track_state": "detected", "confidence": .9, "center_xy": [10, 20]}
+             for frame in range(3)]
+
+    first = _write_v3_artifacts(tmp_path / "first", players, balls, fps=10, config=config)
+    second = _write_v3_artifacts(tmp_path / "second", players, balls, fps=10, config=config)
+    artifact = first["artifacts"]["v4_diagnostics"]
+    artifact_path = tmp_path / "first" / artifact["path"]
+    row = json.loads(artifact_path.read_text(encoding="utf-8").splitlines()[0])
+
+    assert first["v4"] == second["v4"]
+    assert first["generation"] == second["generation"]
+    assert artifact["sha256"] == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    assert first["artifacts"]["v4_diagnostics"]["sha256"] == second["artifacts"]["v4_diagnostics"]["sha256"]
+    assert row["v4"] == {"feature_flag": True, "schema_version": 1}
+    assert row["config"]["engine"] == "v4"
+    assert row["audit"]["feature_flag"] == "v4"
+
+    results = PipelineResults(5, {}, {}, RunSummary(), "cpu",
+                              possession_v3_file=first["artifacts"]["possession"]["path"],
+                              possession_v3_schema_version=1,
+                              possession_v3_manifest_file="possession_v3_manifest.json",
+                              possession_v4_diagnostics_file=artifact["path"],
+                              possession_v4_schema_version=1)
+    payload = results.to_dict()
+    assert payload["possession_v4_diagnostics_file"] == artifact["path"]
+    assert payload["possession_v4_schema_version"] == 1
+
+
 def test_v3_writer_is_feature_flag_isolated(tmp_path: Path):
     base = PipelineConfig(roboflow_api_key="test-key")
     assert _write_v3_artifacts(tmp_path / "legacy", [], [], fps=30, config=base) == {}

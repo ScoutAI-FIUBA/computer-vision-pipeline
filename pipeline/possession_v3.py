@@ -179,6 +179,12 @@ class PossessionContext:
     recovery_source_team: int | None = None
     recovery_reason: str | None = None
     recovery_remaining_seconds: float = 0.0
+    control_evidence: float | None = None
+    release_evidence: float | None = None
+    acquisition_evidence: float | None = None
+    ball_in_transit: bool = False
+    evidence_window_start: int | None = None
+    evidence_window_end: int | None = None
 
     def __post_init__(self) -> None:
         _holder(self.effective_holder_id)
@@ -244,6 +250,15 @@ class PossessionAudit:
     recovery_source_team: int | None = None
     recovery_reason: str | None = None
     recovery_window_seconds: float = 0.0
+    v4_schema_version: int | None = None
+    feature_flag: str | None = None
+    control_score: float | None = None
+    release_score: float | None = None
+    acquisition_score: float | None = None
+    gate_decision: str | None = None
+    gate_reason_codes: list[str] = field(default_factory=list)
+    spatial_contributions: dict[str, float] = field(default_factory=dict)
+    evidence_sources: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         _holder(self.last_holder_id)
@@ -776,6 +791,8 @@ class PossessionResolver:
         quality = (EvidenceKind.OBSERVED if state is PossessionState.OBSERVED else
                    EvidenceKind.INFERRED if state is PossessionState.INFERRED else
                    EvidenceKind.CONTESTED if state is PossessionState.CONTESTED else EvidenceKind.UNKNOWN)
+        evidence = direct or (candidates[0] if candidates else None)
+        v4_evidence = evidence if isinstance(evidence, V4CandidateEvidence) else None
         context = PossessionContext(effective_holder_id=None if state is PossessionState.LOST_NO_DETECTION else effective,
                                     effective_holder_team=None if state is PossessionState.LOST_NO_DETECTION else self.holder_team,
                                     observed_candidate_id=observed_id, challenger_id=challenger_id,
@@ -788,8 +805,14 @@ class PossessionResolver:
                                      recovery_source_id=self.recovery_source_id,
                                      recovery_source_team=self.recovery_source_team,
                                      recovery_reason=self.recovery_reason,
-                                     recovery_remaining_seconds=max(0.0, self.recovery_window - self._recovery_elapsed(frame, self.last_timestamp)))
+                                      recovery_remaining_seconds=max(0.0, self.recovery_window - self._recovery_elapsed(frame, self.last_timestamp)),
+                                      control_evidence=(v4_evidence.holder_control_score if v4_evidence else None),
+                                      release_evidence=(v4_evidence.holder_release_score if v4_evidence else None),
+                                      acquisition_evidence=(v4_evidence.challenger_acquisition_score if v4_evidence else None),
+                                      evidence_window_start=(pending[2] if pending else None),
+                                      evidence_window_end=frame)
         authority = "stable" if (direct and direct.stable_player_id) else "raw" if direct else "unknown"
+        gate_reasons = list(reason)
         audit = PossessionAudit(last_holder_id=(effective if state is PossessionState.LOST_NO_DETECTION else self.recovery_source_id),
                                  last_holder_team=(self.holder_team if state is PossessionState.LOST_NO_DETECTION else self.recovery_source_team),
                                  clear_reason=clear_reason or self._audit_for_last_transition.clear_reason,
@@ -800,7 +823,16 @@ class PossessionResolver:
                                   recovery_source_id=self.recovery_source_id,
                                   recovery_source_team=self.recovery_source_team,
                                   recovery_reason=self.recovery_reason,
-                                  recovery_window_seconds=self.recovery_window)
+                                  recovery_window_seconds=self.recovery_window,
+                                  v4_schema_version=1 if self.v4 else None,
+                                  feature_flag="v4" if self.v4 else None,
+                                  control_score=v4_evidence.holder_control_score if v4_evidence else None,
+                                  release_score=v4_evidence.holder_release_score if v4_evidence else None,
+                                  acquisition_score=v4_evidence.challenger_acquisition_score if v4_evidence else None,
+                                  gate_decision="allow" if switch_confirmed else ("hold" if self.v4 else None),
+                                  gate_reason_codes=gate_reasons,
+                                  spatial_contributions=(dict(v4_evidence.contributions) if v4_evidence else {}),
+                                  evidence_sources=([v4_evidence.source] if v4_evidence else []))
         audit = replace(audit, **{name: getattr(self._audit_for_last_transition, name)
                                   for name in ("previous_holder_id", "previous_holder_team", "new_holder_id",
                                                "new_holder_team", "previous_holder_score", "new_holder_score",

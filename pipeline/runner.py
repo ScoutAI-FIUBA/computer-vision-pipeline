@@ -1241,8 +1241,11 @@ def run_stats_from_v2_observations(
          possession_v3_transitions_file=_v3_artifact_path(v3_manifest, "transitions") if v3_manifest and v3_manifest.get("status") != "failed" else None,
          possession_v3_events_file=_v3_artifact_path(v3_manifest, "events") if v3_manifest and v3_manifest.get("status") != "failed" else None,
          possession_v3_manifest_file=POSSESSION_V3_MANIFEST_FILENAME if v3_manifest and v3_manifest.get("status") != "failed" else None,
-          possession_v3_schema_version=V3_CONTRACT_VERSION if v3_manifest and v3_manifest.get("status") != "failed" else None,
-          possession_v3_observability=v3_manifest.get("observability") if v3_manifest else None,
+           possession_v3_schema_version=V3_CONTRACT_VERSION if v3_manifest and v3_manifest.get("status") != "failed" else None,
+           possession_v3_observability=v3_manifest.get("observability") if v3_manifest else None,
+           possession_v4_diagnostics_file=_v3_artifact_path(v3_manifest, "v4_diagnostics")
+           if v3_manifest and v3_manifest.get("v4", {}).get("enabled") else None,
+           possession_v4_schema_version=1 if v3_manifest and v3_manifest.get("v4", {}).get("enabled") else None,
           artifact_references={
             "possession_events": {"file": possession_path.name, "schema_version": 1},
              "possession_transitions": {
@@ -1253,8 +1256,10 @@ def run_stats_from_v2_observations(
                                "source": "sam31_v2_observations",
                                "artifacts": json.loads((output_dir / "number_manifest.json").read_text(encoding="utf-8")).get("artifacts", {})}}
                 if numbers_available else {}),
-             **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
-                                    "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
+              **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
+                                     "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
+              **({"possession_v4": {"feature_flag": "v4", "diagnostics": _v3_artifact_path(v3_manifest, "v4_diagnostics")}}
+                 if v3_manifest and v3_manifest.get("v4", {}).get("enabled") else {}),
              **({"court_projection": {
                  "projected_tracks": PROJECTED_TRACKS_FILENAME,
                  "projected_shots": PROJECTED_SHOTS_FILENAME,
@@ -1879,6 +1884,9 @@ def run_pipeline(
         results.possession_v3_events_file = _v3_artifact_path(v3_manifest, "events")
         results.possession_v3_manifest_file = POSSESSION_V3_MANIFEST_FILENAME
         results.possession_v3_schema_version = V3_CONTRACT_VERSION
+        if v3_manifest.get("v4", {}).get("enabled"):
+            results.possession_v4_diagnostics_file = _v3_artifact_path(v3_manifest, "v4_diagnostics")
+            results.possession_v4_schema_version = 1
     results.possession_v3_observability = v3_manifest.get("observability") if v3_manifest else None
     results.artifact_references = {
         "possession_events": {
@@ -1893,6 +1901,8 @@ def run_pipeline(
         },
         **({"possession_v3": {"manifest": POSSESSION_V3_MANIFEST_FILENAME,
                               "artifacts": v3_manifest.get("artifacts", {})}} if v3_manifest and v3_manifest.get("status") != "failed" else {}),
+        **({"possession_v4": {"feature_flag": "v4", "diagnostics": _v3_artifact_path(v3_manifest, "v4_diagnostics")}}
+           if v3_manifest and v3_manifest.get("v4", {}).get("enabled") else {}),
     }
 
     # One line per suspected swap, so a run can be reviewed without watching the
