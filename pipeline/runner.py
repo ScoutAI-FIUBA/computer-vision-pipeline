@@ -52,7 +52,7 @@ from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.possession_v3 import (
     PossessionResolver, derive_ball_primitives, derive_ball_transitions, classify_transition,
-    normalize_ball_rows, score_candidates, debounce_reverted_switches, V3_CONTRACT_VERSION, _point,
+    normalize_ball_rows, score_candidates, score_candidates_v4, debounce_reverted_switches, V3_CONTRACT_VERSION, _point,
 )
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
@@ -92,7 +92,7 @@ def _possession_result_config(config: PipelineConfig, base: dict) -> dict:
         return base
     return {
         **base,
-        "possession_engine": "v3",
+        "possession_engine": config.possession_engine,
         "possession_v3_schema_version": V3_CONTRACT_VERSION,
         "possession_v3_reverted_switch_window_seconds": config.possession_v3_reverted_switch_window_seconds,
         "possession_v3_recovery_window_seconds": config.possession_v3_recovery_window_seconds,
@@ -231,14 +231,21 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
     balls = {int(row["frame_index"]): row for row in ball_rows if isinstance(row, dict) and type(row.get("frame_index")) is int}
     resolver = PossessionResolver(real_fps=fps, grace_seconds=config.possession_v3_grace_seconds,
                                   recovery_window_seconds=config.possession_v3_recovery_window_seconds,
-                                  hysteresis_margin=config.possession_v3_hysteresis_margin,
+                                  hysteresis_margin=(config.possession_v4_ambiguity_margin
+                                                     if config.possession_v4_enabled else config.possession_v3_hysteresis_margin),
+                                  ambiguity_margin=(config.possession_v4_ambiguity_margin
+                                                    if config.possession_v4_enabled else None),
                                   persistence_seconds=config.possession_v3_persistence_seconds,
                                   profile=config.possession_v3_calibration_profile)
     observations = []
     for frame in sorted(set(by_frame) | set(balls)):
         ball = balls.get(frame)
-        candidates = score_candidates(by_frame.get(frame, []), ball, previous_holder=resolver.holder_stable,
-                                       ambiguity_margin=config.possession_v3_hysteresis_margin)
+        scorer = score_candidates_v4 if config.possession_v4_enabled else score_candidates
+        candidates = scorer(by_frame.get(frame, []), ball, previous_holder=resolver.holder_stable,
+                            ambiguity_margin=(config.possession_v4_ambiguity_margin
+                                              if config.possession_v4_enabled else config.possession_v3_hysteresis_margin),
+                            **({"disagreement_score": config.possession_v4_spatial_disagreement_score}
+                               if config.possession_v4_enabled else {}))
         observation = resolver.resolve(frame, candidates, missing=ball is None,
                                        invalid=_v3_ball_row_invalid(ball),
                                        ball_lost=ball is not None and ball.get("track_state") == "lost",
@@ -259,7 +266,7 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
                                       "event_window_seconds": config.possession_v3_event_window_seconds,
                                       "recovery_window_seconds": config.possession_v3_recovery_window_seconds,
                                      "reverted_switch_window_seconds": config.possession_v3_reverted_switch_window_seconds,
-                                     "engine": "v3"})
+                                      "engine": config.possession_engine})
     manifest["observability"] = {"status": "complete", "phase": "artifact_write",
                                   "counts": {"observations": len(observations), "primitives": len(primitives),
                                              "transitions": len(transitions), "events": len(events)},

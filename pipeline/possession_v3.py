@@ -130,6 +130,24 @@ class CandidateEvidence:
         _text_list(self.rejected_reasons, "rejected_reasons")
         if self.fallback_identity is not None and (type(self.fallback_identity) is not str or not self.fallback_identity.strip()):
             raise ValueError("fallback_identity must be a non-empty string when set")
+
+
+@dataclass(frozen=True)
+class V4CandidateEvidence(CandidateEvidence):
+    """V4-only candidate sidecar; the V3 contract remains unchanged."""
+    spatial_score: float | None = None
+    mask_score: float | None = None
+    bbox_score: float | None = None
+    mask_bbox_agreement: float | None = None
+    source: str = "v4"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        for value, name in ((self.spatial_score, "spatial_score"), (self.mask_score, "mask_score"),
+                            (self.bbox_score, "bbox_score"), (self.mask_bbox_agreement, "mask_bbox_agreement")):
+            _score(value, name)
+        if type(self.source) is not str or not self.source.strip():
+            raise ValueError("source must be a non-empty string")
 @dataclass(frozen=True)
 class PossessionContext:
     """Serializable roles and temporal state owned by the future resolver."""
@@ -420,7 +438,7 @@ class PossessionEvent:
             raise ValueError("frame_end must not precede frame_start")
 def engine_name(config: PipelineConfig) -> str:
     """Return the validated selector; legacy remains the default."""
-    return "v3" if config.possession_v3_enabled else "legacy"
+    return config.possession_engine if config.possession_v3_enabled else "legacy"
 
 
 # Work Unit 2 deliberately keeps the input boundary duck-typed: upstream
@@ -559,16 +577,70 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
     return output
 
 
+def score_candidates_v4(players, ball, *, previous_holder=None, ambiguity_margin=.1,
+                        disagreement_score=.25):
+    """Fuse mask and box evidence into one conservative spatial vote."""
+    point = _point(ball)
+    output = []
+    for row in players or []:
+        row = row if isinstance(row, dict) else {}
+        stable, raw = _identity_key(row)
+        team = row.get("team_id")
+        box = row.get("xyxy", row.get("bbox", row.get("box")))
+        reasons = []
+        mask_available = row.get("mask_valid") is True
+        mask_value = row.get("mask_contains")
+        if callable(mask_value) and point is not None:
+            try:
+                mask_value = mask_value(*point)
+            except Exception:
+                mask_value = None
+        if mask_available and type(mask_value) is not bool:
+            mask_available = False
+        mask_score = 1.0 if mask_available and mask_value else 0.0 if mask_available else None
+        valid_box = (isinstance(box, (list, tuple)) and len(box) == 4 and
+                     all(type(value) in {int, float} and math.isfinite(float(value)) for value in box) and
+                     box[2] >= box[0] and box[3] >= box[1])
+        bbox_score = 1.0 if valid_box and point is not None and _inside_box(point, box) else 0.0 if valid_box else None
+        agreement = None
+        if mask_score is None:
+            spatial, source = 0.0, "missing-mask"
+            reasons.append("missing_mask")
+        elif bbox_score is None:
+            spatial, source = 0.0, "missing-bbox"
+            reasons.append("missing_bbox")
+        elif mask_score == bbox_score:
+            spatial, agreement, source = mask_score, 1.0, "mask+bbox"
+        else:
+            spatial, agreement, source = max(0.0, min(1.0, float(disagreement_score))), 0.0, "mask+bbox-disagreement"
+            reasons.append("mask_bbox_disagreement")
+        if spatial == 0.0 and not reasons:
+            reasons.append("outside_spatial_region")
+        fallback = f"raw:{raw}" if stable is None and raw is not None else None
+        output.append(V4CandidateEvidence(
+            stable, raw, team if type(team) is int and team >= 0 else None,
+            spatial, {"spatial_score": spatial}, reasons, fallback,
+            spatial, mask_score, bbox_score, agreement, source,
+        ))
+    output.sort(key=lambda c: (-c.score, c.stable_player_id or "", c.raw_track_id or 0))
+    if len(output) > 1 and output[0].score - output[1].score < max(0.0, ambiguity_margin):
+        output = [replace(candidate, rejected_reasons=candidate.rejected_reasons + ["ambiguous_margin"])
+                  for candidate in output]
+    return output
+
+
 class PossessionResolver:
     """Small deterministic temporal resolver; no ball/event semantics live here."""
-    def __init__(self, *, real_fps, grace_seconds=.6, recovery_window_seconds=.8, hysteresis_margin=.1, persistence_seconds=0.0,
-                 keep_threshold=MIN_CANDIDATE_SCORE, profile="default"):
+    def __init__(self, *, real_fps, grace_seconds=.6, recovery_window_seconds=.8, hysteresis_margin=.1,
+                 ambiguity_margin=None, persistence_seconds=0.0, keep_threshold=MIN_CANDIDATE_SCORE, profile="default"):
         if not isinstance(real_fps, (int, float)) or real_fps <= 0: raise ValueError("real_fps must be positive")
         self.fps = float(real_fps); self.grace = min(.6, max(0.0, grace_seconds))
         if type(recovery_window_seconds) not in {int, float} or not math.isfinite(float(recovery_window_seconds)) or recovery_window_seconds < 0:
             raise ValueError("recovery_window_seconds must be finite and non-negative")
         self.recovery_window = float(recovery_window_seconds)
-        self.hysteresis = max(0.0, hysteresis_margin); self.persistence = max(0.0, persistence_seconds)
+        self.hysteresis = max(0.0, hysteresis_margin)
+        self.ambiguity_margin = self.hysteresis if ambiguity_margin is None else max(0.0, ambiguity_margin)
+        self.persistence = max(0.0, persistence_seconds)
         if (type(keep_threshold) not in {int, float} or not math.isfinite(float(keep_threshold))
                 or not 0 <= float(keep_threshold) <= 1):
             raise ValueError("keep_threshold must be finite and between 0 and 1")
@@ -706,6 +778,14 @@ class PossessionResolver:
                                      reason=("no_detection" if ball_lost else "evidence_loss",))
         if candidates:
             top = candidates[0]
+            if {"ambiguous_margin", "mask_bbox_disagreement"}.intersection(top.rejected_reasons):
+                self.pending = None
+                if self.holder:
+                    self.gap_seconds += elapsed
+                    if self.gap_seconds >= self.grace:
+                        return self._lost_no_detection(frame_index, candidates, "grace_expired")
+                return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
+                                         observed=top, reason=("ambiguous_spatial_evidence",))
             if self._key(top) == self.holder and top.score >= self.keep_threshold:
                 self.gap_seconds = 0.0
                 self.pending = None
@@ -718,7 +798,7 @@ class PossessionResolver:
                                             timestamp=timestamp, frame_start=self.last_observed_frame,
                                             timestamp_start=self.last_observed_timestamp)
                 return self._observation(frame_index, PossessionState.NO_POSSESSION, candidates=candidates, reason=("no_valid_candidate",))
-            if len(candidates) > 1 and candidates[0].score - candidates[1].score < self.hysteresis:
+            if len(candidates) > 1 and candidates[0].score - candidates[1].score < self.ambiguity_margin:
                 if self.holder:
                     self.gap_seconds += elapsed
                     if self.gap_seconds >= self.grace:

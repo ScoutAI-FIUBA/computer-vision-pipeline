@@ -121,6 +121,8 @@ DEFAULT_POSSESSION_V3_REVERTED_SWITCH_WINDOW_SECONDS = 0.5
 DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE = "default"
 DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION = 1
 DEFAULT_POSSESSION_V3_BALL_MAX_GAP = 3
+DEFAULT_POSSESSION_V4_SPATIAL_DISAGREEMENT_SCORE = 0.25
+DEFAULT_POSSESSION_V4_AMBIGUITY_MARGIN = 0.05
 
 
 
@@ -187,10 +189,16 @@ class PipelineConfig:
     possession_v3_calibration_profile: str = DEFAULT_POSSESSION_V3_CALIBRATION_PROFILE
     possession_v3_input_contract_version: int = DEFAULT_POSSESSION_V3_INPUT_CONTRACT_VERSION
     possession_v3_ball_max_gap: int = DEFAULT_POSSESSION_V3_BALL_MAX_GAP
+    possession_v4_spatial_disagreement_score: float = DEFAULT_POSSESSION_V4_SPATIAL_DISAGREEMENT_SCORE
+    possession_v4_ambiguity_margin: float = DEFAULT_POSSESSION_V4_AMBIGUITY_MARGIN
 
     @property
     def possession_v3_enabled(self) -> bool:
-        return self.possession_engine == "v3"
+        return self.possession_engine in {"v3", "v4"}
+
+    @property
+    def possession_v4_enabled(self) -> bool:
+        return self.possession_engine == "v4"
 
     # --- Sampling ---
     # COST: the biggest lever there is. SAM2's image encoder runs on every
@@ -320,8 +328,8 @@ class PipelineConfig:
     prefetch_detections: bool = True
 
     def __post_init__(self) -> None:
-        if self.possession_engine not in {"legacy", "v3"}:
-            raise ValueError("Unknown possession_engine: expected 'legacy' or 'v3'")
+        if self.possession_engine not in {"legacy", "v3", "v4"}:
+            raise ValueError("Unknown possession_engine: expected 'legacy', 'v3', or 'v4'")
         grace = _finite_v3(self.possession_v3_grace_seconds, "possession_v3_grace_seconds")
         recovery_window = _finite_v3(self.possession_v3_recovery_window_seconds, "possession_v3_recovery_window_seconds")
         hysteresis = _finite_v3(self.possession_v3_hysteresis_margin, "possession_v3_hysteresis_margin")
@@ -346,6 +354,10 @@ class PipelineConfig:
             raise ValueError("possession_v3_input_contract_version must be at least 1")
         if type(self.possession_v3_ball_max_gap) is not int or self.possession_v3_ball_max_gap < 0:
             raise ValueError("possession_v3_ball_max_gap must be non-negative")
+        for value, name in ((self.possession_v4_spatial_disagreement_score, "possession_v4_spatial_disagreement_score"),
+                            (self.possession_v4_ambiguity_margin, "possession_v4_ambiguity_margin")):
+            if type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be finite and between 0 and 1")
         if self.frame_stride < 1:
             raise ValueError("frame_stride must be at least 1")
         if self.shot_frame_stride < 1:
@@ -483,6 +495,12 @@ class PipelineConfig:
             ),
             "possession_v3_ball_max_gap": _env_int(
                 "POSSESSION_V3_BALL_MAX_GAP", DEFAULT_POSSESSION_V3_BALL_MAX_GAP
+            ),
+            "possession_v4_spatial_disagreement_score": _env_float(
+                "POSSESSION_V4_SPATIAL_DISAGREEMENT_SCORE", DEFAULT_POSSESSION_V4_SPATIAL_DISAGREEMENT_SCORE
+            ),
+            "possession_v4_ambiguity_margin": _env_float(
+                "POSSESSION_V4_AMBIGUITY_MARGIN", DEFAULT_POSSESSION_V4_AMBIGUITY_MARGIN
             ),
             "team_embedder_backend": os.getenv(
                 "TEAM_EMBEDDER_BACKEND", DEFAULT_TEAM_EMBEDDER_BACKEND

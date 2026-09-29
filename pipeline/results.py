@@ -120,9 +120,23 @@ class PipelineResults:
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
 
+_V4_DIAGNOSTIC_FIELDS = {"spatial_score", "mask_score", "bbox_score", "mask_bbox_agreement", "source"}
+
+
+def _without_v4_diagnostics(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _without_v4_diagnostics(item) for key, item in value.items()
+                if key not in _V4_DIAGNOSTIC_FIELDS}
+    if isinstance(value, list):
+        return [_without_v4_diagnostics(item) for item in value]
+    return value
+
+
 def _json_record(value: Any, config: Mapping[str, Any]) -> dict[str, Any]:
     if hasattr(value, "__dataclass_fields__"):
         value = asdict(value)
+    if config.get("engine", config.get("possession_engine")) != "v4":
+        value = _without_v4_diagnostics(value)
     record = dict(value)
     record.setdefault("schema", "possession-engine-v3")
     record.setdefault("schema_version", V3_CONTRACT_VERSION)
