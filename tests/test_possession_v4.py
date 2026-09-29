@@ -125,3 +125,175 @@ def test_v4_ambiguous_margin_cannot_be_promoted_by_legacy_hysteresis():
     observation = resolver.resolve(0, candidates)
     assert observation.state is PossessionState.CONTESTED
     assert resolver.holder is None
+
+
+def evidence_player(name, x, *, approach=0.0, continuity=0.0):
+    return player(name, [x - 10, 0, x + 10, 40],
+                  relative_motion=approach, continuity=continuity)
+
+
+def test_v4_evidence_exposes_normalized_distance_and_contributions():
+    candidate = score_candidates_v4(
+        [evidence_player("p1", 10, approach=.8, continuity=1.0)],
+        {"x": 10, "y": 20, "confidence": .9},
+    )[0]
+    assert candidate.normalized_distance == 0.0
+    assert candidate.contributions["spatial_fusion"] == 1.0
+    assert candidate.holder_control_score > .5
+    assert "ball_quality" in candidate.contributions
+
+
+def test_v4_valid_ball_confidence_contributes_quality():
+    candidate = score_candidates_v4([evidence_player("p1", 10, approach=1)],
+                                    {"x": 10, "y": 20, "confidence": .8})[0]
+    assert candidate.ball_quality == .8
+    assert candidate.contributions["ball_quality"] == .8
+
+
+@pytest.mark.parametrize("confidence", [float("nan"), float("inf"), float("-inf")])
+def test_v4_malformed_ball_confidence_cannot_score_or_acquire_repeatedly(confidence):
+    resolver = PossessionResolver(real_fps=10, v4=True, grace_seconds=.4)
+    holder = score_candidates_v4([evidence_player("p1", 10, continuity=1)],
+                                 {"x": 10, "y": 20, "confidence": .9})
+    resolver.resolve(0, holder)
+    malformed_ball = {"x": 10, "y": 20, "confidence": confidence}
+    for frame in (1, 2, 3):
+        challenger = score_candidates_v4(
+            [evidence_player("p2", 10, approach=1, continuity=1)], malformed_ball
+        )[0]
+        assert challenger.score == 0
+        assert challenger.challenger_acquisition_score == 0
+        result = resolver.resolve(frame, [challenger])
+        assert result.context.effective_holder_id == "p1"
+        assert result.state is PossessionState.CONTESTED
+
+
+def test_v4_resolver_rejects_legacy_candidate_evidence_at_boundary():
+    resolver = PossessionResolver(real_fps=10, v4=True)
+    legacy = CandidateEvidence("p2", 2, 1, 1.0, {"geometry": 1.0})
+    result = resolver.resolve(0, [legacy])
+    assert result.state is PossessionState.CONTESTED
+    assert resolver.holder is None
+    assert "legacy_candidate_without_v4_evidence" in result.provenance.reason_codes
+
+    holder = score_candidates_v4([evidence_player("p1", 10, continuity=1)], {"x": 10, "y": 20})
+    resolver.resolve(1, holder)
+    result = resolver.resolve(2, [legacy])
+    assert result.context.effective_holder_id == "p1"
+    assert result.state is PossessionState.CONTESTED
+
+
+def test_v4_acquisition_requires_approach_not_proximity():
+    close = score_candidates_v4([evidence_player("p2", 10)], {"x": 10, "y": 20})[0]
+    approaching = score_candidates_v4([evidence_player("p2", 10, approach=1.0)],
+                                      {"x": 10, "y": 20})[0]
+    assert close.challenger_acquisition_score < .5
+    assert approaching.challenger_acquisition_score > close.challenger_acquisition_score
+
+
+def test_v4_release_persists_and_dribble_return_keeps_holder():
+    resolver = PossessionResolver(real_fps=10, v4=True, persistence_seconds=.2,
+                                  release_persistence_seconds=.2)
+    holder = score_candidates_v4([evidence_player("p1", 10, approach=1, continuity=1)],
+                                 {"x": 10, "y": 20})
+    assert resolver.resolve(0, holder).state is PossessionState.OBSERVED
+    weak = score_candidates_v4([evidence_player("p1", 60)], {"x": 10, "y": 20})
+    assert resolver.resolve(1, weak).context.effective_holder_id == "p1"
+    returned = score_candidates_v4([evidence_player("p1", 10, approach=1, continuity=1)],
+                                   {"x": 10, "y": 20})
+    assert resolver.resolve(2, returned).context.effective_holder_id == "p1"
+
+
+def test_v4_challenger_acquisition_persists_before_switch():
+    resolver = PossessionResolver(real_fps=10, v4=True, persistence_seconds=.2,
+                                  acquisition_persistence_seconds=.2)
+    assert resolver.resolve(0, score_candidates_v4([evidence_player("p1", 10, continuity=1)],
+                                                     {"x": 10, "y": 20})).state is PossessionState.OBSERVED
+    challenger = score_candidates_v4([evidence_player("p2", 10, approach=1, continuity=1)],
+                                     {"x": 10, "y": 20})
+    assert resolver.resolve(1, challenger).context.effective_holder_id == "p1"
+    assert resolver.resolve(2, challenger).context.effective_holder_id == "p2"
+
+
+def test_v4_ball_lost_grace_does_not_release_holder():
+    resolver = PossessionResolver(real_fps=10, v4=True, grace_seconds=.3)
+    candidate = score_candidates_v4([evidence_player("p1", 10, continuity=1)], {"x": 10, "y": 20})
+    resolver.resolve(0, candidate)
+    lost = resolver.resolve(1, [], ball_lost=True)
+    assert lost.state is PossessionState.INFERRED
+    assert lost.context.effective_holder_id == "p1"
+
+
+def test_v4_passing_front_does_not_switch_on_proximity():
+    resolver = PossessionResolver(real_fps=10, v4=True, acquisition_persistence_seconds=0)
+    holder = score_candidates_v4([evidence_player("p1", 10, continuity=1)], {"x": 10, "y": 20})
+    resolver.resolve(0, holder)
+    passer = score_candidates_v4([evidence_player("p2", 10)], {"x": 10, "y": 20})
+    result = resolver.resolve(1, passer)
+    assert result.context.effective_holder_id == "p1"
+    assert "acquisition_evidence_required" in result.provenance.reason_codes
+
+
+def test_v4_unknown_and_malformed_evidence_do_not_release():
+    resolver = PossessionResolver(real_fps=10, v4=True)
+    holder = score_candidates_v4([evidence_player("p1", 10, continuity=1)], {"x": 10, "y": 20})
+    resolver.resolve(0, holder)
+    unknown = resolver.resolve(1, [], missing=True)
+    assert unknown.state is PossessionState.UNKNOWN
+    assert unknown.context.effective_holder_id == "p1"
+    malformed = score_candidates_v4([{"stable_player_id": "p2", "team_id": 1, "bbox": object()}],
+                                     {"x": 10, "y": 20})[0]
+    assert malformed.score == 0 and "invalid_normalized_distance" in malformed.rejected_reasons
+
+
+def test_v4_malformed_challenger_preserves_holder_as_contested():
+    resolver = PossessionResolver(real_fps=10, v4=True, grace_seconds=.3)
+    holder = score_candidates_v4([evidence_player("p1", 10, continuity=1)], {"x": 10, "y": 20})
+    resolver.resolve(0, holder)
+    malformed = score_candidates_v4([{"stable_player_id": "p2", "team_id": 1, "bbox": object()}],
+                                    {"x": 10, "y": 20})
+    result = resolver.resolve(1, malformed)
+    assert result.state is PossessionState.CONTESTED
+    assert result.context.effective_holder_id == "p1"
+
+
+def test_v4_produces_approach_from_ball_and_player_history():
+    previous = [evidence_player("p2", 50)]
+    current = [evidence_player("p2", 10, continuity=1)]
+    candidate = score_candidates_v4(current, {"x": 10, "y": 20, "confidence": 1.0},
+                                    previous_ball={"x": 10, "y": 20},
+                                    previous_players=previous)[0]
+    assert candidate.relative_motion == 1.0
+    assert candidate.challenger_acquisition_score > .6
+    assert candidate.contributions["relative_motion"] == 1.0
+
+
+@pytest.mark.parametrize("challenger", [
+    {"stable_player_id": "p2", "raw_track_id": 2, "team_id": -1,
+     "bbox": [0, 0, 20, 40], "mask_valid": True, "mask_contains": True,
+     "relative_motion": 1.0},
+    {"stable_player_id": None, "raw_track_id": None, "team_id": 1,
+     "bbox": [0, 0, 20, 40], "mask_valid": True, "mask_contains": True,
+     "relative_motion": 1.0},
+    {"stable_player_id": "p2", "raw_track_id": 2, "team_id": 1,
+     "bbox": [0, 0, 20, 40], "mask_valid": True, "mask_contains": True,
+     "confidence": float("nan"), "relative_motion": 1.0},
+])
+def test_v4_invalid_authority_cannot_replace_holder(challenger):
+    resolver = PossessionResolver(real_fps=10, v4=True, grace_seconds=.3)
+    holder = score_candidates_v4([evidence_player("p1", 10, continuity=1)], {"x": 10, "y": 20})
+    resolver.resolve(0, holder)
+    candidate = score_candidates_v4([challenger], {"x": 10, "y": 20, "confidence": 1.0})[0]
+    assert candidate.score == 0
+    assert candidate.challenger_acquisition_score == 0
+    result = resolver.resolve(1, [candidate])
+    assert result.context.effective_holder_id == "p1"
+    assert result.state is PossessionState.CONTESTED
+
+
+@pytest.mark.parametrize("name,value", [("holder_control_score", -0.1),
+                                         ("holder_release_score", 1.1),
+                                         ("challenger_acquisition_score", float("nan"))])
+def test_v4_evidence_config_scores_are_bounded(name, value):
+    with pytest.raises(ValueError):
+        PipelineConfig(roboflow_api_key="key", possession_engine="v4", **{name: value})

@@ -140,6 +140,13 @@ class V4CandidateEvidence(CandidateEvidence):
     bbox_score: float | None = None
     mask_bbox_agreement: float | None = None
     source: str = "v4"
+    normalized_distance: float | None = None
+    relative_motion: float = 0.0
+    ball_quality: float = 0.0
+    continuity: float = 0.0
+    holder_control_score: float = 0.0
+    holder_release_score: float = 0.0
+    challenger_acquisition_score: float = 0.0
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -148,6 +155,12 @@ class V4CandidateEvidence(CandidateEvidence):
             _score(value, name)
         if type(self.source) is not str or not self.source.strip():
             raise ValueError("source must be a non-empty string")
+        for value, name in ((self.normalized_distance, "normalized_distance"),
+                            (self.relative_motion, "relative_motion"), (self.ball_quality, "ball_quality"),
+                            (self.continuity, "continuity"), (self.holder_control_score, "holder_control_score"),
+                            (self.holder_release_score, "holder_release_score"),
+                            (self.challenger_acquisition_score, "challenger_acquisition_score")):
+            _score(value, name)
 @dataclass(frozen=True)
 class PossessionContext:
     """Serializable roles and temporal state owned by the future resolver."""
@@ -578,7 +591,7 @@ def score_candidates(players, ball, *, previous_holder=None, ambiguity_margin=.1
 
 
 def score_candidates_v4(players, ball, *, previous_holder=None, ambiguity_margin=.1,
-                        disagreement_score=.25):
+                        disagreement_score=.25, previous_ball=None, previous_players=None):
     """Fuse mask and box evidence into one conservative spatial vote."""
     point = _point(ball)
     output = []
@@ -588,6 +601,12 @@ def score_candidates_v4(players, ball, *, previous_holder=None, ambiguity_margin
         team = row.get("team_id")
         box = row.get("xyxy", row.get("bbox", row.get("box")))
         reasons = []
+        if stable is None and raw is None:
+            reasons.append("invalid_identity")
+        if type(team) is not int or team < 0:
+            reasons.append("invalid_team")
+        if point is None:
+            reasons.append("invalid_ball_geometry")
         mask_available = row.get("mask_valid") is True
         mask_value = row.get("mask_contains")
         if callable(mask_value) and point is not None:
@@ -597,10 +616,13 @@ def score_candidates_v4(players, ball, *, previous_holder=None, ambiguity_margin
                 mask_value = None
         if mask_available and type(mask_value) is not bool:
             mask_available = False
+            reasons.append("invalid_mask")
         mask_score = 1.0 if mask_available and mask_value else 0.0 if mask_available else None
         valid_box = (isinstance(box, (list, tuple)) and len(box) == 4 and
                      all(type(value) in {int, float} and math.isfinite(float(value)) for value in box) and
                      box[2] >= box[0] and box[3] >= box[1])
+        if not valid_box:
+            reasons.append("invalid_bbox")
         bbox_score = 1.0 if valid_box and point is not None and _inside_box(point, box) else 0.0 if valid_box else None
         agreement = None
         if mask_score is None:
@@ -616,11 +638,70 @@ def score_candidates_v4(players, ball, *, previous_holder=None, ambiguity_margin
             reasons.append("mask_bbox_disagreement")
         if spatial == 0.0 and not reasons:
             reasons.append("outside_spatial_region")
+        quality_value = ball.get("confidence", ball.get("score", 0.0)) if isinstance(ball, dict) else 0.0
+        quality_valid = (type(quality_value) in {int, float} and math.isfinite(float(quality_value))
+                         and 0 <= float(quality_value) <= 1)
+        quality = float(quality_value) if quality_valid else 0.0
+        quality = max(0.0, min(1.0, quality))
+        if isinstance(ball, dict) and ("confidence" in ball or "score" in ball) and not quality_valid:
+            reasons.append("invalid_ball_confidence")
+        confidence_value = row.get("confidence", row.get("player_confidence"))
+        if confidence_value is not None and (type(confidence_value) not in {int, float}
+                                              or not math.isfinite(float(confidence_value))
+                                              or not 0 <= float(confidence_value) <= 1):
+            reasons.append("invalid_confidence")
+        distance = None
+        if valid_box and point is not None:
+            px, py = (float(box[0] + box[2]) / 2, float(box[1] + box[3]) / 2)
+            size = max(1.0, float(box[2] - box[0]), float(box[3] - box[1]))
+            distance = min(1.0, max(0.0, math.hypot(point[0] - px, point[1] - py) / size))
+        proximity = 0.0 if distance is None else max(0.0, 1.0 - min(1.0, distance))
+        def bounded(name, default=0.0):
+            value = row.get(name, default)
+            return float(value) if type(value) in {int, float} and math.isfinite(float(value)) and 0 <= value <= 1 else default
+        approach = bounded("approach_score", bounded("relative_motion"))
+        previous_row = next((item for item in (previous_players or [])
+                             if isinstance(item, dict) and
+                             ((_identity_key(item)[0] == stable and stable is not None) or
+                              (_identity_key(item)[1] == raw and raw is not None))), None)
+        previous_point, previous_player_point = _point(previous_ball), None
+        previous_box = (previous_row.get("xyxy", previous_row.get("bbox", previous_row.get("box")))
+                        if previous_row else None)
+        if isinstance(previous_box, (list, tuple)) and len(previous_box) == 4 and all(
+                type(value) in {int, float} and math.isfinite(float(value)) for value in previous_box):
+            previous_player_point = ((float(previous_box[0] + previous_box[2]) / 2),
+                                     (float(previous_box[1] + previous_box[3]) / 2))
+        if previous_point is not None and previous_player_point is not None and valid_box and point is not None:
+            current_player_point = ((float(box[0] + box[2]) / 2), (float(box[1] + box[3]) / 2))
+            current_distance = math.hypot(point[0] - current_player_point[0], point[1] - current_player_point[1])
+            previous_distance = math.hypot(previous_point[0] - previous_player_point[0],
+                                           previous_point[1] - previous_player_point[1])
+            size = max(1.0, float(box[2] - box[0]), float(box[3] - box[1]))
+            approach = max(0.0, min(1.0, (previous_distance - current_distance) / size))
+        continuity = bounded("continuity", 1.0 if stable == previous_holder else 0.0)
+        control = max(0.0, min(1.0, .55 * spatial + .25 * proximity + .1 * quality + .1 * continuity))
+        release = max(0.0, min(1.0, 1.0 - control))
+        acquisition_base = .35 * spatial + .2 * proximity + .1 * quality + .1 * continuity
+        acquisition = max(0.0, min(1.0, .5 * acquisition_base + .5 * approach))
+        contributions = {"spatial_score": spatial, "spatial_fusion": spatial, "normalized_distance": proximity,
+                         "relative_motion": approach, "ball_quality": quality, "continuity": continuity}
+        if distance is None:
+            reasons.append("invalid_normalized_distance")
+        invalid_evidence = bool({"invalid_identity", "invalid_team", "invalid_ball_geometry",
+                                 "invalid_mask", "invalid_bbox", "invalid_confidence",
+                                 "invalid_ball_confidence", "invalid_normalized_distance"}.intersection(reasons))
+        if invalid_evidence:
+            spatial, source, approach = 0.0, "invalid-evidence", 0.0
+            control = release = acquisition = 0.0
+            contributions["spatial_score"] = contributions["spatial_fusion"] = 0.0
+            contributions["relative_motion"] = 0.0
+            reasons.append("invalid_evidence")
         fallback = f"raw:{raw}" if stable is None and raw is not None else None
         output.append(V4CandidateEvidence(
             stable, raw, team if type(team) is int and team >= 0 else None,
-            spatial, {"spatial_score": spatial}, reasons, fallback,
-            spatial, mask_score, bbox_score, agreement, source,
+            spatial, contributions, reasons, fallback,
+            spatial, mask_score, bbox_score, agreement, source, distance, approach, quality,
+            continuity, control, release, acquisition,
         ))
     output.sort(key=lambda c: (-c.score, c.stable_player_id or "", c.raw_track_id or 0))
     if len(output) > 1 and output[0].score - output[1].score < max(0.0, ambiguity_margin):
@@ -632,7 +713,10 @@ def score_candidates_v4(players, ball, *, previous_holder=None, ambiguity_margin
 class PossessionResolver:
     """Small deterministic temporal resolver; no ball/event semantics live here."""
     def __init__(self, *, real_fps, grace_seconds=.6, recovery_window_seconds=.8, hysteresis_margin=.1,
-                 ambiguity_margin=None, persistence_seconds=0.0, keep_threshold=MIN_CANDIDATE_SCORE, profile="default"):
+                 ambiguity_margin=None, persistence_seconds=0.0, keep_threshold=MIN_CANDIDATE_SCORE, profile="default",
+                 v4=False, holder_control_score=.55, holder_release_score=.35,
+                 challenger_acquisition_score=.6, release_persistence_seconds=.2,
+                 acquisition_persistence_seconds=.2):
         if not isinstance(real_fps, (int, float)) or real_fps <= 0: raise ValueError("real_fps must be positive")
         self.fps = float(real_fps); self.grace = min(.6, max(0.0, grace_seconds))
         if type(recovery_window_seconds) not in {int, float} or not math.isfinite(float(recovery_window_seconds)) or recovery_window_seconds < 0:
@@ -646,6 +730,18 @@ class PossessionResolver:
             raise ValueError("keep_threshold must be finite and between 0 and 1")
         self.keep_threshold = float(keep_threshold)
         self.profile = profile; self.holder = None; self.last_frame = None; self.last_time = None
+        self.v4 = bool(v4)
+        for value, name in ((holder_control_score, "holder_control_score"),
+                            (holder_release_score, "holder_release_score"),
+                            (challenger_acquisition_score, "challenger_acquisition_score")):
+            if type(value) not in {int, float} or not math.isfinite(float(value)) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be finite and between 0 and 1")
+        self.holder_control_score = float(holder_control_score)
+        self.holder_release_score = float(holder_release_score)
+        self.challenger_acquisition_score = float(challenger_acquisition_score)
+        self.release_persistence = max(0.0, float(release_persistence_seconds))
+        self.acquisition_persistence = max(0.0, float(acquisition_persistence_seconds))
+        self.release_pending = None
         self.pending = None; self.gap_seconds = 0.0
         self.holder_stable = self.holder_raw = self.holder_team = self.holder_fallback = None
         self.last_observed_frame = self.last_observed_score = None
@@ -724,6 +820,26 @@ class PossessionResolver:
     def _key(self, candidate):
         return candidate.stable_player_id or candidate.fallback_identity or (f"raw:{candidate.raw_track_id}" if candidate.raw_track_id else None)
 
+    def _v4_ready(self, candidate, candidates=()):
+        prior = next((item for item in candidates if self._key(item) == self.holder), None)
+        release_ready = (prior is None or not isinstance(prior, V4CandidateEvidence)
+                         or prior.holder_release_score >= self.holder_release_score)
+        return (self.v4 and isinstance(candidate, V4CandidateEvidence) and release_ready
+                and candidate.challenger_acquisition_score >= self.challenger_acquisition_score
+                and candidate.relative_motion > 0)
+
+    def _v4_invalid_candidate(self, candidate):
+        if self.v4 and isinstance(candidate, CandidateEvidence) and not isinstance(candidate, V4CandidateEvidence):
+            return True
+        return (self.v4 and isinstance(candidate, V4CandidateEvidence)
+                and (candidate.team_id is None
+                     or self._key(candidate) is None
+                     or bool({"invalid_bbox", "invalid_identity", "invalid_team",
+                              "invalid_ball_geometry", "invalid_mask", "invalid_confidence",
+                              "invalid_ball_confidence", "invalid_normalized_distance",
+                              "invalid_evidence"}.intersection(
+                                  candidate.rejected_reasons))))
+
     def resolve(self, frame_index, candidates, *, missing=False, invalid=False, ball_lost=False,
                 authoritative_loss=False, duplicate=False, timestamp=None):
         self._audit_for_last_transition = PossessionAudit()
@@ -754,6 +870,11 @@ class PossessionResolver:
         if invalid_input:
             last = self.holder_stable or self.holder_fallback or (f"raw:{self.holder_raw}" if self.holder_raw else None)
             team = self.holder_team
+            if self.v4 and self.holder:
+                return self._observation(frame_index, PossessionState.UNKNOWN, candidates=candidates,
+                                         reason=("invalid_timestamp" if not timestamp_valid else
+                                                 "reverse_timestamp" if timestamp_reversed else
+                                                 "unknown_evidence",))
             previous = self.holder
             self.clear_effective_holder(ClearReason.EXPLICIT_RESET, frame_index=frame_index, timestamp=timestamp,
                                          frame_start=self.last_observed_frame,
@@ -778,6 +899,17 @@ class PossessionResolver:
                                      reason=("no_detection" if ball_lost else "evidence_loss",))
         if candidates:
             top = candidates[0]
+            if self.v4 and self._v4_invalid_candidate(top):
+                self.pending = None
+                if self.holder:
+                    self.gap_seconds += elapsed
+                    if self.gap_seconds >= self.grace:
+                        return self._lost_no_detection(frame_index, candidates, "grace_expired")
+                return self._observation(frame_index, PossessionState.CONTESTED,
+                                         candidates=candidates, observed=top,
+                                         reason=("legacy_candidate_without_v4_evidence"
+                                                 if not isinstance(top, V4CandidateEvidence)
+                                                 else "invalid_candidate_evidence",))
             if {"ambiguous_margin", "mask_bbox_disagreement"}.intersection(top.rejected_reasons):
                 self.pending = None
                 if self.holder:
@@ -787,6 +919,9 @@ class PossessionResolver:
                 return self._observation(frame_index, PossessionState.CONTESTED, candidates=candidates,
                                          observed=top, reason=("ambiguous_spatial_evidence",))
             if self._key(top) == self.holder and top.score >= self.keep_threshold:
+                self.release_pending = None
+                if self.v4 and isinstance(top, V4CandidateEvidence) and top.holder_control_score < self.holder_control_score:
+                    self.release_pending = (frame_index, timestamp)
                 self.gap_seconds = 0.0
                 self.pending = None
                 self.last_observed_frame, self.last_observed_score = frame_index, top.score
@@ -794,6 +929,22 @@ class PossessionResolver:
                 return self._observation(frame_index, PossessionState.OBSERVED, top, candidates)
             top = candidates[0]
             if top.score <= 0:
+                if self._v4_invalid_candidate(top) and self.holder:
+                    self.gap_seconds += elapsed
+                    if self.gap_seconds >= self.grace:
+                        return self._lost_no_detection(frame_index, candidates, "grace_expired")
+                    return self._observation(frame_index, PossessionState.CONTESTED,
+                                             candidates=candidates, observed=top,
+                                             reason=("invalid_candidate_evidence",))
+                if self.v4 and self._key(top) == self.holder and isinstance(top, V4CandidateEvidence):
+                    started = self.release_pending or (frame_index, timestamp)
+                    release_elapsed = ((timestamp - started[1]) if timestamp is not None and started[1] is not None
+                                       else (frame_index - started[0]) / self.fps)
+                    if release_elapsed < self.release_persistence:
+                        self.release_pending = started
+                        return self._observation(frame_index, PossessionState.TRANSITIONING,
+                                                 candidates=candidates, observed=top,
+                                                 reason=("release_persistence",))
                 self.clear_effective_holder(ClearReason.LOOSE_BALL_CONFIRMED, frame_index=frame_index,
                                             timestamp=timestamp, frame_start=self.last_observed_frame,
                                             timestamp_start=self.last_observed_timestamp)
@@ -830,9 +981,15 @@ class PossessionResolver:
                                          candidates=candidates, observed=top,
                                          reason=("below_keep_threshold",))
             if top.score - next((c.score for c in candidates if self._key(c) == self.holder), 0.0) >= self.hysteresis:
+                if self.v4 and not self._v4_ready(top, candidates):
+                    self.pending = None
+                    return self._observation(frame_index, PossessionState.TRANSITIONING,
+                                             candidates=candidates, observed=top,
+                                             reason=("acquisition_evidence_required",))
                 key = self._key(top)
+                required_persistence = self.acquisition_persistence if self.v4 else self.persistence
                 accumulated = self.pending[1] + elapsed if self.pending and self.pending[0] == key else elapsed
-                if self.pending and self.pending[0] == key and accumulated >= self.persistence:
+                if self.pending and self.pending[0] == key and accumulated >= required_persistence:
                     self.confirm_switch(top, frame_index=frame_index, timestamp=timestamp)
                     self.gap_seconds = 0.0
                     self.last_observed_frame, self.last_observed_score = frame_index, top.score
@@ -856,6 +1013,8 @@ class PossessionResolver:
 
     def confirm_switch(self, candidate, *, frame_index=None, timestamp=None):
         """The sole mutation path for an effective holder change."""
+        if self._v4_invalid_candidate(candidate):
+            return self.holder
         if not isinstance(candidate, CandidateEvidence) or self._key(candidate) is None:
             raise ValueError("confirmed switch requires an identified candidate")
         if self.holder_stable is not None and candidate.stable_player_id is None:

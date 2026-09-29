@@ -235,22 +235,41 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
                                                      if config.possession_v4_enabled else config.possession_v3_hysteresis_margin),
                                   ambiguity_margin=(config.possession_v4_ambiguity_margin
                                                     if config.possession_v4_enabled else None),
-                                  persistence_seconds=config.possession_v3_persistence_seconds,
-                                  profile=config.possession_v3_calibration_profile)
+                                   persistence_seconds=config.possession_v3_persistence_seconds,
+                                   v4=config.possession_v4_enabled,
+                                   holder_control_score=(config.holder_control_score
+                                                         if config.possession_v4_enabled else .55),
+                                   holder_release_score=(config.holder_release_score
+                                                         if config.possession_v4_enabled else .35),
+                                   challenger_acquisition_score=(config.challenger_acquisition_score
+                                                                 if config.possession_v4_enabled else .6),
+                                   release_persistence_seconds=(config.possession_v4_release_persistence_seconds
+                                                                if config.possession_v4_enabled else 0.0),
+                                   acquisition_persistence_seconds=(config.possession_v4_acquisition_persistence_seconds
+                                                                   if config.possession_v4_enabled else 0.0),
+                                   profile=config.possession_v3_calibration_profile)
     observations = []
+    previous_ball = None
+    previous_players = None
     for frame in sorted(set(by_frame) | set(balls)):
         ball = balls.get(frame)
         scorer = score_candidates_v4 if config.possession_v4_enabled else score_candidates
         candidates = scorer(by_frame.get(frame, []), ball, previous_holder=resolver.holder_stable,
                             ambiguity_margin=(config.possession_v4_ambiguity_margin
                                               if config.possession_v4_enabled else config.possession_v3_hysteresis_margin),
-                            **({"disagreement_score": config.possession_v4_spatial_disagreement_score}
-                               if config.possession_v4_enabled else {}))
+                             **({"disagreement_score": config.possession_v4_spatial_disagreement_score,
+                                 "previous_ball": previous_ball,
+                                 "previous_players": previous_players}
+                                if config.possession_v4_enabled else {}))
         observation = resolver.resolve(frame, candidates, missing=ball is None,
                                        invalid=_v3_ball_row_invalid(ball),
                                        ball_lost=ball is not None and ball.get("track_state") == "lost",
                                        timestamp=ball.get("timestamp_seconds") if ball else None)
         observations.append(observation)
+        if ball is not None:
+            previous_ball = ball
+        if frame in by_frame:
+            previous_players = by_frame[frame]
     observations = debounce_reverted_switches(
         observations, real_fps=fps,
         window_seconds=config.possession_v3_reverted_switch_window_seconds,
