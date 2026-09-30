@@ -25,6 +25,43 @@ When `COURT_MODEL_ID` is configured and valid court keypoints are detected, the 
 
 The V2 Modal image sets `POSSESSION_ENGINE=v3`, so its existing stats adapter also writes the additive V3 artifacts. Run it with:
 
+### Restartable V2 stages
+
+Staged execution is opt-in. These native Modal CLI flags run the deployed methods through
+the normal `modal run` runner, so remote logs and failures remain visible:
+
+```bash
+# Command 1: persist tracking artifacts/bundles in one durable job
+modal run modal_app_v2.py --tracking-only --job-id game-03 \
+  --video-path clips/game_03.mp4
+
+# Command 2: run stats from the persisted tracking bundle
+modal run modal_app_v2.py --stats-only --job-id game-03
+```
+
+The two commands are equivalent to the existing `--staged` one-command flow,
+but make the tracking and stats retry boundary explicit.
+
+Tracking and stats use the `v2-job-data` Modal Volume at `/v2-job-data`. Each job stores
+`job.json`, the input video, and immutable `tracking/generations/<fingerprint>/` and
+`stats/generations/<fingerprint>/` directories. `current.json` is advanced atomically;
+incomplete or hash-invalid generations are ignored. Use the local replay command with an
+explicit job directory and generation to render saved tracking without inference:
+
+Direct stage retries may call `track_stage(job_id=...)` and `stats_stage(job_id=...)` separately;
+active leases reject duplicate workers, and matching completed generations are returned without
+recomputation. The local `main` command remains monolithic unless a caller explicitly uses the
+`--tracking-only`, `--staged`, or `--stats-only` flag. With neither flag, the monolithic behavior is unchanged.
+
+```text
+python scripts/tracking/debug_v2.py --job-id /v2-job-data/JOB_ID \
+  --generation GENERATION --output replay.mp4
+```
+
+The current timeout target remains 1800 seconds per invocation. Confirm GPU seconds and
+Volume retention in Modal before enabling staged routing in a caller. To roll back, omit
+staged routing and use `process`; no staged artifacts are consumed.
+
 ```bash
 modal run modal_app_v2.py --video-path clips/game_03.mp4 \
   --frame-start 60 --frame-end 130 --output-dir outputs/v2-game

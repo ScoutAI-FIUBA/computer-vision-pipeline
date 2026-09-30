@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import importlib
 import inspect
 import json
-import inspect
 import os
 import tempfile
 import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Mapping
 
 import modal
 
@@ -21,12 +24,16 @@ from pipeline.results import (
     _manifest_hash,
     _mask_filename,
     package_artifacts,
+    load_stage_generation,
+    publish_stage_generation,
+    stage_fingerprint,
 )
 from pipeline.config import PipelineConfig
 from pipeline.number_predictor import build_number_predictor
 from pipeline.detection import build_detector
-from pipeline.runner import run_stats_from_v2_observations
+from pipeline.runner import run_stats_from_v2_observations, run_stats_from_v2_generation
 from pipeline.runner_v2 import run_v2
+from pipeline.input_integrity import verify_sha256_file
 from pipeline.sam31_tracking import normalize_multiplex_output
 from pipeline.sam31_segments import (
     SAM31_MAX_NUM_OBJECTS,
@@ -63,6 +70,209 @@ model_cache = modal.Volume.from_name("scoutai-model-cache", create_if_missing=Tr
 tracknet_data = modal.Volume.from_name(
     "tracknet-data", environment_name="main", create_if_missing=False
 )
+V2_JOB_VOLUME_DIR = "/v2-job-data"
+v2_job_data = modal.Volume.from_name("v2-job-data", create_if_missing=True)
+V2_VOLUMES = {CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data, V2_JOB_VOLUME_DIR: v2_job_data}
+JOB_SCHEMA = "v2-job-1"
+JOB_LEASE_SECONDS = 1800
+MAX_JOB_ERRORS = 8
+
+
+def _job_path(root: Path, job_id: str) -> Path:
+    if not job_id or Path(job_id).name != job_id or job_id in {".", ".."}:
+        raise ValueError("invalid job_id")
+    return Path(root) / job_id
+
+
+def _job_input_path(job: Path, input_fingerprint: str) -> Path:
+    """Return the immutable input object for a content fingerprint."""
+    digest = input_fingerprint.removeprefix("sha256:")
+    if not digest or Path(digest).name != digest or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("invalid input fingerprint")
+    return Path(job) / "inputs" / f"{digest}.mp4"
+
+
+def _persist_job_input(job: Path, input_fingerprint: str, video_bytes: bytes) -> Path:
+    """Persist input by fingerprint; never overwrite another generation's input."""
+    path = _job_input_path(job, input_fingerprint)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    digest = input_fingerprint.removeprefix("sha256:")
+    if path.is_file():
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError("job input fingerprint collision")
+        return path
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_bytes(video_bytes)
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError("job input fingerprint collision")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def _committed_job_input(job: Path, input_fingerprint: str) -> Path:
+    """Resolve immutable inputs, or legacy inputs for manifests without them."""
+    if input_fingerprint.startswith("sha256:"):
+        versioned = _job_input_path(job, input_fingerprint)
+        return verify_sha256_file(versioned, input_fingerprint)
+    legacy = job / "input.mp4"
+    return legacy
+
+
+def read_job_manifest(root: Path, job_id: str | None = None) -> dict[str, Any]:
+    path = _job_path(root, job_id) / "job.json" if job_id else Path(root) / "job.json"
+    if not path.is_file():
+        raise ValueError(f"job manifest not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema", JOB_SCHEMA) != JOB_SCHEMA:
+        raise ValueError("unsupported job manifest schema")
+    return payload
+
+
+def write_job_manifest(root: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(manifest)
+    payload.setdefault("schema", JOB_SCHEMA)
+    payload.setdefault("job_id", Path(root).name)
+    payload.setdefault("state", "created")
+    payload.setdefault("attempts", {})
+    payload.setdefault("lease", None)
+    payload.setdefault("errors", [])
+    path = Path(root) / "job.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with (path.with_name(".job.lock")).open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return _write_job_manifest_unlocked(path, payload)
+
+
+def _write_job_manifest_unlocked(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+    return dict(payload)
+
+
+@contextmanager
+def _job_lock(root: Path, job_id: str):
+    job = _job_path(root, job_id)
+    job.mkdir(parents=True, exist_ok=True)
+    with (job / ".job.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield job
+
+
+def acquire_job_lease(root: Path, job_id: str, *, owner: str, now: float | None = None,
+                      lease_seconds: int = JOB_LEASE_SECONDS, stage: str | None = None,
+                      input_fingerprint: str | None = None,
+                      request_fingerprint: str | None = None) -> dict[str, Any]:
+    job = _job_path(root, job_id)
+    job.mkdir(parents=True, exist_ok=True)
+    path = job / "job.json"
+    lock_path = job / ".job.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if path.is_file():
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            if manifest.get("schema", JOB_SCHEMA) != JOB_SCHEMA:
+                raise ValueError("unsupported job manifest schema")
+        else:
+            manifest = {"schema": JOB_SCHEMA, "job_id": job_id, "state": "created",
+                        "attempts": {}, "lease": None, "errors": []}
+        now = time.time() if now is None else now
+        current = manifest.get("lease") or {}
+        if current.get("owner") and float(current.get("expires_at", 0)) > now and current.get("owner") != owner:
+            raise RuntimeError("active lease exists")
+        attempts = dict(manifest.get("attempts") or {})
+        stage = stage or manifest.get("stage", "tracking")
+        attempts[stage] = int(attempts.get(stage, 0)) + 1
+        manifest.update({"state": stage, "stage": stage, "attempts": attempts,
+                         "lease": {"owner": owner, "expires_at": now + lease_seconds}})
+        if input_fingerprint is not None:
+            manifest["input_fingerprint"] = input_fingerprint
+        if request_fingerprint is not None:
+            manifest["request_fingerprint"] = request_fingerprint
+        return _write_job_manifest_unlocked(path, manifest)
+
+
+def record_job_error(root: Path, job_id: str, stage: str, error: Exception) -> dict[str, Any]:
+    with _job_lock(root, job_id) as job:
+        path = job / "job.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        errors = list(manifest.get("errors") or [])
+        errors.append({"stage": stage, "error": f"{type(error).__name__}: {error}", "time": time.time()})
+        manifest["errors"] = errors[-MAX_JOB_ERRORS:]
+        manifest["state"] = "failed"
+        manifest["lease"] = None
+        return _write_job_manifest_unlocked(path, manifest)
+
+
+def _stage_owner(worker_id: str | None) -> str:
+    if worker_id:
+        return worker_id
+    for name in ("MODAL_TASK_ID", "MODAL_FUNCTION_CALL_ID", "MODAL_INVOCATION_ID", "MODAL_SANDBOX_ID"):
+        value = os.getenv(name)
+        if value:
+            return f"modal:{name}:{value}"
+    raise RuntimeError(
+        "unique worker identity is required; pass worker_id in tests or provide a Modal task/invocation identity"
+    )
+
+
+def _stats_progress(message: str) -> None:
+    print(f"[v2-stats] {message}", flush=True)
+
+
+def _assert_lease_owner(manifest: Mapping[str, Any], owner: str, *, now: float | None = None) -> None:
+    lease = manifest.get("lease") or {}
+    if lease.get("owner") != owner or float(lease.get("expires_at", 0)) <= (time.time() if now is None else now):
+        raise RuntimeError("lease ownership lost before finalization")
+
+
+def _assert_lease_available(root: Path, job_id: str, owner: str) -> None:
+    _assert_lease_owner(read_job_manifest(root, job_id), owner)
+
+
+def _finalize_stage(root: Path, job_id: str, *, owner: str, publish, manifest):
+    """Publish and update the job pointer while the lease check is held."""
+    with _job_lock(root, job_id) as job:
+        path = job / "job.json"
+        current = json.loads(path.read_text(encoding="utf-8"))
+        _assert_lease_owner(current, owner)
+        published = publish()
+        updates = manifest(published) if callable(manifest) else manifest
+        current.update(updates)
+        _write_job_manifest_unlocked(path, current)
+        return published
+
+
+def _record_job_error_if_owner(root: Path, job_id: str, stage: str, error: Exception, owner: str) -> None:
+    try:
+        with _job_lock(root, job_id) as job:
+            path = job / "job.json"
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            _assert_lease_owner(manifest, owner)
+            errors = list(manifest.get("errors") or [])
+            errors.append({"stage": stage, "error": f"{type(error).__name__}: {error}", "time": time.time()})
+            manifest.update({"errors": errors[-MAX_JOB_ERRORS:], "state": "failed", "lease": None})
+            _write_job_manifest_unlocked(path, manifest)
+    except RuntimeError:
+        # A newer worker owns the job; never let a stale worker clear its lease.
+        return
+
+
+def _find_matching_generation(root: Path, *, input_fingerprint: str,
+                              request_fingerprint: str, tracking_generation: str | None = None) -> dict[str, Any] | None:
+    for path in sorted((Path(root) / "generations").glob("*/manifest.json")):
+        try:
+            manifest = load_stage_generation(Path(root), path.parent.name)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if (manifest.get("input_fingerprint"), manifest.get("request_fingerprint"),
+                manifest.get("tracking_generation")) == (input_fingerprint, request_fingerprint, tracking_generation):
+            return manifest
+    return None
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -460,36 +670,54 @@ def _segment_float_setting(value: float | None, env_name: str, default: float) -
     )
 
 
+def _config_fingerprint(config: PipelineConfig) -> dict[str, Any]:
+    values = asdict(config)
+    values.pop("roboflow_api_key", None)
+    return values
+
+
+def _tracking_stage_fingerprint(
+    prompt: str, frame_start: int, frame_end: int, segmented: bool | None,
+    segment_window: int | None, segment_overlap: int | None,
+    segment_seam_min_score: float | None, segment_seam_ambiguity_margin: float | None,
+    config: PipelineConfig,
+) -> str:
+    return stage_fingerprint(
+        "tracking", prompt, frame_start, frame_end,
+        {
+            "segmented": _segmented_enabled(segmented),
+            "segment_window": _segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
+            "segment_overlap": _segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
+            "seam_min_score": _segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
+            "seam_ambiguity_margin": _segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
+            "max_num_objects": SAM31_MAX_NUM_OBJECTS,
+            "reid_backend": os.getenv("REID_BACKEND", "osnet"),
+            "team_embedder_backend": os.getenv("TEAM_EMBEDDER_BACKEND", "siglip"),
+            "team_embedder_model_id": os.getenv("TEAM_EMBEDDER_MODEL_ID", "Marqo/marqo-fashionSigLIP"),
+        },
+        _config_fingerprint(config),
+    )
+
+
+def _stats_stage_fingerprint(possession_engine: str | None, generation: str, config: PipelineConfig) -> str:
+    return stage_fingerprint(
+        "stats", possession_engine or config.possession_engine, generation, _config_fingerprint(config)
+    )
+
+
 @app.cls(
     image=image,
     gpu="A100-80GB",
-    volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data},
+    # volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data}
+    volumes=V2_VOLUMES,
     secrets=[hf_secret, roboflow_secret],
     timeout=1800,
 )
 class PipelineV2:
     @modal.enter()
     def load_models(self) -> None:
-        """Warm SAM, ReID, and team models once per Modal container."""
-        from pipeline.reid import build_embedder
-        from pipeline.runner_v2 import (
-            ConservativeStableIdentityResolver,
-            RunnerV2Seams,
-            RuntimeIdentityAuthority,
-        )
-        from pipeline.team_embedder import build_team_embedder
-
-        self._ensure_predictor()
-        reid_backend = os.getenv("REID_BACKEND", "osnet")
-        team_backend = os.getenv("TEAM_EMBEDDER_BACKEND", "siglip")
-        team_model_id = os.getenv("TEAM_EMBEDDER_MODEL_ID", "Marqo/marqo-fashionSigLIP")
-        self.seams = RunnerV2Seams(
-            identity=ConservativeStableIdentityResolver(),
-            reid=build_embedder(reid_backend, weights=f"{CACHE_DIR}/reid/osnet_x1_0_msmt17.pt"),
-            team_embedder=build_team_embedder(team_backend, model_id=team_model_id),
-            identity_authority=RuntimeIdentityAuthority(),
-        )
-        model_cache.commit()
+        """Keep container startup cheap; stages initialize models on demand."""
+        self._models_loaded = True
 
     def _ensure_predictor(self) -> Any:
         if hasattr(self, "predictor"):
@@ -503,6 +731,238 @@ class PipelineV2:
         )
         model_cache.commit()
         return self.predictor
+
+    def _ensure_seams(self) -> Any:
+        if hasattr(self, "seams"):
+            return self.seams
+        from pipeline.reid import build_embedder
+        from pipeline.runner_v2 import (
+            ConservativeStableIdentityResolver,
+            RunnerV2Seams,
+            RuntimeIdentityAuthority,
+        )
+        from pipeline.team_embedder import build_team_embedder
+
+        self.seams = RunnerV2Seams(
+            identity=ConservativeStableIdentityResolver(),
+            reid=build_embedder(
+                os.getenv("REID_BACKEND", "osnet"),
+                weights=f"{CACHE_DIR}/reid/osnet_x1_0_msmt17.pt",
+            ),
+            team_embedder=build_team_embedder(
+                os.getenv("TEAM_EMBEDDER_BACKEND", "siglip"),
+                model_id=os.getenv("TEAM_EMBEDDER_MODEL_ID", "Marqo/marqo-fashionSigLIP"),
+            ),
+            identity_authority=RuntimeIdentityAuthority(),
+        )
+        model_cache.commit()
+        return self.seams
+
+    def _job_dir(self, job_id: str) -> Path:
+        return _job_path(Path(V2_JOB_VOLUME_DIR), job_id)
+
+    def _track_stage(
+        self, *, job_id: str, video_bytes: bytes, prompt: str = "basketball player on the court",
+        frame_start: int = 60, frame_end: int = 130, segmented: bool | None = None,
+        segment_window: int | None = None, segment_overlap: int | None = None,
+        segment_seam_min_score: float | None = None,
+        segment_seam_ambiguity_margin: float | None = None,
+        worker_id: str | None = None,
+        return_payload: bool = False,
+    ) -> dict[str, Any]:
+        """Persist tracking evidence once; retries return the matching generation."""
+        validate_entrypoint_args(video_bytes=video_bytes, prompt=prompt,
+                                 frame_start=frame_start, frame_end=frame_end)
+        job = self._job_dir(job_id)
+        job.mkdir(parents=True, exist_ok=True)
+        input_fingerprint = f"sha256:{hashlib.sha256(video_bytes).hexdigest()}"
+        config = PipelineConfig.from_env()
+        request_fingerprint = _tracking_stage_fingerprint(
+            prompt, frame_start, frame_end, segmented, segment_window, segment_overlap,
+            segment_seam_min_score, segment_seam_ambiguity_margin, config,
+        )
+        manifest_path = job / "job.json"
+        if manifest_path.is_file():
+            existing = read_job_manifest(job)
+            if (existing.get("input_fingerprint"), existing.get("request_fingerprint")) == (input_fingerprint, request_fingerprint):
+                try:
+                    generation = load_stage_generation(job / "tracking", existing.get("tracking_generation"))
+                    return {"status": "tracked", "generation": generation["generation"], "fingerprint": input_fingerprint}
+                except ValueError:
+                    pass
+        owner = _stage_owner(worker_id)
+        acquired = False
+        try:
+            acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="tracking",
+                              input_fingerprint=input_fingerprint, request_fingerprint=request_fingerprint)
+            acquired = True
+            job = self._job_dir(job_id)
+            _persist_job_input(job, input_fingerprint, video_bytes)
+            with tempfile.TemporaryDirectory(prefix="v2-track-") as work:
+                root = Path(work)
+                source = root / "input.mp4"
+                source.write_bytes(video_bytes)
+                segmented_run = _segmented_enabled(segmented)
+                seams: list[dict[str, Any]] = []
+                if segmented_run:
+                    rows, masks = _track_segmented_video(
+                        self._ensure_predictor(), source, prompt, frame_start, frame_end, root,
+                        window=_segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
+                        overlap=_segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
+                        seam_min_score=_segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
+                        seam_ambiguity_margin=_segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
+                        seam_diagnostics=seams,
+                    )
+                else:
+                    rows, masks = _track_video(self._ensure_predictor(), source, prompt, frame_start, frame_end)
+                _add_mask_references(rows, masks)
+                if getattr(self, "_models_loaded", False):
+                    self._ensure_seams()
+                frames = _load_video_frames(source, frame_start, frame_end)
+                runner_kwargs = {
+                    "frames_by_index": frames,
+                    "masks_by_observation": masks,
+                    "bbox_sanitizer_config": config,
+                }
+                if hasattr(self, "seams"):
+                    runner_kwargs["seams"] = self.seams
+                tracking_result = run_v2(rows, **runner_kwargs)
+                if segmented_run:
+                    tracking_result.runtime_diagnostics = {
+                        **(getattr(tracking_result, "runtime_diagnostics", {}) or {}),
+                        "seam_diagnostics": seams,
+                    }
+                clean_masks = getattr(tracking_result, "cleaned_masks_by_observation", {})
+                _add_clean_mask_references(tracking_result.observations, clean_masks)
+                package = root / "package"
+                artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
+                if segmented_run:
+                    artifact_config.update({
+                        "sam31_segmented": True,
+                        "sam31_segment_window": _segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
+                        "sam31_segment_overlap": _segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
+                        "sam31_max_num_objects": SAM31_MAX_NUM_OBJECTS,
+                        "sam31_seam_min_score": _segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
+                        "sam31_seam_ambiguity_margin": _segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
+                        "sam31_seam_diagnostics": seams,
+                    })
+                sanitizer_metadata = getattr(tracking_result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
+                if sanitizer_metadata.get("corrected_count", 0) or sanitizer_metadata.get("unresolved_count", 0):
+                    artifact_config["bbox_sanitizer"] = sanitizer_metadata
+                package_artifacts(package, tracking_result.observations, masks, clean_masks=clean_masks,
+                                  input_fingerprint=input_fingerprint, frame_bounds=[frame_start, frame_end],
+                                  prompts=[prompt], config=artifact_config,
+                                  acceptance=getattr(tracking_result, "acceptance", {}),
+                                  acceptance_reasons=getattr(tracking_result, "acceptance_reasons", []))
+                artifacts = {
+                    ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+                    for path in package.rglob("*") if path.is_file()
+                }
+                generation = _finalize_stage(
+                    Path(V2_JOB_VOLUME_DIR), job_id, owner=owner,
+                    publish=lambda: publish_stage_generation(
+                        job / "tracking", stage="tracking",
+                        input_fingerprint=input_fingerprint,
+                        request_fingerprint=request_fingerprint, artifacts=artifacts,
+                        frame_bounds=[frame_start, frame_end],
+                    ),
+                    manifest=lambda published: {
+                        "state": "tracked", "stage": "tracking",
+                        "tracking_generation": published["generation"], "lease": None,
+                    },
+                )
+            result = {"status": "tracked", "generation": generation["generation"], "fingerprint": input_fingerprint}
+            if return_payload:
+                result["tracking_payload"] = {
+                    "observations": tracking_result.observations,
+                    "masks_by_observation": masks,
+                    "clean_masks_by_observation": clean_masks,
+                }
+            return result
+        except Exception as error:
+            if acquired:
+                _record_job_error_if_owner(Path(V2_JOB_VOLUME_DIR), job_id, "tracking", error, owner)
+            raise
+
+    @modal.method()
+    def track_stage(
+        self, *, job_id: str, video_bytes: bytes, prompt: str = "basketball player on the court",
+        frame_start: int = 60, frame_end: int = 130, segmented: bool | None = None,
+        segment_window: int | None = None, segment_overlap: int | None = None,
+        segment_seam_min_score: float | None = None,
+        segment_seam_ambiguity_margin: float | None = None,
+        worker_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._track_stage(
+            job_id=job_id, video_bytes=video_bytes, prompt=prompt,
+            frame_start=frame_start, frame_end=frame_end, segmented=segmented,
+            segment_window=segment_window, segment_overlap=segment_overlap,
+            segment_seam_min_score=segment_seam_min_score,
+            segment_seam_ambiguity_margin=segment_seam_ambiguity_margin,
+            worker_id=worker_id,
+        )
+
+    def _stats_stage(self, *, job_id: str, possession_engine: str | None = None,
+                     worker_id: str | None = None, tracking_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Consume one validated tracking generation and publish bounded stats metadata."""
+        job = self._job_dir(job_id)
+        started = time.perf_counter()
+        _stats_progress("job manifest read start")
+        manifest = read_job_manifest(job)
+        _stats_progress(f"job manifest read complete: elapsed={time.perf_counter() - started:.2f}s")
+        started = time.perf_counter()
+        _stats_progress("stage generation validation/hash checks start")
+        generation = load_stage_generation(job / "tracking", manifest.get("tracking_generation"))
+        _stats_progress(
+            "stage generation validation/hash checks complete: "
+            f"elapsed={time.perf_counter() - started:.2f}s"
+        )
+        generation_dir = job / "tracking" / "generations" / generation["generation"]
+        config = PipelineConfig.from_env(**({"possession_engine": possession_engine} if possession_engine else {}))
+        stats_request = _stats_stage_fingerprint(possession_engine, generation["generation"], config)
+        existing = _find_matching_generation(job / "stats", input_fingerprint=manifest["input_fingerprint"],
+                                             request_fingerprint=stats_request,
+                                             tracking_generation=generation["generation"])
+        if existing is not None:
+            return {"status": "complete", "generation": existing["generation"],
+                    "tracking_generation": generation["generation"]}
+        try:
+            owner = _stage_owner(worker_id)
+            acquired = False
+            acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="stats",
+                              input_fingerprint=manifest["input_fingerprint"], request_fingerprint=stats_request)
+            acquired = True
+            with tempfile.TemporaryDirectory(prefix="v2-stats-") as work:
+                output = Path(work) / "stats"
+                _stats_progress("stats start")
+                result = run_stats_from_v2_generation(
+                    _committed_job_input(job, generation["input_fingerprint"]), config,
+                    job / "tracking", output,
+                                                       generation, validated=True, tracking_payload=tracking_payload)
+                artifacts = {path.relative_to(output).as_posix(): path for path in output.rglob("*") if path.is_file()}
+                published = _finalize_stage(
+                    Path(V2_JOB_VOLUME_DIR), job_id, owner=owner,
+                    publish=lambda: publish_stage_generation(
+                        job / "stats", stage="stats",
+                        input_fingerprint=manifest["input_fingerprint"],
+                        request_fingerprint=stats_request,
+                        tracking_generation=generation["generation"], artifacts=artifacts,
+                        frame_bounds=generation["frame_bounds"],
+                    ),
+                    manifest=lambda published: {
+                        "state": "complete", "stats_generation": published["generation"], "lease": None,
+                    },
+                )
+            return {"status": "complete", "generation": published["generation"], "tracking_generation": generation["generation"]}
+        except Exception as error:
+            if acquired:
+                _record_job_error_if_owner(Path(V2_JOB_VOLUME_DIR), job_id, "stats", error, owner)
+            raise
+
+    @modal.method()
+    def stats_stage(self, *, job_id: str, possession_engine: str | None = None,
+                    worker_id: str | None = None) -> dict[str, Any]:
+        return self._stats_stage(job_id=job_id, possession_engine=possession_engine, worker_id=worker_id)
 
     @modal.method()
     def process(
@@ -521,7 +981,20 @@ class PipelineV2:
         segment_seam_min_score: float | None = None,
         segment_seam_ambiguity_margin: float | None = None,
         possession_engine: str | None = None,
+        staged: bool = False,
+        job_id: str | None = None,
     ) -> dict[str, Any]:
+        if staged:
+            if not job_id:
+                raise ValueError("job_id is required for staged execution")
+            tracking = self._track_stage(video_bytes=video_bytes, prompt=prompt, frame_start=frame_start,
+                                         frame_end=frame_end, job_id=job_id, segmented=segmented,
+                                         segment_window=segment_window, segment_overlap=segment_overlap,
+                                         segment_seam_min_score=segment_seam_min_score,
+                                         segment_seam_ambiguity_margin=segment_seam_ambiguity_margin,
+                                         return_payload=True)
+            return self._stats_stage(job_id=job_id, possession_engine=possession_engine,
+                                     tracking_payload=tracking.get("tracking_payload"))
         if possession_engine is not None:
             _validate_possession_engine(possession_engine)
         validate_entrypoint_args(
@@ -539,6 +1012,8 @@ class PipelineV2:
             print("[v2] progress=0")
             try:
                 segmented_run = _segmented_enabled(segmented)
+                if getattr(self, "_models_loaded", False):
+                    self._ensure_seams()
                 seam_diagnostics: list[dict[str, Any]] = []
                 if segmented_run:
                     rows, masks = _track_segmented_video(
@@ -662,6 +1137,22 @@ class PipelineV2:
             return payload
 
 
+def _validate_local_entrypoint_mode(
+    *, video_path: str, job_id: str, staged: bool, stats_only: bool, tracking_only: bool
+) -> None:
+    selected_modes = sum((staged, stats_only, tracking_only))
+    if selected_modes > 1:
+        raise ValueError("--staged, --stats-only, and --tracking-only are mutually exclusive")
+    if selected_modes and not job_id:
+        raise ValueError("--job-id is required with --staged, --stats-only, or --tracking-only")
+    if job_id and not selected_modes:
+        raise ValueError("--job-id requires --staged or --stats-only")
+    if stats_only and video_path:
+        raise ValueError("--video-path cannot be used with --stats-only")
+    if not stats_only and not video_path:
+        raise ValueError("--video-path is required")
+
+
 @app.local_entrypoint()
 def main(
     video_path: str = "",
@@ -674,33 +1165,67 @@ def main(
     segmented: bool | None = None,
     segment_window: int | None = None,
     segment_overlap: int | None = None,
+    segment_seam_min_score: float | None = None,
+    segment_seam_ambiguity_margin: float | None = None,
     possession_engine: str = "v3",
+    staged: bool = False,
+    stats_only: bool = False,
+    tracking_only: bool = False,
+    job_id: str = "",
 ) -> None:
-    if not video_path:
-        raise ValueError("--video-path is required")
-    source = Path(video_path)
-    if not source.is_file():
-        raise SystemExit(f"Video not found: {source}")
-    video_bytes = source.read_bytes()
-    validate_entrypoint_args(
-        video_bytes=video_bytes,
-        prompt=prompt,
-        frame_start=frame_start,
-        frame_end=frame_end,
+    _validate_local_entrypoint_mode(
+        video_path=video_path, job_id=job_id, staged=staged, stats_only=stats_only,
+        tracking_only=tracking_only,
     )
-    payload = PipelineV2().process.remote(
-        video_bytes=video_bytes,
-        prompt=prompt,
-        frame_start=frame_start,
-        frame_end=frame_end,
-        return_artifacts=bool(output_dir),
-        return_diagnostics=return_diagnostics,
-        segmented=segmented,
-        segment_window=segment_window,
-        segment_overlap=segment_overlap,
-        possession_engine=possession_engine,
-        max_artifact_bytes=max_artifact_bytes or None,
-    )
+    _validate_possession_engine(possession_engine)
+
+    pipeline = PipelineV2()
+    if stats_only:
+        payload = pipeline.stats_stage.remote(
+            job_id=job_id, possession_engine=possession_engine
+        )
+    else:
+        source = Path(video_path)
+        if not source.is_file():
+            raise SystemExit(f"Video not found: {source}")
+        video_bytes = source.read_bytes()
+        validate_entrypoint_args(
+            video_bytes=video_bytes,
+            prompt=prompt,
+            frame_start=frame_start,
+            frame_end=frame_end,
+        )
+        if tracking_only:
+            payload = pipeline.track_stage.remote(
+                job_id=job_id,
+                video_bytes=video_bytes,
+                prompt=prompt,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                segmented=segmented,
+                segment_window=segment_window,
+                segment_overlap=segment_overlap,
+                segment_seam_min_score=segment_seam_min_score,
+                segment_seam_ambiguity_margin=segment_seam_ambiguity_margin,
+            )
+        else:
+            payload = pipeline.process.remote(
+                video_bytes=video_bytes,
+                prompt=prompt,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                return_artifacts=bool(output_dir),
+                return_diagnostics=return_diagnostics,
+                segmented=segmented,
+                segment_window=segment_window,
+                segment_overlap=segment_overlap,
+                segment_seam_min_score=segment_seam_min_score,
+                segment_seam_ambiguity_margin=segment_seam_ambiguity_margin,
+                possession_engine=possession_engine,
+                max_artifact_bytes=max_artifact_bytes or None,
+                staged=staged,
+                job_id=job_id or None,
+            )
     artifacts = payload.pop("artifacts", None)
     print(json.dumps(payload, indent=2, sort_keys=True))
     if artifacts is not None:

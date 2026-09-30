@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import os
+import tarfile
 import time
 from pathlib import Path
 
@@ -12,7 +14,10 @@ import cv2
 import numpy as np
 import pytest
 
-from pipeline.results import PipelineResults, RunSummary, package_artifacts, write_v3_artifacts
+from pipeline.results import (
+    PipelineResults, RunSummary, package_artifacts, write_v3_artifacts,
+    stage_fingerprint, publish_stage_generation, validate_stage_generation, load_stage_generation,
+)
 from pipeline.possession_v3 import (
     BallTransition, EventType, PossessionEvent, PossessionObservation,
     PossessionState, EvidenceKind, Provenance, PossessionContext, PossessionAudit,
@@ -37,6 +42,149 @@ def _observations() -> list[dict]:
             "track_state": "tracked",
         }
     ]
+
+
+def _valid_tracking_artifacts(root: Path, input_fingerprint: str = "input-a", frame_bounds: list[int] | None = None):
+    package = root / "package"
+    package_artifacts(package, [], {}, input_fingerprint=input_fingerprint, frame_bounds=frame_bounds or [0, 0])
+    return {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+
+
+def test_stage_fingerprint_is_canonical_and_changes_with_inputs():
+    assert stage_fingerprint({"b": 2, "a": 1}) == stage_fingerprint({"a": 1, "b": 2})
+    assert stage_fingerprint({"a": 1}) != stage_fingerprint({"a": 2})
+
+
+def test_stage_generation_is_atomic_and_validated(tmp_path: Path):
+    generation = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts=_valid_tracking_artifacts(tmp_path, frame_bounds=[1, 1]), frame_bounds=[1, 1],
+    )
+    assert generation["complete"] is True
+    assert validate_stage_generation(tmp_path, generation) == generation
+    assert json.loads((tmp_path / "current.json").read_text())["generation"] == generation["generation"]
+
+
+def test_loading_generation_rejects_manifest_from_another_generation(tmp_path: Path):
+    first = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts=_valid_tracking_artifacts(tmp_path, frame_bounds=[1, 1]), frame_bounds=[1, 1],
+    )
+    second = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-b", request_fingerprint="request-b",
+        artifacts={"tracks.jsonl": b"tracks-b", "tracking-manifest.json": b"{}"}, frame_bounds=[2, 2],
+    )
+    manifest_path = tmp_path / "generations" / first["generation"] / "manifest.json"
+    manifest_path.write_text(
+        (tmp_path / "generations" / second["generation"] / "manifest.json").read_text(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid generation"):
+        load_stage_generation(tmp_path, first["generation"])
+
+
+def test_stage_generation_recomputes_fingerprint_from_published_artifact_bytes(tmp_path: Path):
+    generation = publish_stage_generation(
+        tmp_path, stage="stats", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts={"results.json": b"old"}, frame_bounds=[1, 1], tracking_generation="tracking-a",
+    )
+    manifest_path = tmp_path / "generations" / generation["generation"] / "manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    artifact = tmp_path / "generations" / generation["generation"] / "results.json"
+    artifact.write_bytes(b"new")
+    payload["artifacts"]["results.json"]["sha256"] = hashlib.sha256(b"new").hexdigest()
+    payload["artifacts"]["results.json"]["size_bytes"] = 3
+    payload["manifest_sha256"] = hashlib.sha256(
+        json.dumps({key: value for key, value in payload.items() if key != "manifest_sha256"},
+                   sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="generation fingerprint"):
+        validate_stage_generation(tmp_path, payload)
+
+
+def test_tracking_generation_rejects_invalid_embedded_package_manifest(tmp_path: Path):
+    generation = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts={"tracks.jsonl": b"tracks", "tracking-manifest.json": b"{}"}, frame_bounds=[1, 1],
+    )
+
+    with pytest.raises(ValueError, match="embedded|package|schema"):
+        validate_stage_generation(tmp_path, generation)
+
+
+def test_tracking_generation_rejects_embedded_reference_hash_mismatch(tmp_path: Path):
+    package = {
+        "schema": "sam31-artifacts", "schema_version": 1, "input_fingerprint": "input-a",
+        "frame_bounds": [1, 1], "prompts": ["player"], "config": {}, "benchmark": {},
+        "acceptance": {}, "acceptance_reasons": [], "observation_count": 1,
+        "mask_encoding": "PNG uint8 lossless", "transfer_errors": [], "truncated": False,
+        "complete": True, "artifacts": {
+            "manifest": {"key": "manifest.json"},
+            "tracks": {"key": "tracks.jsonl", "size_bytes": 6, "sha256": "bad"},
+            "masks": {"key": "masks/", "count": 0, "missing": [], "references": {}},
+        },
+    }
+    package["artifacts"]["manifest"]["sha256"] = __import__("pipeline.results", fromlist=["_manifest_hash"])._manifest_hash(package)
+    generation = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts={"tracks.jsonl": b"tracks", "tracking-manifest.json": json.dumps(package).encode()}, frame_bounds=[1, 1],
+    )
+
+    with pytest.raises(ValueError, match="embedded|hash"):
+        validate_stage_generation(tmp_path, generation)
+
+
+def test_stage_generation_rejects_hash_changes_and_preserves_previous_pointer(tmp_path: Path):
+    previous = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts=_valid_tracking_artifacts(tmp_path, frame_bounds=[0, 0]), frame_bounds=[0, 0],
+    )
+    path = tmp_path / "generations" / previous["generation"] / "tracks.jsonl"
+    path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="hash"):
+        validate_stage_generation(tmp_path, previous)
+    assert json.loads((tmp_path / "current.json").read_text())["generation"] == previous["generation"]
+
+
+def test_stage_generation_requires_complete_tracking_contract(tmp_path: Path):
+    generation = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts={"tracks.jsonl": b"old", "tracking-manifest.json": b"{}"}, frame_bounds=[1, 1],
+    )
+    path = tmp_path / "generations" / generation["generation"] / "manifest.json"
+    payload = json.loads(path.read_text())
+    payload["frame_bounds"] = None
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="frame_bounds|manifest hash"):
+        validate_stage_generation(tmp_path, payload)
+
+
+def test_stage_generation_pointer_failure_keeps_prior_generation(tmp_path: Path, monkeypatch):
+    previous = publish_stage_generation(
+        tmp_path, stage="tracking", input_fingerprint="input-a", request_fingerprint="request-a",
+        artifacts=_valid_tracking_artifacts(tmp_path, frame_bounds=[0, 0]),
+    )
+    from pipeline import results as results_module
+    original = results_module.os.replace
+
+    def fail_pointer(source, destination):
+        if Path(destination).name == "current.json":
+            raise OSError("pointer publication failed")
+        return original(source, destination)
+
+    monkeypatch.setattr(results_module.os, "replace", fail_pointer)
+    with pytest.raises(OSError, match="pointer publication failed"):
+        publish_stage_generation(
+            tmp_path, stage="tracking", input_fingerprint="input-b", request_fingerprint="request-b",
+            artifacts={"tracks.jsonl": b"new", "tracking-manifest.json": b"{}"},
+        )
+    assert json.loads((tmp_path / "current.json").read_text())["generation"] == previous["generation"]
 
 
 def test_package_writes_manifest_tracks_and_lossless_mask(tmp_path: Path):
@@ -97,6 +245,91 @@ def test_package_adds_optional_clean_mask_without_replacing_raw_mask(tmp_path: P
     assert written["clean_mask_ref"] == "masks_clean/" + manifest["artifacts"]["clean_masks"]["references"]["60:3"]["key"].rsplit("/", 1)[-1]
     clean_key = manifest["artifacts"]["clean_masks"]["references"]["60:3"]["key"]
     assert cv2.imread(str(tmp_path / clean_key), cv2.IMREAD_UNCHANGED) is not None
+
+
+def test_package_writes_hashed_raw_and_clean_mask_bundles(tmp_path: Path):
+    manifest = package_artifacts(
+        tmp_path,
+        _observations(),
+        {"60:3": np.ones((2, 2), dtype=np.uint8)},
+        clean_masks={"60:3": np.eye(2, dtype=np.uint8)},
+    )
+
+    for name, filename in (("masks", "masks.tar"), ("clean_masks", "masks_clean.tar")):
+        bundle = manifest["artifacts"][name]["bundle"]
+        assert bundle["key"] == filename
+        assert bundle["sha256"] == hashlib.sha256((tmp_path / filename).read_bytes()).hexdigest()
+        with tarfile.open(tmp_path / filename) as archive:
+            assert archive.getnames() == [
+                manifest["artifacts"][name]["references"]["60:3"]["key"].rsplit("/", 1)[-1]
+            ]
+
+
+def test_validate_stage_generation_checks_declared_mask_bundle_hash(tmp_path: Path):
+    package = tmp_path / "package"
+    package_artifacts(package, _observations(), {"60:3": np.ones((2, 2), dtype=np.uint8)},
+                      input_fingerprint="input", frame_bounds=[0, 0])
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    bundle = tmp_path / "tracking" / "generations" / generation["generation"] / "masks.tar"
+    bundle.write_bytes(bundle.read_bytes() + b"corrupt")
+
+    with pytest.raises(ValueError, match="hash mismatch: masks.tar"):
+        validate_stage_generation(tmp_path / "tracking", generation)
+
+
+@pytest.mark.parametrize("group_name", ["masks", "clean_masks"])
+@pytest.mark.parametrize("tamper", ["content", "extra"])
+def test_validate_stage_generation_checks_bundle_content_and_exact_members(
+    tmp_path: Path, group_name: str, tamper: str,
+):
+    package = tmp_path / "package"
+    package_artifacts(
+        package, _observations(), {"60:3": np.ones((2, 2), dtype=np.uint8)},
+        {"60:3": np.eye(2, dtype=np.uint8)}, input_fingerprint="input", frame_bounds=[0, 0],
+    )
+    bundle_path = package / ("masks.tar" if group_name == "masks" else "masks_clean.tar")
+    with tarfile.open(bundle_path) as source:
+        members = [(member.name, source.extractfile(member).read()) for member in source.getmembers()]
+    if tamper == "content":
+        encoded = cv2.imencode(".png", np.zeros((2, 2), dtype=np.uint8))[1].tobytes()
+        members[0] = (members[0][0], encoded)
+    else:
+        members.append(("extra.png", members[0][1]))
+    with tarfile.open(bundle_path, "w") as archive:
+        for name, data in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+
+    manifest_path = package / "manifest.json"
+    package_manifest = json.loads(manifest_path.read_text())
+    bundle = package_manifest["artifacts"][group_name]["bundle"]
+    bundle_bytes = bundle_path.read_bytes()
+    bundle["sha256"] = hashlib.sha256(bundle_bytes).hexdigest()
+    bundle["size_bytes"] = len(bundle_bytes)
+    package_manifest["artifacts"]["manifest"]["sha256"] = __import__(
+        "pipeline.results", fromlist=["_manifest_hash"]
+    )._manifest_hash(package_manifest)
+    manifest_path.write_text(json.dumps(package_manifest, sort_keys=True), encoding="utf-8")
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+
+    error = "bundle (content|member hash)" if tamper == "content" else "bundle members"
+    with pytest.raises(ValueError, match=error):
+        validate_stage_generation(tmp_path / "tracking", generation)
 
 
 def test_package_strips_runtime_bbox_coordinate_space_from_tracks(tmp_path: Path):

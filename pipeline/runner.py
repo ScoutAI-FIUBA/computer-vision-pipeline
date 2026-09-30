@@ -11,17 +11,22 @@ the output directory afterwards.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import logging
 import math
+import tarfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from numbers import Real
 from pathlib import Path
-from typing import Callable
+from pathlib import PurePosixPath
+from typing import Any, Callable
 
 import numpy as np
+import cv2
 
 from pipeline import appearance
 from pipeline.ball import (
@@ -56,7 +61,10 @@ from pipeline.possession_v3 import (
 )
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
 from pipeline.reid import Embedder, build_embedder
-from pipeline.results import RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter, write_v3_artifacts
+from pipeline.results import (
+    RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter, write_v3_artifacts,
+    validate_stage_generation,
+)
 from pipeline.shot_events import (
     flush_open_shot_event,
     shot_frame_signals,
@@ -1082,6 +1090,14 @@ class _BoundedProgress:
             )
 
 
+def _emit_file_batch_progress(
+    emit: Callable[[str], None], label: str, processed: int, total: int, *, batch_size: int = 100
+) -> None:
+    """Keep large artifact loads observable without logging every small-file read."""
+    if processed == total or processed % batch_size == 0:
+        emit(f"{label}: {processed}/{total} files")
+
+
 def run_stats_from_v2_observations(
     video_path: Path,
     config: PipelineConfig,
@@ -1271,6 +1287,148 @@ def run_stats_from_v2_observations(
     phase("artifact writing", lambda: results.write(output_dir / RESULTS_FILENAME))
     emit("stats complete")
     return results
+
+
+def run_stats_from_v2_generation(
+    video_path: Path, config: PipelineConfig, generation_root: Path, output_dir: Path,
+    manifest: dict, *, masks_by_observation=None, clean_masks_by_observation=None,
+    number_predictor=None, number_detector=None, validated: bool = False,
+    tracking_payload: Mapping[str, Any] | None = None,
+) -> PipelineResults:
+    """Validate and consume one immutable tracking generation without re-tracking."""
+    emit = lambda message: print(f"[v2-stats] {message}", flush=True)
+    if not validated:
+        validation_started = time.perf_counter()
+        emit("stage generation validation/hash checks start")
+        validate_stage_generation(Path(generation_root), manifest)
+        emit(
+            "stage generation validation/hash checks complete: "
+            f"elapsed={time.perf_counter() - validation_started:.2f}s"
+        )
+    generation = Path(generation_root) / "generations" / manifest["generation"]
+    if tracking_payload is not None:
+        observations = list(tracking_payload["observations"])
+        masks_by_observation = tracking_payload.get("masks_by_observation", {})
+        clean_masks_by_observation = tracking_payload.get("clean_masks_by_observation", {})
+        emit(f"in-memory tracking payload: {len(observations)} rows")
+        return run_stats_from_v2_observations(
+            video_path, config, output_dir, observations,
+            masks_by_observation=masks_by_observation,
+            clean_masks_by_observation=clean_masks_by_observation,
+            number_predictor=number_predictor, number_detector=number_detector,
+        )
+    package_manifest_path = generation / "tracking-manifest.json"
+    package_manifest = json.loads(package_manifest_path.read_text(encoding="utf-8"))
+    package_artifacts = package_manifest.get("artifacts", {})
+    tracks_ref = package_artifacts.get("tracks")
+    if not isinstance(tracks_ref, Mapping) or not isinstance(tracks_ref.get("key"), str):
+        raise ValueError("tracking contract does not declare tracks artifact")
+    tracks_path = generation / Path(tracks_ref["key"])
+    if not tracks_path.is_file():
+        raise ValueError("declared tracks artifact is missing")
+    tracks_started = time.perf_counter()
+    emit("tracks load start")
+    observations = [json.loads(line) for line in tracks_path.read_text(encoding="utf-8").splitlines() if line]
+    emit(
+        f"tracks load complete: {len(observations)} rows, "
+        f"elapsed={time.perf_counter() - tracks_started:.2f}s"
+    )
+
+    def load_masks(name: str) -> dict[str, np.ndarray]:
+        group = package_artifacts.get(name, {})
+        references = group.get("references", {}) if isinstance(group, Mapping) else {}
+        loaded = {}
+        total = len(references)
+        started = time.perf_counter()
+        bundle = group.get("bundle") if isinstance(group, Mapping) else None
+        if isinstance(bundle, Mapping) and isinstance(bundle.get("key"), str):
+            bundle_key = bundle["key"]
+            bundle_parts = PurePosixPath(bundle_key)
+            if (bundle_parts.is_absolute() or "\\" in bundle_key
+                    or any(part in {"", ".", ".."} for part in bundle_parts.parts)):
+                raise ValueError(f"unsafe {name} bundle path")
+            bundle_path = generation / Path(bundle_key)
+            if not bundle_path.is_file():
+                raise ValueError(f"declared {name} bundle is missing")
+            emit(f"{name.replace('_', ' ')} bundle load start: {total} files")
+            try:
+                bundle_data = bundle_path.read_bytes()
+                with tarfile.open(fileobj=io.BytesIO(bundle_data), mode="r") as archive:
+                    members = archive.getmembers()
+                    member_names = set()
+                    for member in members:
+                        member_path = PurePosixPath(member.name)
+                        if (not member.isfile() or member_path.is_absolute() or "\\" in member.name
+                                or any(part in {"", ".", ".."} for part in member_path.parts)):
+                            raise ValueError(f"unsafe {name} bundle member")
+                        if member.name in member_names:
+                            raise ValueError(f"duplicate {name} bundle member")
+                        member_names.add(member.name)
+                    if (type(bundle.get("size_bytes")) is not int
+                            or bundle["size_bytes"] != len(bundle_data)
+                            or bundle.get("sha256") != hashlib.sha256(bundle_data).hexdigest()):
+                        raise ValueError(f"{name} bundle hash or size mismatch")
+                    expected_members = set()
+                    for index, (observation_key, reference) in enumerate(references.items(), 1):
+                        if not isinstance(reference, Mapping) or not isinstance(reference.get("key"), str):
+                            raise ValueError(f"invalid {name} artifact reference")
+                        member_name = Path(reference["key"]).name
+                        if member_name in expected_members:
+                            raise ValueError(f"duplicate {name} artifact reference")
+                        expected_members.add(member_name)
+                        try:
+                            member = archive.getmember(member_name)
+                        except KeyError as error:
+                            raise ValueError(f"missing {name} bundle member") from error
+                        handle = archive.extractfile(member)
+                        data = handle.read() if handle is not None else b""
+                        if (type(reference.get("size_bytes")) is not int
+                                or reference["size_bytes"] != len(data)
+                                or reference.get("sha256") != hashlib.sha256(data).hexdigest()):
+                            raise ValueError(f"{name} bundle member hash or size mismatch")
+                        mask = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                        if mask is None or mask.ndim != 2:
+                            raise ValueError(f"invalid {name} artifact")
+                        loaded[str(observation_key)] = mask
+                        _emit_file_batch_progress(emit, f"{name.replace('_', ' ')} bundle load", index, total)
+                    if member_names != expected_members:
+                        raise ValueError(f"{name} bundle members do not match references")
+            except (OSError, tarfile.TarError) as error:
+                raise ValueError(f"invalid {name} bundle") from error
+            emit(
+                f"{name.replace('_', ' ')} bundle load complete: {total} files, "
+                f"elapsed={time.perf_counter() - started:.2f}s"
+            )
+            return loaded
+        emit(f"{name.replace('_', ' ')} load start: {total} files")
+        for index, (observation_key, reference) in enumerate(references.items(), 1):
+            if not isinstance(reference, Mapping) or not isinstance(reference.get("key"), str):
+                raise ValueError(f"invalid {name} artifact reference")
+            path = generation / Path(reference["key"])
+            if not path.is_file():
+                raise ValueError(f"declared {name} artifact is missing")
+            mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if mask is None or mask.ndim != 2:
+                raise ValueError(f"invalid {name} artifact")
+            loaded[str(observation_key)] = mask
+            _emit_file_batch_progress(emit, f"{name.replace('_', ' ')} load", index, total)
+        if total == 0:
+            emit(f"{name.replace('_', ' ')} load: 0/0 files")
+        emit(
+            f"{name.replace('_', ' ')} load complete: {total} files, "
+            f"elapsed={time.perf_counter() - started:.2f}s"
+        )
+        return loaded
+
+    masks_by_observation = load_masks("masks")
+    clean_masks_by_observation = load_masks("clean_masks")
+    emit("stats start")
+    return run_stats_from_v2_observations(
+        video_path, config, output_dir, observations,
+        masks_by_observation=masks_by_observation,
+        clean_masks_by_observation=clean_masks_by_observation,
+        number_predictor=number_predictor, number_detector=number_detector,
+    )
 
 
 def run_pipeline(

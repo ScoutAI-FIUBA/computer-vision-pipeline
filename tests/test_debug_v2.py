@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -15,7 +16,9 @@ from scripts.tracking.debug_v2 import (
     render_debug_video,
     render_frame,
     validate_artifacts,
+    replay_generation,
 )
+from pipeline.results import package_artifacts, publish_stage_generation
 
 
 def _write_video(path: Path, count: int = 4) -> None:
@@ -47,6 +50,151 @@ def _write_artifacts(root: Path) -> None:
         "transfer_errors": [],
         "artifacts": {"tracks": {"key": "tracks.jsonl"}, "masks": {"key": "masks/", "missing": []}},
     }))
+
+
+def test_replay_generation_uses_explicit_validated_generation(tmp_path: Path):
+    source_video = tmp_path / "source.mp4"
+    video = tmp_path / "inputs"
+    _write_video(source_video, count=1)
+    input_fingerprint = "sha256:" + hashlib.sha256(source_video.read_bytes()).hexdigest()
+    video = video / f"{input_fingerprint.removeprefix('sha256:')}.mp4"
+    video.parent.mkdir()
+    source_video.replace(video)
+    source = tmp_path / "source"
+    (source / "masks").mkdir(parents=True)
+    cv2.imwrite(str(source / "masks" / "one.png"), np.zeros((24, 32), dtype=np.uint8))
+    (source / "tracks.jsonl").write_text(json.dumps({"frame_index": 0, "raw_track_id": 1,
+                                                       "bbox_xyxy": [1, 1, 10, 10],
+                                                       "mask_ref": "masks/one.png"}) + "\n")
+    package_artifacts(source, [], {}, input_fingerprint=input_fingerprint, frame_bounds=[0, 0])
+    published = publish_stage_generation(tmp_path / "tracking", stage="tracking",
+                                         input_fingerprint=input_fingerprint, request_fingerprint="request",
+                                         frame_bounds=[0, 0],
+                                         artifacts={
+                                             ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(source).as_posix()): path
+                                             for path in source.rglob("*") if path.is_file()
+                                         })
+    output = tmp_path / "replay.mp4"
+    result = replay_generation(tmp_path, published["generation"], output)
+    assert result["frames_written"] == 1
+    assert output.is_file()
+
+
+def test_replay_generation_falls_back_to_legacy_input(tmp_path: Path):
+    video = tmp_path / "input.mp4"
+    _write_video(video, count=1)
+    source = tmp_path / "source"
+    (source / "masks").mkdir(parents=True)
+    cv2.imwrite(str(source / "masks" / "one.png"), np.zeros((24, 32), dtype=np.uint8))
+    (source / "tracks.jsonl").write_text(json.dumps({
+        "frame_index": 0, "raw_track_id": 1, "bbox_xyxy": [1, 1, 10, 10], "mask_ref": "masks/one.png",
+    }) + "\n")
+    package_artifacts(source, [], {}, input_fingerprint="legacy", frame_bounds=[0, 0])
+    published = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="legacy", request_fingerprint="request",
+        frame_bounds=[0, 0], artifacts={
+            ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(source).as_posix()): path
+            for path in source.rglob("*") if path.is_file()
+        },
+    )
+
+    assert replay_generation(tmp_path, published["generation"], tmp_path / "replay.mp4")["frames_written"] == 1
+
+
+def test_replay_generation_does_not_fallback_when_immutable_input_is_missing(tmp_path: Path):
+    (tmp_path / "input.mp4").write_bytes(b"mutable legacy input")
+    fingerprint = "sha256:" + ("a" * 64)
+    source = tmp_path / "source"
+    (source / "masks").mkdir(parents=True)
+    cv2.imwrite(str(source / "masks" / "one.png"), np.zeros((24, 32), dtype=np.uint8))
+    (source / "tracks.jsonl").write_text(json.dumps({
+        "frame_index": 0, "raw_track_id": 1, "bbox_xyxy": [1, 1, 10, 10], "mask_ref": "masks/one.png",
+    }) + "\n")
+    package_artifacts(source, [], {}, input_fingerprint=fingerprint, frame_bounds=[0, 0])
+    published = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint=fingerprint,
+        request_fingerprint="request", frame_bounds=[0, 0],
+        artifacts={
+            ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(source).as_posix()): path
+            for path in source.rglob("*") if path.is_file()
+        },
+    )
+
+    with pytest.raises(ValueError, match="immutable job input is missing"):
+        replay_generation(tmp_path, published["generation"], tmp_path / "replay.mp4")
+
+
+def test_replay_generation_rejects_tampered_immutable_input(tmp_path: Path):
+    source_video = tmp_path / "source.mp4"
+    _write_video(source_video, count=1)
+    fingerprint = "sha256:" + hashlib.sha256(source_video.read_bytes()).hexdigest()
+    immutable = tmp_path / "inputs" / f"{fingerprint.removeprefix('sha256:')}.mp4"
+    immutable.parent.mkdir()
+    source_video.replace(immutable)
+    immutable.write_bytes(b"tampered video")
+
+    source = tmp_path / "source"
+    (source / "masks").mkdir(parents=True)
+    cv2.imwrite(str(source / "masks" / "one.png"), np.zeros((24, 32), dtype=np.uint8))
+    (source / "tracks.jsonl").write_text(json.dumps({
+        "frame_index": 0, "raw_track_id": 1, "bbox_xyxy": [1, 1, 10, 10], "mask_ref": "masks/one.png",
+    }) + "\n")
+    package_artifacts(source, [], {}, input_fingerprint=fingerprint, frame_bounds=[0, 0])
+    published = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint=fingerprint,
+        request_fingerprint="request", frame_bounds=[0, 0], artifacts={
+            ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(source).as_posix()): path
+            for path in source.rglob("*") if path.is_file()
+        },
+    )
+
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        replay_generation(tmp_path, published["generation"], tmp_path / "replay.mp4")
+
+
+def test_replay_generation_rejects_tampered_or_missing_generation_without_job_writes(tmp_path: Path):
+    with pytest.raises(ValueError, match="not found"):
+        replay_generation(tmp_path, "missing", tmp_path / "out.mp4")
+
+
+def test_replay_generation_rejects_hash_invalid_generation_without_output(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "tracks.jsonl").write_text("{}\n")
+    (source / "tracking-manifest.json").write_text("{}")
+    published = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        frame_bounds=[0, 0], artifacts={path.name: path for path in source.iterdir()},
+    )
+    (tmp_path / "tracking" / "generations" / published["generation"] / "tracks.jsonl").write_text("tampered")
+    output = tmp_path / "out.mp4"
+    with pytest.raises(ValueError, match="hash"):
+        replay_generation(tmp_path, published["generation"], output)
+    assert not output.exists()
+
+
+def test_replay_generation_rejects_incomplete_generation_without_any_writes(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "tracks.jsonl").write_text("{}\n")
+    (source / "tracking-manifest.json").write_text("{}")
+    published = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        frame_bounds=[0, 0], artifacts={path.name: path for path in source.iterdir()},
+    )
+    manifest_path = tmp_path / "tracking" / "generations" / published["generation"] / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["complete"] = False
+    manifest["manifest_sha256"] = "invalidated"
+    manifest_path.write_text(json.dumps(manifest))
+    before = sorted((path.relative_to(tmp_path), path.read_bytes()) for path in tmp_path.rglob("*") if path.is_file())
+
+    with pytest.raises(ValueError, match="incomplete|hash"):
+        replay_generation(tmp_path, published["generation"], tmp_path / "out.mp4")
+
+    after = sorted((path.relative_to(tmp_path), path.read_bytes()) for path in tmp_path.rglob("*") if path.is_file())
+    assert after == before
+    assert not (tmp_path / "out.mp4").exists()
 
 
 def test_render_frame_draws_mask_bbox_and_raw_label(tmp_path: Path):

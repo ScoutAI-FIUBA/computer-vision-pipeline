@@ -14,6 +14,8 @@ from typing import Any, Iterable, Mapping
 import cv2
 import numpy as np
 
+from pipeline.input_integrity import verify_sha256_file
+
 MAX_DRAW_COORDINATE = int(np.iinfo(np.int32).max) - 1
 TEAM_COLORS = {
     0: (0, 90, 255),
@@ -23,6 +25,39 @@ NEUTRAL_COLOR = (160, 255, 160)
 POSSESSION_STATUSES = {"confirmed", "unknown", "lost", "unassigned"}
 V3_STATES = {"OBSERVED", "INFERRED", "GRACE", "CONTESTED", "NO_POSSESSION", "UNKNOWN", "CANDIDATE", "TRANSITIONING", "LOST_NO_DETECTION"}
 NUMBER_STATUSES = {"confirmed", "ambiguous", "unknown"}
+
+
+def _replay_input_path(job_root: Path, input_fingerprint: Any) -> Path:
+    """Resolve a staged input without accepting a fingerprint as a path."""
+    if not isinstance(input_fingerprint, str) or not input_fingerprint:
+        raise ValueError("missing input fingerprint")
+    if input_fingerprint.startswith("sha256:"):
+        digest = input_fingerprint.removeprefix("sha256:")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("invalid input fingerprint")
+        immutable = job_root / "inputs" / f"{digest}.mp4"
+        return verify_sha256_file(immutable, input_fingerprint)
+    legacy = job_root / "input.mp4"
+    if legacy.is_file():
+        return legacy
+    raise ValueError(f"job input is missing for fingerprint: {input_fingerprint}")
+
+
+def replay_generation(job_root: Path, generation: str, output_path: Path, *,
+                      start_frame: int | None = None, end_frame: int | None = None) -> dict[str, int | None]:
+    """Render an explicitly selected durable tracking generation without inference."""
+    from pipeline.results import load_stage_generation
+
+    job_root = Path(job_root)
+    manifest = load_stage_generation(job_root / "tracking", generation)
+    if manifest.get("stage") != "tracking":
+        raise ValueError("selected generation is not a tracking generation")
+    generation_root = job_root / "tracking" / "generations" / generation
+    tracks = generation_root / "tracks.jsonl"
+    masks = generation_root / "masks"
+    input_path = _replay_input_path(job_root, manifest.get("input_fingerprint"))
+    return render_debug_video(input_path, tracks, masks, output_path,
+                              start_frame=start_frame, end_frame=end_frame)
 
 
 def load_observations(tracks_jsonl: Path) -> dict[int, list[dict[str, Any]]]:
@@ -201,6 +236,10 @@ def validate_artifacts(tracks_jsonl: Path, masks_dir: Path, *, allow_incomplete:
         raise ValueError(f"could not read artifact manifest: {manifest_path}") from error
     if not isinstance(manifest, dict):
         raise ValueError("invalid artifact manifest structure: expected an object")
+    if manifest.get("schema") == "v2-stage-1":
+        from pipeline.results import validate_stage_generation
+        validate_stage_generation(tracks_jsonl.parent.parent.parent, manifest)
+        return
 
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -515,7 +554,9 @@ def render_debug_video(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render SAM3.1 raw tracks and masks locally.")
-    parser.add_argument("--video-path", type=Path, required=True)
+    parser.add_argument("--video-path", type=Path)
+    parser.add_argument("--job-id", type=Path, help="Durable job directory for generation replay")
+    parser.add_argument("--generation", help="Explicit tracking generation to replay")
     parser.add_argument("--tracks-jsonl", type=Path)
     parser.add_argument("--masks-dir", type=Path)
     parser.add_argument("--artifact-dir", type=Path, help="Directory containing tracks.jsonl and masks/")
@@ -533,6 +574,16 @@ def main() -> None:
         help="Render despite an incomplete/truncated manifest (unsafe; default rejects it)",
     )
     args = parser.parse_args()
+
+    if args.job_id or args.generation:
+        if not args.job_id or not args.generation:
+            parser.error("--job-id and --generation must be provided together")
+        stats = replay_generation(args.job_id, args.generation, args.output,
+                                  start_frame=args.start_frame, end_frame=args.end_frame)
+        print(f"Wrote {stats['frames_written']} frames to {args.output}")
+        return
+    if args.video_path is None:
+        parser.error("--video-path is required unless --job-id and --generation are provided")
 
     artifact_dir = args.artifact_dir
     tracks_jsonl = args.tracks_jsonl or (artifact_dir / "tracks.jsonl" if artifact_dir else None)

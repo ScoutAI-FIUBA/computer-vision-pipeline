@@ -304,6 +304,10 @@ def _normalize_heatmap_output(output: Any, *, expected_seq_len: int) -> tuple[np
     return heatmap[0, channel_count - 1].astype(np.float32), metadata
 
 
+def _select_torch_device(torch_module: Any) -> Any:
+    return torch_module.device("cuda" if torch_module.cuda.is_available() else "cpu")
+
+
 class StubTrackNetDetector:
     def __init__(self, *, context_size: int, input_size: FrameSize) -> None:
         self.context_size = context_size
@@ -494,7 +498,8 @@ class PytorchTrackNetDetector:
                 x = self.up_block_3(x)
                 return self.sigmoid(self.predictor(x))
 
-        checkpoint_data = torch.load(checkpoint_path, map_location="cpu")
+        device = _select_torch_device(torch)
+        checkpoint_data = torch.load(checkpoint_path, map_location=device)
         state_dict = None
         if isinstance(checkpoint_data, dict):
             if isinstance(checkpoint_data.get("model"), dict):
@@ -520,7 +525,8 @@ class PytorchTrackNetDetector:
 
         model.eval()
         self._torch = torch
-        self._model = model
+        self._device = device
+        self._model = model.to(device)
         self.context_size = seq_len
         self.input_size = input_size
         self.backend_name = "pytorch"
@@ -534,9 +540,11 @@ class PytorchTrackNetDetector:
             raise ValueError(f"Expected {self.context_size} frames, got {len(frames)}")
 
         model_input = _build_tracknet_channels(frames, self.input_size, self.bg_mode)
-        with self._torch.no_grad():
-            output = self._model(self._torch.from_numpy(model_input))
-        heatmap, output_metadata = _normalize_heatmap_output(output.detach().cpu().numpy(), expected_seq_len=self.context_size)
+        with self._torch.inference_mode():
+            output = self._model(self._torch.from_numpy(model_input).to(self._device))
+        heatmap, output_metadata = _normalize_heatmap_output(
+            output.detach().float().cpu().numpy(), expected_seq_len=self.context_size
+        )
         source_height, source_width = frames[-1].shape[:2]
         return BallHeatmapPrediction(
             heatmap=heatmap,

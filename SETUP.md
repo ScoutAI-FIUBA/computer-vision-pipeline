@@ -46,6 +46,38 @@ fallback; the player SAM2/output stream remains at its separate 15 FPS default.
 
 ### V2 Modal stats
 
+V2 also provides restartable tracking/stats primitives backed by the named `v2-job-data`
+Volume. A job directory contains `job.json`, `input.mp4`, and immutable generation
+directories under `tracking/` and `stats/`; manifests include hashes and fingerprints.
+Retries reuse matching complete generations, while stale leases can be reclaimed. The
+active lease rejects duplicate workers. The native `modal run` entrypoint exposes restartable
+routing. Use `--staged` with `--job-id` for one command that runs tracking then stats, or use
+`--stats-only --job-id` to retry only stats from an existing job. Remote logs and errors are
+streamed by the normal Modal runner:
+
+```bash
+# Command 1: persist tracking artifacts/bundles
+modal run modal_app_v2.py --tracking-only --job-id game-03 \
+  --video-path clips/game_03.mp4
+
+# Command 2: run stats from the persisted tracking bundle
+modal run modal_app_v2.py --stats-only --job-id game-03
+```
+
+`--tracking-only`, `--staged`, and `--stats-only` are mutually exclusive; each requires
+`--job-id`, and `--tracking-only` also requires `--video-path`. The existing monolithic
+`process` method remains the default and rollback path when neither flag is supplied.
+
+Replay a selected generation locally (read-only apart from the requested MP4 output):
+
+```bash
+python scripts/tracking/debug_v2.py --job-id /path/to/job \
+  --generation GENERATION --output replay.mp4
+```
+
+The retention window for the job Volume is intentionally still an operational decision.
+Measure timeout and GPU cost before enabling staged routing in production.
+
 `modal_app_v2.py` uses the existing `tracknet-data` Modal Volume, mounted at
 `/tracknet-data`, and enables TrackNet with this checkpoint path:
 

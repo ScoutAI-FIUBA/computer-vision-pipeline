@@ -65,6 +65,405 @@ def test_v2_and_legacy_gpu_capacity_are_explicitly_separate():
     assert decorated_gpu(legacy_source, "Pipeline") == "L4"
 
 
+def test_job_manifest_lifecycle_leases_and_stale_recovery(tmp_path: Path):
+    from modal_app_v2 import acquire_job_lease, read_job_manifest, write_job_manifest
+
+    write_job_manifest(tmp_path / "job-1", {"job_id": "job-1", "state": "created"})
+    first = acquire_job_lease(tmp_path, "job-1", owner="worker-a", now=100, lease_seconds=30)
+    assert first["attempts"]["tracking"] == 1
+    with pytest.raises(RuntimeError, match="active lease"):
+        acquire_job_lease(tmp_path, "job-1", owner="worker-b", now=110, lease_seconds=30)
+    recovered = acquire_job_lease(tmp_path, "job-1", owner="worker-b", now=131, lease_seconds=30)
+    assert recovered["attempts"]["tracking"] == 2
+    assert read_job_manifest(tmp_path, "job-1")["lease"]["owner"] == "worker-b"
+
+
+def test_lease_acquisition_is_atomic_and_initializes_running_state(tmp_path: Path):
+    from modal_app_v2 import acquire_job_lease, read_job_manifest
+
+    acquired = acquire_job_lease(
+        tmp_path, "job-atomic", owner="worker-a", now=100,
+        stage="tracking", input_fingerprint="input", request_fingerprint="request",
+    )
+
+    assert acquired["state"] == "tracking"
+    assert acquired["lease"]["owner"] == "worker-a"
+    with pytest.raises(RuntimeError, match="active lease"):
+        acquire_job_lease(
+            tmp_path, "job-atomic", owner="worker-b", now=101,
+            stage="tracking", input_fingerprint="other", request_fingerprint="other",
+        )
+    assert read_job_manifest(tmp_path, "job-atomic")["input_fingerprint"] == "input"
+
+
+def _raw_method(cls, name):
+    method = cls.__dict__[name]
+    return method.__dict__[next(key for key in method.__dict__ if key.startswith("_sync_original"))].raw_f
+
+
+def test_track_stage_rejects_duplicate_active_worker_before_mutation(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+    from modal_app_v2 import read_job_manifest, write_job_manifest
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    write_job_manifest(tmp_path / "job-1", {
+        "job_id": "job-1", "state": "created", "input_fingerprint": "other",
+        "request_fingerprint": "other", "lease": {"owner": "worker-a", "expires_at": 9999999999},
+    })
+    with pytest.raises(RuntimeError, match="active lease"):
+        _raw_method(cls, "track_stage")(
+            cls(), job_id="job-1", video_bytes=b"video", worker_id="worker-b",
+        )
+    assert read_job_manifest(tmp_path, "job-1")["lease"]["owner"] == "worker-a"
+
+
+def test_stage_finalizer_rejects_stale_owner_before_publish_or_manifest_write(tmp_path: Path):
+    import modal_app_v2
+    from modal_app_v2 import acquire_job_lease, read_job_manifest, write_job_manifest
+
+    job = tmp_path / "job-1"
+    acquire_job_lease(tmp_path, "job-1", owner="worker-a", stage="tracking", now=100, lease_seconds=30)
+    write_job_manifest(job, {**read_job_manifest(job), "lease": {"owner": "worker-b", "expires_at": 9999999999}})
+    published = []
+
+    with pytest.raises(RuntimeError, match="lease ownership"):
+        modal_app_v2._finalize_stage(
+            tmp_path, "job-1", owner="worker-a",
+            publish=lambda: published.append(True),
+            manifest={"state": "tracked", "lease": None},
+        )
+
+    assert published == []
+    assert read_job_manifest(job)["lease"]["owner"] == "worker-b"
+
+
+def test_stage_owner_requires_unique_identity_and_accepts_explicit_or_modal_id(monkeypatch):
+    import modal_app_v2
+
+    for name in ("MODAL_TASK_ID", "MODAL_FUNCTION_CALL_ID", "MODAL_INVOCATION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="unique worker identity"):
+        modal_app_v2._stage_owner(None)
+    assert modal_app_v2._stage_owner("test-worker") == "test-worker"
+
+    monkeypatch.setenv("MODAL_INVOCATION_ID", "invocation-1")
+    assert modal_app_v2._stage_owner(None) == "modal:MODAL_INVOCATION_ID:invocation-1"
+
+
+def test_tracking_fingerprint_changes_with_effective_environment_configuration(monkeypatch):
+    import modal_app_v2
+    from pipeline.config import PipelineConfig
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.delenv("SAM31_V2_SEGMENT_WINDOW", raising=False)
+    first = PipelineConfig.from_env()
+    first_fingerprint = modal_app_v2._tracking_stage_fingerprint(
+        "player", 0, 1, None, None, None, None, None, first,
+    )
+    monkeypatch.setenv("SAM31_V2_SEGMENT_WINDOW", "64")
+    second = PipelineConfig.from_env()
+    second_fingerprint = modal_app_v2._tracking_stage_fingerprint(
+        "player", 0, 1, None, None, None, None, None, second,
+    )
+    assert first_fingerprint != second_fingerprint
+
+    first_stats = modal_app_v2._stats_stage_fingerprint("v3", "tracking-1", first)
+    monkeypatch.setenv("POSSESSION_V3_GRACE_SECONDS", "0.5")
+    third = PipelineConfig.from_env()
+    second_stats = modal_app_v2._stats_stage_fingerprint("v3", "tracking-1", third)
+    assert first_stats != second_stats
+
+
+def test_stats_stage_reuses_matching_completed_generation_without_recomputing(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+    import pipeline.reid
+    import pipeline.team_embedder
+    from modal_app_v2 import write_job_manifest
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    job = tmp_path / "job-1"
+    job.mkdir()
+    package = job / "package"
+    package_artifacts(package, [], {}, input_fingerprint="input", frame_bounds=[0, 0])
+    tracking_artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    tracking = publish_stage_generation(
+        job / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=tracking_artifacts, frame_bounds=[0, 0],
+    )
+    stats_request = modal_app_v2._stats_stage_fingerprint(
+        "v3", tracking["generation"], modal_app_v2.PipelineConfig.from_env(possession_engine="v3")
+    )
+    stats = publish_stage_generation(
+        job / "stats", stage="stats", input_fingerprint="input", request_fingerprint=stats_request,
+        tracking_generation=tracking["generation"], artifacts={"results.json": b"{}"}, frame_bounds=[0, 0],
+    )
+    write_job_manifest(job, {
+        "job_id": "job-1", "state": "complete", "input_fingerprint": "input",
+        "request_fingerprint": "request", "tracking_generation": tracking["generation"],
+        "stats_generation": stats["generation"],
+    })
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_generation", lambda *args, **kwargs: pytest.fail("recomputed stats"))
+    monkeypatch.setattr(pipeline.reid, "build_embedder", lambda *args, **kwargs: pytest.fail("ReID initialized"))
+    monkeypatch.setattr(pipeline.team_embedder, "build_team_embedder", lambda *args, **kwargs: pytest.fail("Team ID initialized"))
+    fake_model_builder = types.ModuleType("sam3.model_builder")
+    fake_model_builder.build_sam3_multiplex_video_predictor = lambda **kwargs: pytest.fail("SAM3 initialized")
+    fake_sam3 = types.ModuleType("sam3")
+    fake_sam3.model_builder = fake_model_builder
+    monkeypatch.setitem(sys.modules, "sam3", fake_sam3)
+    monkeypatch.setitem(sys.modules, "sam3.model_builder", fake_model_builder)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    pipeline = cls()
+    load_models = cls.load_models.__dict__[next(key for key in cls.load_models.__dict__ if key.startswith("_sync_original"))].raw_f
+    load_models(pipeline)
+    assert not hasattr(pipeline, "predictor")
+    assert not hasattr(pipeline, "seams")
+    result = _raw_method(cls, "stats_stage")(pipeline, job_id="job-1", possession_engine="v3", worker_id="worker-a")
+    assert result["generation"] == stats["generation"]
+
+
+def test_staged_process_orchestrates_tracking_then_stats(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    calls = []
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    instance = cls()
+    monkeypatch.setattr(instance, "track_stage", lambda **_kwargs: pytest.fail("Modal track descriptor called"))
+    monkeypatch.setattr(instance, "stats_stage", lambda **_kwargs: pytest.fail("Modal stats descriptor called"))
+    monkeypatch.setattr(instance, "_track_stage", lambda **kwargs: calls.append(("track", kwargs)) or {"status": "tracked"})
+    monkeypatch.setattr(instance, "_stats_stage", lambda **kwargs: calls.append(("stats", kwargs)) or {"status": "complete"})
+
+    result = _raw_method(cls, "process")(
+        instance, video_bytes=b"video", job_id="job-1", staged=True,
+        prompt="player", frame_start=0, frame_end=1, possession_engine="v3",
+    )
+
+    assert result == {"status": "complete"}
+    assert [name for name, _ in calls] == ["track", "stats"]
+    assert calls[0][1]["job_id"] == calls[1][1]["job_id"] == "job-1"
+
+
+def test_staged_process_passes_tracking_payload_without_modal_serialization(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    payload = {
+        "observations": [{"observation_key": "0:1"}],
+        "masks_by_observation": {"0:1": object()},
+        "clean_masks_by_observation": {},
+    }
+    captured = {}
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    instance = cls()
+    monkeypatch.setattr(instance, "_track_stage", lambda **_kwargs: {"status": "tracked", "tracking_payload": payload})
+
+    def stats(**kwargs):
+        captured.update(kwargs)
+        return {"status": "complete"}
+
+    monkeypatch.setattr(instance, "_stats_stage", stats)
+    result = _raw_method(cls, "process")(
+        instance, video_bytes=b"video", job_id="job-1", staged=True,
+    )
+
+    assert result == {"status": "complete"}
+    assert captured["tracking_payload"] is payload
+
+
+def test_track_stage_publishes_v2_enriched_rows_and_clean_masks(tmp_path: Path, monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.results import load_stage_generation
+    from pipeline.runner_v2 import RunnerV2Result
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    row = {
+        "observation_key": "0:3", "frame_index": 0, "raw_track_id": 3,
+        "bbox_xyxy": [0, 0, 2, 2], "track_state": "tracked",
+    }
+    mask = np.ones((2, 2), dtype=np.uint8)
+    clean_mask = np.eye(2, dtype=np.uint8)
+    enriched = {**row, "stable_player_id": "player-3", "team_id": 1}
+    captured = {}
+
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: ([row], {"0:3": mask}))
+    monkeypatch.setattr(cls := next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+                                    if key.startswith("_sync_original"))._user_cls,
+                        "_ensure_predictor", lambda _self: object())
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {0: object()})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **kwargs: (
+        captured.update({"rows": observations, **kwargs})
+        or RunnerV2Result([enriched], cleaned_masks_by_observation={"0:3": clean_mask})
+    ))
+    result = _raw_method(cls, "track_stage")(
+        cls(), job_id="job-1", video_bytes=b"video", frame_start=0, frame_end=0,
+        worker_id="worker-a",
+    )
+    generation = load_stage_generation(tmp_path / "job-1" / "tracking", result["generation"])
+    tracks = [json.loads(line) for line in (tmp_path / "job-1" / "tracking" / "generations" /
+                                            result["generation"] / "tracks.jsonl").read_text().splitlines()]
+
+    assert captured["rows"] == [row]
+    assert captured["masks_by_observation"]["0:3"] is mask
+    assert tracks[0]["stable_player_id"] == "player-3"
+    assert tracks[0]["team_id"] == 1
+    assert tracks[0]["clean_mask_ref"].startswith("masks_clean/")
+    tracking_manifest = json.loads(
+        (tmp_path / "job-1" / "tracking" / "generations" / result["generation"] /
+         "tracking-manifest.json").read_text()
+    )
+    assert tracking_manifest["artifacts"]["clean_masks"]["count"] == 1
+
+
+def test_stats_stage_reads_enriched_staged_tracking_contract(tmp_path: Path, monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.results import package_artifacts, publish_stage_generation
+    from modal_app_v2 import write_job_manifest
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    job = tmp_path / "job-1"
+    package = job / "package"
+    enriched = [{
+        "observation_key": "0:3", "frame_index": 0, "raw_track_id": 3,
+        "bbox_xyxy": [0, 0, 2, 2], "stable_player_id": "player-3", "team_id": 1,
+        "track_state": "tracked",
+    }]
+    package_artifacts(package, enriched, {"0:3": np.ones((2, 2), dtype=np.uint8)},
+                      input_fingerprint="input", frame_bounds=[0, 0])
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    tracking = publish_stage_generation(
+        job / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    write_job_manifest(job, {
+        "job_id": "job-1", "state": "tracked", "input_fingerprint": "input",
+        "tracking_generation": tracking["generation"],
+    })
+    captured = {}
+
+    def fake_stats(video_path, config, tracking_root, output, generation, **kwargs):
+        captured["observations"] = json.loads(
+            (tracking_root / "generations" / generation["generation"] / "tracks.jsonl").read_text().splitlines()[0]
+        )
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "results.json").write_text("{}")
+        return object()
+
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_generation", fake_stats)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+               if key.startswith("_sync_original"))._user_cls
+
+    _raw_method(cls, "stats_stage")(cls(), job_id="job-1", worker_id="worker-a")
+
+    assert captured["observations"]["stable_player_id"] == "player-3"
+    assert captured["observations"]["team_id"] == 1
+
+
+def test_stale_and_replacement_inputs_are_isolated_and_stats_rejects_tampering(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+    from modal_app_v2 import _committed_job_input, _persist_job_input, write_job_manifest
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    job = tmp_path / "job-1"
+    stale = b"stale-worker-video"
+    committed = b"replacement-worker-video"
+    stale_fingerprint = "sha256:" + hashlib.sha256(stale).hexdigest()
+    committed_fingerprint = "sha256:" + hashlib.sha256(committed).hexdigest()
+
+    stale_path = _persist_job_input(job, stale_fingerprint, stale)
+    committed_path = _persist_job_input(job, committed_fingerprint, committed)
+
+    assert stale_path != committed_path
+    assert stale_path.read_bytes() == stale
+    assert committed_path.read_bytes() == committed
+
+    # A legacy mutable path must not win over the committed immutable input.
+    (job / "input.mp4").write_bytes(stale)
+    assert _committed_job_input(job, committed_fingerprint) == committed_path
+
+    captured = {}
+    package = job / "package"
+    package_artifacts(package, [], {}, input_fingerprint=committed_fingerprint, frame_bounds=[0, 0])
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    tracking = publish_stage_generation(
+        job / "tracking", stage="tracking", input_fingerprint=committed_fingerprint,
+        request_fingerprint="request", artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    write_job_manifest(job, {
+        "job_id": "job-1", "state": "tracked", "input_fingerprint": committed_fingerprint,
+        "tracking_generation": tracking["generation"],
+    })
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+
+    def fake_stats(video_path, *args, **kwargs):
+        captured["video_path"] = video_path
+        output = args[2]
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "results.json").write_text("{}")
+        return object()
+
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_generation", fake_stats)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+               if key.startswith("_sync_original"))._user_cls
+    _raw_method(cls, "stats_stage")(cls(), job_id="job-1", worker_id="worker-stats")
+    assert captured["video_path"] == committed_path
+
+    import shutil
+    shutil.rmtree(job / "stats")
+    committed_path.write_bytes(b"tampered replacement-worker-video")
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        _raw_method(cls, "stats_stage")(cls(), job_id="job-1", worker_id="worker-stats-2")
+
+
+def test_committed_input_does_not_fallback_when_immutable_input_is_missing(tmp_path: Path):
+    from modal_app_v2 import _committed_job_input
+
+    legacy = tmp_path / "input.mp4"
+    legacy.write_bytes(b"mutable legacy input")
+    fingerprint = "sha256:" + ("a" * 64)
+
+    with pytest.raises(ValueError, match="immutable job input is missing"):
+        _committed_job_input(tmp_path, fingerprint)
+    assert _committed_job_input(tmp_path, "legacy") == legacy
+
+
+def test_committed_input_rejects_tampered_immutable_input(tmp_path: Path):
+    from modal_app_v2 import _committed_job_input, _persist_job_input
+
+    content = b"committed video"
+    fingerprint = "sha256:" + hashlib.sha256(content).hexdigest()
+    path = _persist_job_input(tmp_path, fingerprint, content)
+    path.write_bytes(b"tampered video")
+
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        _committed_job_input(tmp_path, fingerprint)
+
+
+def test_staged_process_records_failure_and_does_not_fallback(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    instance = cls()
+    monkeypatch.setattr(instance, "_track_stage", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("tracking failed")))
+    monkeypatch.setattr(instance, "_stats_stage", lambda **_kwargs: pytest.fail("stats must not run"))
+
+    with pytest.raises(RuntimeError, match="tracking failed"):
+        _raw_method(cls, "process")(instance, video_bytes=b"video", job_id="job-1", staged=True)
+
+
 def test_v2_defaults_to_on_court_prompt():
     source = (Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -391,7 +790,7 @@ def test_v2_predictor_initialization_disables_optional_flashattention3(monkeypat
     ]
 
 
-def test_v2_load_models_warms_cold_container_and_assigns_runtime_seams(monkeypatch):
+def test_v2_tracking_models_are_lazy_and_cached(monkeypatch):
     import modal_app_v2
     import pipeline.reid
     import pipeline.team_embedder
@@ -444,6 +843,12 @@ def test_v2_load_models_warms_cold_container_and_assigns_runtime_seams(monkeypat
     pipeline = pipeline_cls()
     load_models(pipeline)
 
+    assert pipeline._models_loaded is True
+    assert not hasattr(pipeline, "predictor")
+    assert not hasattr(pipeline, "seams")
+    assert predictor_calls == []
+    pipeline._ensure_predictor()
+    pipeline._ensure_seams()
     assert pipeline.predictor is fake_predictor
     assert predictor_calls == [{"max_num_objects": 16, "multiplex_count": 16, "use_fa3": False}]
     assert reid_calls == [("fake-reid", "/cache/reid/osnet_x1_0_msmt17.pt")]
@@ -622,6 +1027,109 @@ def test_local_entrypoint_forwards_selected_possession_engine(
         modal_app_v2.main(video_path=str(video), output_dir=str(tmp_path / "output"))
 
     assert forwarded["possession_engine"] == selected
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"staged": True, "stats_only": True, "job_id": "job"}, "mutually exclusive"),
+        ({"tracking_only": True, "staged": True, "job_id": "job", "video_path": "input.mp4"}, "mutually exclusive"),
+        ({"tracking_only": True, "stats_only": True, "job_id": "job", "video_path": "input.mp4"}, "mutually exclusive"),
+        ({"tracking_only": True}, "job-id is required"),
+        ({"tracking_only": True, "job_id": "job"}, "video-path is required"),
+        ({"staged": True}, "job-id is required"),
+        ({"stats_only": True}, "job-id is required"),
+        ({"job_id": "job"}, "requires --staged"),
+        ({"stats_only": True, "job_id": "job", "video_path": "input.mp4"}, "cannot be used"),
+        ({"staged": True, "job_id": "job"}, "video-path is required"),
+    ],
+)
+def test_local_entrypoint_validates_restartable_cli_modes(kwargs, message):
+    from modal_app_v2 import _validate_local_entrypoint_mode
+
+    with pytest.raises(ValueError, match=message):
+        _validate_local_entrypoint_mode(
+            video_path=kwargs.get("video_path", ""),
+            job_id=kwargs.get("job_id", ""),
+            staged=kwargs.get("staged", False),
+            stats_only=kwargs.get("stats_only", False),
+            tracking_only=kwargs.get("tracking_only", False),
+        )
+
+
+def test_local_entrypoint_routes_staged_process_to_deployed_method(tmp_path, monkeypatch):
+    import modal_app_v2
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    forwarded = {}
+
+    class FakeProcess:
+        def remote(self, **kwargs):
+            forwarded.update(kwargs)
+            return {"status": "complete"}
+
+    class FakePipeline:
+        process = FakeProcess()
+
+    monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
+    modal_app_v2.main(video_path=str(video), staged=True, job_id="job-1")
+
+    assert forwarded["staged"] is True
+    assert forwarded["job_id"] == "job-1"
+
+
+def test_local_entrypoint_routes_stats_only_to_deployed_stats_method(monkeypatch, capsys):
+    import modal_app_v2
+
+    forwarded = {}
+
+    class FakeStats:
+        def remote(self, **kwargs):
+            forwarded.update(kwargs)
+            return {"status": "complete", "generation": "stats-1"}
+
+    class FakePipeline:
+        stats_stage = FakeStats()
+
+    monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
+    modal_app_v2.main(stats_only=True, job_id="job-1")
+
+    assert forwarded == {"job_id": "job-1", "possession_engine": "v3"}
+    assert "stats-1" in capsys.readouterr().out
+
+
+def test_local_entrypoint_routes_tracking_only_to_deployed_track_method(tmp_path, monkeypatch, capsys):
+    import modal_app_v2
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    forwarded = {}
+
+    class FakeTrack:
+        def remote(self, **kwargs):
+            forwarded.update(kwargs)
+            return {"status": "tracked", "generation": "tracking-1", "fingerprint": "sha256:test"}
+
+    class FakePipeline:
+        track_stage = FakeTrack()
+
+    monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
+    modal_app_v2.main(video_path=str(video), tracking_only=True, job_id="job-1")
+
+    assert forwarded == {
+        "job_id": "job-1",
+        "video_bytes": b"video",
+        "prompt": "basketball player on the court",
+        "frame_start": 60,
+        "frame_end": 130,
+        "segmented": None,
+        "segment_window": None,
+        "segment_overlap": None,
+        "segment_seam_min_score": None,
+        "segment_seam_ambiguity_margin": None,
+    }
+    assert "tracking-1" in capsys.readouterr().out
 
 
 def test_v2_process_returns_artifacts_and_never_remote_debug_video():

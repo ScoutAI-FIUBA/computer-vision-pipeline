@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from types import SimpleNamespace
 
 import pytest
 import numpy as np
 
 from pipeline.config import PipelineConfig
-from pipeline.runner import _BoundedProgress, run_stats_from_v2_observations
+from pipeline.runner import _BoundedProgress, _emit_file_batch_progress, run_stats_from_v2_observations
 
 
 def _court_enabled_config():
@@ -15,6 +17,44 @@ def _court_enabled_config():
         roboflow_api_key="test-key", court_model_id="court/1", team_embedder_backend="none",
         number_evidence_enabled=False,
     )
+
+
+def test_file_batch_progress_is_sparse_and_always_reports_final_batch():
+    messages = []
+    for processed in range(1, 251):
+        _emit_file_batch_progress(messages.append, "masks load", processed, 250, batch_size=100)
+
+    assert messages == ["masks load: 100/250 files", "masks load: 200/250 files", "masks load: 250/250 files"]
+
+
+def test_stats_generation_logs_validation_tracks_masks_and_stats(tmp_path, monkeypatch, capsys):
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    package = tmp_path / "package"
+    package_artifacts(package, [], {}, input_fingerprint="input", frame_bounds=[0, 0])
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    monkeypatch.setattr(runner, "run_stats_from_v2_observations", lambda *args, **kwargs: object())
+
+    runner.run_stats_from_v2_generation(
+        tmp_path / "input.mp4", PipelineConfig(roboflow_api_key="test-key"),
+        tmp_path / "tracking", tmp_path / "stats", generation,
+    )
+
+    output = capsys.readouterr().out
+    assert "stage generation validation/hash checks start" in output
+    assert "stage generation validation/hash checks complete" in output
+    assert "tracks load complete: 0 rows" in output
+    assert "masks load: 0/0 files" in output
+    assert "clean masks load: 0/0 files" in output
+    assert "stats start" in output
 
 
 def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, monkeypatch, capsys):
@@ -71,6 +111,239 @@ def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, m
     assert "[v2-stats] possession start" in output
     assert "[v2-stats] artifact writing start" in output
     assert "[v2-stats] stats complete" in output
+
+
+def test_v2_stats_generation_loads_persisted_masks(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    observation = {
+        "observation_key": "0:1",
+        "frame_index": 0,
+        "raw_track_id": 1,
+        "stable_player_id": "player-001",
+        "bbox_xyxy": [1, 2, 10, 20],
+        "track_state": "tracked",
+    }
+    raw_mask = np.array([[0, 1], [2, 255]], dtype=np.uint8)
+    clean_mask = np.array([[255, 0], [0, 255]], dtype=np.uint8)
+    package = tmp_path / "package"
+    package_artifacts(
+        package, [observation], {"0:1": raw_mask}, {"0:1": clean_mask},
+        input_fingerprint="input", frame_bounds=[0, 0],
+    )
+    # Model an old tracking job: individual refs remain, but no bundle exists.
+    from pipeline.results import _manifest_hash
+    old_manifest_path = package / "manifest.json"
+    old_manifest = json.loads(old_manifest_path.read_text())
+    old_manifest["artifacts"]["masks"].pop("bundle", None)
+    old_manifest["artifacts"]["clean_masks"].pop("bundle", None)
+    old_manifest["artifacts"]["manifest"]["sha256"] = _manifest_hash(old_manifest)
+    old_manifest_path.write_text(json.dumps(old_manifest, indent=2, sort_keys=True))
+    (package / "masks.tar").unlink()
+    (package / "masks_clean.tar").unlink()
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    captured = {}
+
+    def capture(_video, _config, _output, observations, **kwargs):
+        captured["observations"] = observations
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(runner, "run_stats_from_v2_observations", capture)
+    result = runner.run_stats_from_v2_generation(
+        tmp_path / "input.mp4", PipelineConfig(roboflow_api_key="test-key"),
+        tmp_path / "tracking", tmp_path / "stats", generation,
+    )
+
+    assert result is not None
+    assert captured["observations"] == [observation]
+    np.testing.assert_array_equal(captured["masks_by_observation"]["0:1"], raw_mask)
+    np.testing.assert_array_equal(captured["clean_masks_by_observation"]["0:1"], clean_mask)
+
+
+def test_v2_stats_generation_prefers_mask_bundle_over_individual_files(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    observation = {"observation_key": "0:1", "frame_index": 0, "bbox_xyxy": [1, 2, 10, 20]}
+    package = tmp_path / "package"
+    package_artifacts(
+        package, [observation], {"0:1": np.ones((2, 2), dtype=np.uint8)},
+        {"0:1": np.eye(2, dtype=np.uint8)}, input_fingerprint="input", frame_bounds=[0, 0],
+    )
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    captured = {}
+    monkeypatch.setattr(
+        runner, "run_stats_from_v2_observations",
+        lambda *args, **kwargs: captured.update({"observations": args[3], **kwargs}) or object(),
+    )
+    monkeypatch.setattr(runner.cv2, "imread", lambda *_args, **_kwargs: pytest.fail("individual mask read"))
+
+    runner.run_stats_from_v2_generation(
+        tmp_path / "input.mp4", PipelineConfig(roboflow_api_key="test-key"),
+        tmp_path / "tracking", tmp_path / "stats", generation, validated=True,
+    )
+
+    np.testing.assert_array_equal(captured["masks_by_observation"]["0:1"], np.ones((2, 2), dtype=np.uint8))
+    np.testing.assert_array_equal(captured["clean_masks_by_observation"]["0:1"], np.eye(2, dtype=np.uint8))
+
+
+def test_v2_stats_generation_uses_in_memory_tracking_payload(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    observation = {"observation_key": "0:1", "frame_index": 0, "bbox_xyxy": [1, 2, 10, 20]}
+    raw_mask = np.ones((2, 2), dtype=np.uint8)
+    clean_mask = np.eye(2, dtype=np.uint8)
+    package = tmp_path / "package"
+    package_artifacts(package, [observation], {"0:1": raw_mask}, {"0:1": clean_mask}, input_fingerprint="input", frame_bounds=[0, 0])
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    captured = {}
+    monkeypatch.setattr(
+        runner, "run_stats_from_v2_observations",
+        lambda *args, **kwargs: captured.update({"observations": args[3], **kwargs}) or object(),
+    )
+    monkeypatch.setattr(runner.cv2, "imread", lambda *_args, **_kwargs: pytest.fail("durable mask reload"))
+
+    runner.run_stats_from_v2_generation(
+        tmp_path / "input.mp4", PipelineConfig(roboflow_api_key="test-key"),
+        tmp_path / "tracking", tmp_path / "stats", generation, validated=True,
+        tracking_payload={
+            "observations": [observation],
+            "masks_by_observation": {"0:1": raw_mask},
+            "clean_masks_by_observation": {"0:1": clean_mask},
+        },
+    )
+
+    assert captured["observations"] == [observation]
+    np.testing.assert_array_equal(captured["masks_by_observation"]["0:1"], raw_mask)
+    np.testing.assert_array_equal(captured["clean_masks_by_observation"]["0:1"], clean_mask)
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt"])
+def test_v2_stats_generation_rejects_missing_or_corrupt_mask_bundle(tmp_path, monkeypatch, failure):
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    observation = {"observation_key": "0:1", "frame_index": 0, "bbox_xyxy": [1, 2, 10, 20]}
+    package = tmp_path / "package"
+    package_artifacts(package, [observation], {"0:1": np.ones((2, 2), dtype=np.uint8)},
+                      input_fingerprint="input", frame_bounds=[0, 0])
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    bundle = tmp_path / "tracking" / "generations" / generation["generation"] / "masks.tar"
+    if failure == "missing":
+        bundle.unlink()
+    else:
+        bundle.write_bytes(b"not a tar")
+    monkeypatch.setattr(runner, "run_stats_from_v2_observations", lambda *_args, **_kwargs: object())
+
+    with pytest.raises(ValueError, match="bundle"):
+        runner.run_stats_from_v2_generation(
+            tmp_path / "input.mp4", PipelineConfig(roboflow_api_key="test-key"),
+            tmp_path / "tracking", tmp_path / "stats", generation, validated=True,
+        )
+
+
+def test_v2_stats_generation_rejects_path_traversal_in_mask_bundle(tmp_path, monkeypatch):
+    import io
+    import tarfile
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    observation = {"observation_key": "0:1", "frame_index": 0, "bbox_xyxy": [1, 2, 10, 20]}
+    package = tmp_path / "package"
+    package_artifacts(package, [observation], {"0:1": np.ones((2, 2), dtype=np.uint8)},
+                      input_fingerprint="input", frame_bounds=[0, 0])
+    with tarfile.open(package / "masks.tar", "w") as archive:
+        data = b"not a png"
+        info = tarfile.TarInfo("../escape.png")
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    monkeypatch.setattr(runner, "run_stats_from_v2_observations", lambda *_args, **_kwargs: object())
+
+    with pytest.raises(ValueError, match="unsafe masks bundle member"):
+        runner.run_stats_from_v2_generation(
+            tmp_path / "input.mp4", PipelineConfig(roboflow_api_key="test-key"),
+            tmp_path / "tracking", tmp_path / "stats", generation, validated=True,
+        )
+
+
+@pytest.mark.parametrize("tamper", ["wrong_member", "extra_member", "wrong_hash"])
+def test_v2_stats_generation_rejects_inconsistent_mask_bundle(tmp_path, monkeypatch, tamper):
+    import pipeline.runner as runner
+    from pipeline.results import package_artifacts, publish_stage_generation
+
+    observation = {"observation_key": "0:1", "frame_index": 0, "bbox_xyxy": [1, 2, 10, 20]}
+    package = tmp_path / "package"
+    package_artifacts(package, [observation], {"0:1": np.ones((2, 2), dtype=np.uint8)},
+                      input_fingerprint="input", frame_bounds=[0, 0])
+    bundle_path = package / "masks.tar"
+    original = bundle_path.read_bytes()
+    with tarfile.open(fileobj=io.BytesIO(original), mode="r") as source:
+        members = [(member.name, source.extractfile(member).read()) for member in source.getmembers()]
+    if tamper == "wrong_member":
+        members[0] = ("not-the-declared-member.png", members[0][1])
+    elif tamper == "extra_member":
+        members.append(("extra.png", members[0][1]))
+    else:
+        members[0] = (members[0][0], b"tampered")
+    with tarfile.open(bundle_path, "w") as archive:
+        for name, data in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    generation = publish_stage_generation(
+        tmp_path / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    monkeypatch.setattr(runner, "run_stats_from_v2_observations", lambda *_args, **_kwargs: object())
+
+    with pytest.raises(ValueError, match="bundle|member"):
+        runner.run_stats_from_v2_generation(
+            tmp_path / "input.mp4", PipelineConfig(roboflow_api_key="test-key"),
+            tmp_path / "tracking", tmp_path / "stats", generation, validated=True,
+        )
 
 
 def test_v2_stats_v4_emits_diagnostics_without_invoking_v3_scorer(tmp_path, monkeypatch):
