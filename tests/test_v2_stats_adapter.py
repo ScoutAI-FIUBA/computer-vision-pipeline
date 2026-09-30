@@ -73,6 +73,72 @@ def test_v2_stats_adapter_reuses_rows_without_legacy_player_tracking(tmp_path, m
     assert "[v2-stats] stats complete" in output
 
 
+def test_v2_stats_v4_emits_diagnostics_without_invoking_v3_scorer(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner,
+        "probe",
+        lambda _path: SimpleNamespace(
+            fps=30.0, frame_count=2, width=100, height=100, duration_seconds=2 / 30
+        ),
+    )
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+
+    def fail_v3_scorer(*_args, **_kwargs):
+        raise AssertionError("V3 scorer must not run for engine=v4")
+
+    v4_calls = []
+    real_v4_scorer = runner.score_candidates_v4
+
+    def spy_v4_scorer(*args, **kwargs):
+        v4_calls.append((args, kwargs))
+        return real_v4_scorer(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "score_candidates", fail_v3_scorer)
+    monkeypatch.setattr(runner, "score_candidates_v4", spy_v4_scorer)
+    observations = [
+        {
+            "frame_index": frame,
+            "raw_track_id": 17,
+            "stable_player_id": "player-001",
+            "bbox_xyxy": [10, 10, 30, 50],
+            "team_id": 1,
+            "track_state": "tracked",
+            "confidence": 0.95,
+        }
+        for frame in (0, 1)
+    ]
+
+    result = run_stats_from_v2_observations(
+        video,
+        PipelineConfig(
+            roboflow_api_key="test-key",
+            team_embedder_backend="none",
+            number_evidence_enabled=False,
+            possession_engine="v4",
+        ),
+        tmp_path / "stats",
+        observations,
+    )
+
+    stats_dir = tmp_path / "stats"
+    manifest = json.loads((stats_dir / "possession_v3_manifest.json").read_text())
+    assert manifest["v4"] == {"enabled": True, "schema_version": 1, "feature_flag": "v4",
+                               "overlay_fields": [
+                                   "holder_control", "holder_release", "challenger_acquisition",
+                                   "mask_bbox_agreement", "gate_reason_codes",
+                               ]}
+    diagnostic = manifest["artifacts"]["v4_diagnostics"]
+    diagnostic_path = stats_dir / diagnostic["path"]
+    assert diagnostic_path.is_file()
+    assert json.loads(diagnostic_path.read_text().splitlines()[0])["v4"]["feature_flag"] is True
+    assert result.possession_v4_diagnostics_file == diagnostic["path"]
+    assert v4_calls
+
+
 def test_v2_stats_projects_authoritative_rows_and_shots(tmp_path, monkeypatch):
     import pipeline.runner as runner
 

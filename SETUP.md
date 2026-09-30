@@ -109,6 +109,35 @@ and events. `modal_app.py` remains on the legacy possession engine, and local
 or other callers still default to legacy unless they explicitly set
 `POSSESSION_ENGINE=v3`.
 
+### V4 and rollback commands
+
+Run segmented V4 explicitly; the selection is sent to the Modal container and
+recorded in the root manifest plus stats metadata:
+
+```bash
+SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py \
+  --video-path clips/game_03.mp4 --frame-start 60 --frame-end 130 \
+  --segment-window 32 --segment-overlap 1 \
+  --possession-engine v4 --output-dir outputs/v2-segmented-v4
+```
+
+V4 is exclusive: it does not run V3 in parallel. Roll back V2 with
+`--possession-engine v3`; use `legacy` only with the general local
+pipeline/config path, for example
+`POSSESSION_ENGINE=legacy python -m pipeline.cli clips/game_03.mp4`.
+Calibration is offline and is not run automatically.
+
+For a V3-only saved-bundle debug render, pass both exact inputs:
+
+```bash
+./.venv/bin/python scripts/tracking/debug_v2.py \
+  --video-path clips/game_03.mp4 \
+  --artifact-dir outputs/v2-segmented-v4 \
+  --v3-dir outputs/v2-segmented-v4/stats/possession_v3/generations/<generation-id> \
+  --numbers-json outputs/v2-segmented-v4/stats/numbers.json \
+  --output outputs/v2-segmented-v4/v3-number-debug.mp4
+```
+
 For bounded SAM3.1 V2 runs, seam stitching uses mask IoU first and bbox
 IoU/center fallback to make one-to-one local-ID matches. Set
 `SAM31_V2_SEAM_MIN_SCORE` and `SAM31_V2_SEAM_AMBIGUITY_MARGIN` to tune the

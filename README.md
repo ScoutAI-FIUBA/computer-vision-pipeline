@@ -32,6 +32,34 @@ modal run modal_app_v2.py --video-path clips/game_03.mp4 \
 
 Expected V3 outputs under the returned `stats/` directory are `possession_v3_manifest.json` and generation-scoped `possession_v3/` artifacts for possession rows, transitions, and events. The legacy `modal_app.py` image does not set this variable and keeps the global default unchanged.
 
+### Explicit V4 execution
+
+V2 accepts only `v3` or `v4`; the selected value is passed into the Modal
+container's `PipelineConfig`, so a local `POSSESSION_ENGINE` cannot silently
+select a different remote engine. V4 runs only the V4 scorer, not a parallel
+V3 run. The root manifest, `stats/results.json`, and
+`stats/possession_v3_manifest.json` record the selected engine. V3 remains the
+default for V2; `modal_app.py` is unchanged.
+
+Full segmented V4 command:
+
+```bash
+SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py \
+  --video-path clips/game_03.mp4 --frame-start 60 --frame-end 130 \
+  --segment-window 32 --segment-overlap 1 \
+  --possession-engine v4 --output-dir outputs/v2-segmented-v4
+```
+
+Expect `stats/possession_v3_manifest.json`, generation-scoped V4 possession
+rows/transitions/events, and V4 diagnostics referenced from `stats/results.json`
+and the root `manifest.json`.
+
+Rollback V2 with `--possession-engine v3`. Use `legacy` only when invoking the
+general local pipeline/config directly, for example
+`POSSESSION_ENGINE=legacy python -m pipeline.cli clips/game_03.mp4`; V2's
+explicit option does not accept `legacy`. Calibration is offline and is not
+automatically run by Modal.
+
 ### Conservative temporal BBox sanitizer
 
 Set `BBOX_SANITIZER_ENABLED=1` to run the offline V2 sanitizer before ReID and team identification; leave it at `0` for compatibility runs. Correction precedence is **mask cleanup → temporal interpolation → unresolved**. Mask cleanup uses connected components and conservative temporal evidence, writes optional `clean_mask_ref` artifacts under `masks_clean/`, and leaves the raw mask and `raw_bbox` available for provenance. Component areas are compared in the same units as the mask: normalized player boxes are converted to mask-pixel units before validation. If cleanup cannot produce one defensible component, the existing temporal interpolator may correct only a bounded multi-signal gap; otherwise the giant raw bbox remains unchanged and is marked `bbox_unresolved`. Initial calibration values are `BBOX_HISTORY_SIZE=15`, `BBOX_MAX_INTERPOLATION_GAP=2`, and `BBOX_SIGNAL_THRESHOLD=3.0`; tune them from reported corrected and unresolved counts, not from a single area threshold.
@@ -98,6 +126,17 @@ overlays, provide the V3 directory and the stats number summary directly:
 `--numbers-json` is optional. When `--stats-dir` is used, an existing
 `<stats-dir>/numbers.json` is picked up automatically; legacy possession overlays
 still load as before. Without a numbers file, rendering remains backward-compatible.
+
+Exact V3-only debug command:
+
+```bash
+./.venv/bin/python scripts/tracking/debug_v2.py \
+  --video-path clips/game_03.mp4 \
+  --artifact-dir outputs/v2-segmented-v4 \
+  --v3-dir outputs/v2-segmented-v4/stats/possession_v3/generations/<generation-id> \
+  --numbers-json outputs/v2-segmented-v4/stats/numbers.json \
+  --output outputs/v2-segmented-v4/v3-number-debug.mp4
+```
 
 ## Phase status
 

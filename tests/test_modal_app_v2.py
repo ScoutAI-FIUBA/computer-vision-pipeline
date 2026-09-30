@@ -16,7 +16,7 @@ def fake_v2_stats(monkeypatch, request):
         "test_process_exercises_real_stats_adapter_and_manifest_contract",
         "test_process_uses_v3_image_config_and_returns_v3_artifacts",
         "test_process_end_to_end_number_detector_reaches_real_v2_stats_chain",
-    }:
+    } or request.node.name.startswith("test_process_possession_engine_is_explicit_and_persisted"):
         return
     import modal_app_v2
 
@@ -593,6 +593,35 @@ def test_local_entrypoint_writes_remote_artifact_bytes(tmp_path: Path, monkeypat
 
     assert (tmp_path / "output" / "manifest.json").read_bytes() == b"{}"
     assert "tracking_identity" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("selected", ["v4", "v3"])
+def test_local_entrypoint_forwards_selected_possession_engine(
+    tmp_path: Path, monkeypatch, capsys, selected: str
+):
+    import modal_app_v2
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    forwarded = {}
+
+    class FakeProcess:
+        def remote(self, **kwargs):
+            forwarded.update(kwargs)
+            return {"acceptance": {}, "artifacts": {}}
+
+    class FakePipeline:
+        process = FakeProcess()
+
+    monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
+    if selected == "v4":
+        modal_app_v2.main(
+            video_path=str(video), output_dir=str(tmp_path / "output"), possession_engine=selected
+        )
+    else:
+        modal_app_v2.main(video_path=str(video), output_dir=str(tmp_path / "output"))
+
+    assert forwarded["possession_engine"] == selected
 
 
 def test_v2_process_returns_artifacts_and_never_remote_debug_video():
@@ -1457,6 +1486,128 @@ def test_process_uses_v3_image_config_and_returns_v3_artifacts(monkeypatch):
     manifest = json.loads(artifacts["stats/possession_v3_manifest.json"])
     pointer = manifest["artifacts"]["possession"]["path"]
     assert f"stats/{pointer}" in artifacts
+
+
+@pytest.mark.parametrize(
+    ("requested", "configured", "expected"),
+    [("v4", "v3", "v4"), (None, "v3", "v3")],
+)
+def test_process_possession_engine_is_explicit_and_persisted(
+    monkeypatch, requested, configured, expected
+):
+    import modal_app_v2
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("POSSESSION_ENGINE", configured)
+    monkeypatch.setenv("NUMBER_EVIDENCE_ENABLED", "0")
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *_args: ([], {}))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(
+        modal_app_v2,
+        "run_v2",
+        lambda rows, **_kwargs: types.SimpleNamespace(
+            observations=rows, acceptance={}, acceptance_reasons=[], runtime_diagnostics={}
+        ),
+    )
+    captured = []
+
+    def fake_stats(_video_path, output_dir, _observations, *, config, **_kwargs):
+        captured.append(config.possession_engine)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "results.json").write_text(
+            json.dumps({"config": {"possession_engine": config.possession_engine}}),
+            encoding="utf-8",
+        )
+        for name in ("tracks.jsonl", "teams.json", "shot_events.jsonl"):
+            (output_dir / name).write_text("{}\n" if name.endswith("jsonl") else "{}", encoding="utf-8")
+        generation = output_dir / "possession_v3" / "generations" / "engine-check"
+        generation.mkdir(parents=True)
+        (generation / "possession_v3.jsonl").write_text("{}\n", encoding="utf-8")
+        v4_diagnostics = output_dir / "possession_v4_diagnostics.jsonl"
+        if config.possession_engine == "v4":
+            v4_diagnostics.write_text('{"v4": {"feature_flag": true}}\n', encoding="utf-8")
+        manifest = {
+            "schema": "possession-engine-v3",
+            "engine": config.possession_engine,
+            "v4": {"enabled": config.possession_engine == "v4"},
+            "artifacts": {
+                "manifest": {"path": "possession_v3_manifest.json"},
+                "possession": {
+                    "path": "possession_v3/generations/engine-check/possession_v3.jsonl"
+                },
+                **(
+                    {"v4_diagnostics": {"path": "possession_v4_diagnostics.jsonl"}}
+                    if config.possession_engine == "v4"
+                    else {}
+                ),
+            },
+        }
+        (output_dir / "possession_v3_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        return types.SimpleNamespace(
+            to_dict=lambda: {
+                "tracks_file": "tracks.jsonl",
+                "teams_file": "teams.json",
+                "numbers_file": None,
+                "shot_events_file": "shot_events.jsonl",
+                "possession_v4_diagnostics_file": (
+                    "possession_v4_diagnostics.jsonl"
+                    if config.possession_engine == "v4"
+                    else None
+                ),
+            }
+        )
+
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", fake_stats)
+    cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+    process = cls.process.__dict__[
+        next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))
+    ].raw_f
+
+    payload = process(
+        cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60,
+        possession_engine=requested, return_artifacts=True,
+    )
+
+    assert captured == [expected]
+    root_manifest = json.loads(payload["artifacts"]["manifest.json"])
+    assert root_manifest["config"]["possession_engine"] == expected
+    stats = json.loads(payload["artifacts"]["stats/results.json"])
+    assert stats["config"]["possession_engine"] == expected
+    v3_manifest = json.loads(payload["artifacts"]["stats/possession_v3_manifest.json"])
+    assert v3_manifest["engine"] == expected
+    assert v3_manifest["v4"]["enabled"] is (expected == "v4")
+    stats_refs = root_manifest["artifacts"]["legacy_stats"]
+    if expected == "v4":
+        reference = stats_refs["possession_v4_diagnostics"]
+        assert reference["key"] == "stats/possession_v4_diagnostics.jsonl"
+        data = payload["artifacts"][reference["key"]]
+        assert reference["size_bytes"] == len(data)
+        assert reference["sha256"] == hashlib.sha256(data).hexdigest()
+    else:
+        assert "possession_v4_diagnostics" not in stats_refs
+
+
+def test_process_rejects_legacy_possession_engine(monkeypatch):
+    import modal_app_v2
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    cls = next(
+        value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+        if key.startswith("_sync_original")
+    )._user_cls
+    process = cls.process.__dict__[
+        next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))
+    ].raw_f
+
+    with pytest.raises(ValueError, match="must be 'v3' or 'v4'"):
+        process(cls(), video_bytes=b"fake-video", possession_engine="legacy")
 
 
 def test_process_court_projection_manifest_boundary(monkeypatch):

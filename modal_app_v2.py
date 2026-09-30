@@ -280,6 +280,12 @@ def _run_v2_stats(video_path: Path, output_dir: Path, observations, *, masks=Non
     return run_stats_from_v2_observations(video_path, config, output_dir, observations, **kwargs)
 
 
+def _validate_possession_engine(value: str) -> str:
+    if value not in {"v3", "v4"}:
+        raise ValueError("--possession-engine must be 'v3' or 'v4'")
+    return value
+
+
 def _session_objects(output: dict[str, Any]) -> list[dict[str, Any]]:
     ids = output.get("out_obj_ids")
     boxes = output.get("out_boxes_xywh")
@@ -514,7 +520,10 @@ class PipelineV2:
         segment_overlap: int | None = None,
         segment_seam_min_score: float | None = None,
         segment_seam_ambiguity_margin: float | None = None,
+        possession_engine: str | None = None,
     ) -> dict[str, Any]:
+        if possession_engine is not None:
+            _validate_possession_engine(possession_engine)
         validate_entrypoint_args(
             video_bytes=video_bytes,
             prompt=prompt,
@@ -546,7 +555,10 @@ class PipelineV2:
                     )
                 _add_mask_references(rows, masks)
                 frames = _load_video_frames(video_path, frame_start, frame_end)
-                config = PipelineConfig.from_env()
+                config_overrides = {}
+                if possession_engine is not None:
+                    config_overrides["possession_engine"] = _validate_possession_engine(possession_engine)
+                config = PipelineConfig.from_env(**config_overrides)
                 runner_kwargs = {"frames_by_index": frames, "masks_by_observation": masks}
                 runner_kwargs["bbox_sanitizer_config"] = config
                 if hasattr(self, "seams"):
@@ -561,6 +573,8 @@ class PipelineV2:
                 _add_clean_mask_references(result.observations, clean_masks)
                 video_metadata = _video_metadata(video_path)
                 artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
+                if config.possession_engine in {"v3", "v4"}:
+                    artifact_config["possession_engine"] = config.possession_engine
                 if segmented_run:
                     artifact_config.update({
                         "sam31_segmented": True,
@@ -623,10 +637,11 @@ class PipelineV2:
                         "possession_transitions": stats_payload.get("possession_transitions_file"),
                         "ball_tracks": stats_payload.get("ball_tracks_file"),
                         "projected_tracks": stats_payload.get("projected_tracks_file"),
-                        "projected_shots": stats_payload.get("projected_shots_file"),
-                        "projected_shots_image": stats_payload.get("projected_shots_image_file"),
-                        "annotated_video": stats_payload.get("annotated_video_file"),
-                    }.items()
+                         "projected_shots": stats_payload.get("projected_shots_file"),
+                         "projected_shots_image": stats_payload.get("projected_shots_image_file"),
+                         "annotated_video": stats_payload.get("annotated_video_file"),
+                         "possession_v4_diagnostics": stats_payload.get("possession_v4_diagnostics_file"),
+                     }.items()
                     if filename is not None
                 }
                 artifact_manifest["legacy_stats_results"] = "stats/results.json"
@@ -659,6 +674,7 @@ def main(
     segmented: bool | None = None,
     segment_window: int | None = None,
     segment_overlap: int | None = None,
+    possession_engine: str = "v3",
 ) -> None:
     if not video_path:
         raise ValueError("--video-path is required")
@@ -682,6 +698,7 @@ def main(
         segmented=segmented,
         segment_window=segment_window,
         segment_overlap=segment_overlap,
+        possession_engine=possession_engine,
         max_artifact_bytes=max_artifact_bytes or None,
     )
     artifacts = payload.pop("artifacts", None)
