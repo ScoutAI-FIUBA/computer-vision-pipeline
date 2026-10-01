@@ -32,11 +32,18 @@ from fastapi import Header, HTTPException
 APP_NAME = "scoutai-pipeline-v2-service"
 # The GPU app and class this wrapper drives, referenced by name so we never
 # import v2's module (keeping its boundary intact) and so it can be redeployed
-# independently. We target the progress-reporting fork (scoutai-pipeline-v2-prog)
-# so jobs emit real RUNNING progress; it is a separate app from the teammate's
-# deployed scoutai-pipeline-v2, which stays untouched.
-V2_APP = "scoutai-pipeline-v2-prog"
+# independently. We point straight at the teammate's deployed scoutai-pipeline-v2
+# so there is no forked copy to keep in sync.
+V2_APP = "scoutai-pipeline-v2"
 V2_CLASS = "PipelineV2"
+
+# v2 exposes no progress signal, so while the GPU job runs we emit a time-based
+# estimate that creeps toward a ceiling — enough to keep the UI bar moving. The
+# DONE callback fills the rest once results are uploaded. Replace this with real
+# progress once v2 emits it upstream.
+PROGRESS_HEARTBEAT_SECONDS = 12
+PROGRESS_STEP = 8
+PROGRESS_CEILING = 85
 
 # Mirror modal_app_v2's SAM 3.1 defaults. v2 processes a bounded frame window;
 # the backend can override these per job once it knows how to.
@@ -123,6 +130,24 @@ def _report_status(
         print(f"[job {job_id}] could not report {status}: {error!r}")
 
 
+def _await_with_progress(call, job_id: str | None):
+    """Block on the GPU job, emitting a time-based progress estimate meanwhile.
+
+    v2 reports no real progress, and `.get()` blocks, so we poll with a timeout
+    and nudge the bar up a step on each tick until the job returns. If the job
+    raised, `.get()` re-raises it here (not a TimeoutError), and the caller turns
+    it into a FAILED callback.
+    """
+
+    percent = 0
+    while True:
+        try:
+            return call.get(timeout=PROGRESS_HEARTBEAT_SECONDS)
+        except TimeoutError:
+            percent = min(PROGRESS_CEILING, percent + PROGRESS_STEP)
+            _report_status(job_id, "RUNNING", progress_percent=percent)
+
+
 @app.function(image=image, secrets=[r2_secret, callback_secret], timeout=1800)
 def run_backed_job(payload: dict) -> dict:
     """Fetch the video from R2, run v2 on the GPU, upload its stats, report back.
@@ -149,11 +174,8 @@ def run_backed_job(payload: dict) -> dict:
             _report_status(job_id, "RUNNING", progress_percent=0)
 
             pipeline_v2 = modal.Cls.from_name(V2_APP, V2_CLASS)
-            result = pipeline_v2().process.remote(
+            call = pipeline_v2().process.spawn(
                 video_bytes=video_path.read_bytes(),
-                # Passed so the GPU container reports RUNNING progress for this job
-                # as tracking advances (the fork reads the same callback secret).
-                job_id=job_id,
                 prompt=payload.get("prompt") or DEFAULT_PROMPT,
                 frame_start=int(payload.get("frame_start", DEFAULT_FRAME_START)),
                 frame_end=int(payload.get("frame_end", DEFAULT_FRAME_END)),
@@ -162,6 +184,7 @@ def run_backed_job(payload: dict) -> dict:
                 segmented=payload.get("segmented"),
                 max_artifact_bytes=MAX_ARTIFACT_BYTES,
             )
+            result = _await_with_progress(call, job_id)
 
             artifacts = result.get("artifacts") or {}
             uploaded: list[str] = []
