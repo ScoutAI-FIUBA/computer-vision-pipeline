@@ -427,6 +427,60 @@ def test_stale_and_replacement_inputs_are_isolated_and_stats_rejects_tampering(t
         _raw_method(cls, "stats_stage")(cls(), job_id="job-1", worker_id="worker-stats-2")
 
 
+def test_persist_job_input_renames_temporary_file_and_is_idempotent(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+    from modal_app_v2 import _persist_job_input
+
+    content = b"publishable video"
+    fingerprint = "sha256:" + hashlib.sha256(content).hexdigest()
+    replacements = []
+    original_replace = modal_app_v2.os.replace
+
+    def record_replace(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(modal_app_v2.os, "replace", record_replace)
+
+    path = _persist_job_input(tmp_path, fingerprint, content)
+    assert path.read_bytes() == content
+    assert len(replacements) == 1
+    assert replacements[0][1] == path
+    assert not list(path.parent.glob(".*.tmp"))
+
+    assert _persist_job_input(tmp_path, fingerprint, content) == path
+    assert len(replacements) == 1
+
+
+def test_persist_job_input_rejects_mismatched_bytes_before_publication(tmp_path: Path):
+    from modal_app_v2 import _persist_job_input
+
+    fingerprint = "sha256:" + hashlib.sha256(b"expected video").hexdigest()
+
+    with pytest.raises(ValueError, match="input fingerprint mismatch"):
+        _persist_job_input(tmp_path, fingerprint, b"poisoned video")
+
+    assert not (tmp_path / "inputs").exists()
+
+
+def test_persist_job_input_removes_temporary_file_when_write_fails(tmp_path: Path, monkeypatch):
+    from modal_app_v2 import _persist_job_input
+
+    content = b"write failure video"
+    fingerprint = "sha256:" + hashlib.sha256(content).hexdigest()
+
+    def fail_after_writing(path, data):
+        path.open("wb").write(data)
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(Path, "write_bytes", fail_after_writing)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        _persist_job_input(tmp_path, fingerprint, content)
+
+    assert not list((tmp_path / "inputs").glob(".*.tmp"))
+
+
 def test_committed_input_does_not_fallback_when_immutable_input_is_missing(tmp_path: Path):
     from modal_app_v2 import _committed_job_input
 

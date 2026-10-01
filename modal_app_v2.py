@@ -95,21 +95,24 @@ def _job_input_path(job: Path, input_fingerprint: str) -> Path:
 def _persist_job_input(job: Path, input_fingerprint: str, video_bytes: bytes) -> Path:
     """Persist input by fingerprint; never overwrite another generation's input."""
     path = _job_input_path(job, input_fingerprint)
-    path.parent.mkdir(parents=True, exist_ok=True)
     digest = input_fingerprint.removeprefix("sha256:")
-    if path.is_file():
+    if hashlib.sha256(video_bytes).hexdigest() != digest:
+        raise ValueError("input fingerprint mismatch")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with (path.parent / ".publish.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if path.is_file():
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise ValueError("job input fingerprint collision")
+            return path
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_bytes(video_bytes)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
         if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError("job input fingerprint collision")
-        return path
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_bytes(video_bytes)
-    try:
-        os.link(temporary, path)
-    except FileExistsError:
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-            raise ValueError("job input fingerprint collision")
-    finally:
-        temporary.unlink(missing_ok=True)
     return path
 
 
