@@ -59,15 +59,14 @@ FALLBACK_FRAME_END = 130
 # cover a whole clip is SEGMENTED mode: bounded windows (each under the limit)
 # with overlap, whose identities are stitched across the seams.
 #
-# The right window is clip-dependent: it must hold <=16 distinct tracks. We
-# default to the pipeline's documented default (32/1), which is conservative and
-# the most likely to stay under the cap on dense footage. A payload can raise it
-# for sparser clips (e.g. 150/20). NOTE: a clip with spurious/fragmented tracks
-# can still exceed 16 even at a small window -- that is a pipeline data-quality
-# issue, not something the window size alone can fix.
+# The window that holds <=16 tracks is clip-dependent (a dense clip has more
+# distinct tracks in the same span). Rather than guess one value, we try a ladder
+# largest-first -- a bigger window means fewer segments, so it's faster and makes
+# fewer client round-trips when it fits. If a run trips the 16-object cap we step
+# down to a smaller window and retry. A payload may pin segment_window to skip the
+# ladder.
 DEFAULT_SEGMENTED = True
-DEFAULT_SEGMENT_WINDOW = 32
-DEFAULT_SEGMENT_OVERLAP = 1
+SEGMENT_WINDOW_LADDER = (96, 48, 24)
 
 # v2 nests its box-score outputs under this subdirectory; the backend's stats
 # endpoints read them at the results-key root, so we flatten this prefix away on
@@ -183,6 +182,31 @@ def _frame_bounds(payload: dict, video_path: Path) -> tuple[int, int]:
     return FALLBACK_FRAME_START, FALLBACK_FRAME_END
 
 
+def _segment_windows(payload: dict) -> tuple[int, ...]:
+    """Segment windows to try, largest first. A pinned payload value wins."""
+
+    pinned = payload.get("segment_window")
+    if pinned is not None:
+        return (int(pinned),)
+    return SEGMENT_WINDOW_LADDER
+
+
+def _segment_overlap(payload: dict, window: int) -> int:
+    """Seam overlap for a window: a payload value, else a fraction of the window."""
+
+    pinned = payload.get("segment_overlap")
+    if pinned is not None:
+        return int(pinned)
+    return max(1, window // 8)
+
+
+def _is_object_cap_error(exc: Exception) -> bool:
+    """Whether a run failed because a segment exceeded SAM 3.1's object cap."""
+
+    message = str(exc).lower()
+    return "active objects" in message and "maximum" in message
+
+
 def _await_with_progress(call, job_id: str | None):
     """Block on the GPU job, emitting a time-based progress estimate meanwhile.
 
@@ -228,23 +252,40 @@ def run_backed_job(payload: dict) -> dict:
 
             frame_start, frame_end = _frame_bounds(payload, video_path)
             pipeline_v2 = modal.Cls.from_name(V2_APP, V2_CLASS)
-            call = pipeline_v2().process.spawn(
-                video_bytes=video_path.read_bytes(),
-                prompt=payload.get("prompt") or DEFAULT_PROMPT,
-                frame_start=frame_start,
-                frame_end=frame_end,
-                return_artifacts=True,
-                possession_engine=payload.get("possession_engine"),
-                # Segmented by default so a whole-clip run stays under SAM 3.1's
-                # 16-object-per-session limit and keeps team/identity resolution.
-                segmented=payload.get("segmented", DEFAULT_SEGMENTED),
-                segment_window=payload.get("segment_window", DEFAULT_SEGMENT_WINDOW),
-                segment_overlap=payload.get("segment_overlap", DEFAULT_SEGMENT_OVERLAP),
-                max_artifact_bytes=MAX_ARTIFACT_BYTES,
-            )
-            result = _await_with_progress(call, job_id)
+            video_bytes = video_path.read_bytes()
+            windows = _segment_windows(payload)
 
-            artifacts = result.get("artifacts") or {}
+            result = None
+            for attempt, window in enumerate(windows):
+                overlap = _segment_overlap(payload, window)
+                call = pipeline_v2().process.spawn(
+                    video_bytes=video_bytes,
+                    prompt=payload.get("prompt") or DEFAULT_PROMPT,
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    return_artifacts=True,
+                    possession_engine=payload.get("possession_engine"),
+                    # Segmented so a whole-clip run stays under SAM 3.1's
+                    # 16-object-per-session limit and keeps team/identity resolution.
+                    segmented=payload.get("segmented", DEFAULT_SEGMENTED),
+                    segment_window=window,
+                    segment_overlap=overlap,
+                    max_artifact_bytes=MAX_ARTIFACT_BYTES,
+                )
+                try:
+                    result = _await_with_progress(call, job_id)
+                    break
+                except Exception as exc:  # noqa: BLE001 - only the cap error is retriable
+                    if _is_object_cap_error(exc) and attempt < len(windows) - 1:
+                        print(
+                            f"[job {job_id}] segment window {window} tripped the 16-object "
+                            f"cap; retrying with a smaller window"
+                        )
+                        _report_status(job_id, "RUNNING", progress_percent=0)
+                        continue
+                    raise
+
+            artifacts = (result or {}).get("artifacts") or {}
             uploaded: list[str] = []
             if output_prefix:
                 prefix = output_prefix.rstrip("/") + "/"
