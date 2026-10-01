@@ -30,10 +30,12 @@ import modal
 from fastapi import Header, HTTPException
 
 APP_NAME = "scoutai-pipeline-v2-service"
-# The isolated GPU app and class this wrapper drives, referenced by name so we
-# never import v2's module (keeping its boundary intact) and so v2 can be
-# redeployed independently.
-V2_APP = "scoutai-pipeline-v2"
+# The GPU app and class this wrapper drives, referenced by name so we never
+# import v2's module (keeping its boundary intact) and so it can be redeployed
+# independently. We target the progress-reporting fork (scoutai-pipeline-v2-prog)
+# so jobs emit real RUNNING progress; it is a separate app from the teammate's
+# deployed scoutai-pipeline-v2, which stays untouched.
+V2_APP = "scoutai-pipeline-v2-prog"
 V2_CLASS = "PipelineV2"
 
 # Mirror modal_app_v2's SAM 3.1 defaults. v2 processes a bounded frame window;
@@ -149,6 +151,9 @@ def run_backed_job(payload: dict) -> dict:
             pipeline_v2 = modal.Cls.from_name(V2_APP, V2_CLASS)
             result = pipeline_v2().process.remote(
                 video_bytes=video_path.read_bytes(),
+                # Passed so the GPU container reports RUNNING progress for this job
+                # as tracking advances (the fork reads the same callback secret).
+                job_id=job_id,
                 prompt=payload.get("prompt") or DEFAULT_PROMPT,
                 frame_start=int(payload.get("frame_start", DEFAULT_FRAME_START)),
                 frame_end=int(payload.get("frame_end", DEFAULT_FRAME_END)),
