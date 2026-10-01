@@ -23,6 +23,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -45,11 +46,13 @@ PROGRESS_HEARTBEAT_SECONDS = 12
 PROGRESS_STEP = 8
 PROGRESS_CEILING = 85
 
-# Mirror modal_app_v2's SAM 3.1 defaults. v2 processes a bounded frame window;
-# the backend can override these per job once it knows how to.
 DEFAULT_PROMPT = "basketball player on the court"
-DEFAULT_FRAME_START = 60
-DEFAULT_FRAME_END = 130
+# By default we process the WHOLE clip: v2's bounded window (60-130) only tracks
+# players there, so any shot outside it gets a stale, wrong court position. We
+# probe the video length and pass 0..last. A payload may still override with
+# explicit frame_start/frame_end. These are the fallback if probing fails.
+FALLBACK_FRAME_START = 60
+FALLBACK_FRAME_END = 130
 
 # v2 nests its box-score outputs under this subdirectory; the backend's stats
 # endpoints read them at the results-key root, so we flatten this prefix away on
@@ -64,10 +67,12 @@ MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 
 app = modal.App(APP_NAME)
 
-# A light CPU image: no GPU, no models. It only needs an S3 client (R2 is
-# S3-compatible) and the pipeline package for its R2Storage helper.
+# A light CPU image: no GPU, no models. It needs an S3 client (R2 is
+# S3-compatible), the pipeline package for its R2Storage helper, and ffprobe
+# (from ffmpeg) to read the clip's frame count so we can track the whole video.
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    .apt_install("ffmpeg")
     .pip_install("boto3==1.35.36", "fastapi==0.115.6")
     .add_local_python_source("pipeline")
 )
@@ -130,6 +135,39 @@ def _report_status(
         print(f"[job {job_id}] could not report {status}: {error!r}")
 
 
+def _frame_count(video_path: Path) -> int | None:
+    """Total video frames via ffprobe, or None if it can't be read."""
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1", str(video_path),
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        return int(result.stdout.strip())
+    except Exception:  # noqa: BLE001 - probing is best-effort; fall back on failure
+        return None
+
+
+def _frame_bounds(payload: dict, video_path: Path) -> tuple[int, int]:
+    """The frame range to track: explicit payload bounds, else the whole clip.
+
+    v2's default window (60-130) only tracks players there, so shots elsewhere
+    get a stale court position. Unless the caller pins a range, we track the
+    entire video so every shot has real positions to project from.
+    """
+
+    if payload.get("frame_start") is not None and payload.get("frame_end") is not None:
+        return int(payload["frame_start"]), int(payload["frame_end"])
+    count = _frame_count(video_path)
+    if count and count > 1:
+        return 0, count - 1
+    return FALLBACK_FRAME_START, FALLBACK_FRAME_END
+
+
 def _await_with_progress(call, job_id: str | None):
     """Block on the GPU job, emitting a time-based progress estimate meanwhile.
 
@@ -173,12 +211,13 @@ def run_backed_job(payload: dict) -> dict:
             # "queued behind a download".
             _report_status(job_id, "RUNNING", progress_percent=0)
 
+            frame_start, frame_end = _frame_bounds(payload, video_path)
             pipeline_v2 = modal.Cls.from_name(V2_APP, V2_CLASS)
             call = pipeline_v2().process.spawn(
                 video_bytes=video_path.read_bytes(),
                 prompt=payload.get("prompt") or DEFAULT_PROMPT,
-                frame_start=int(payload.get("frame_start", DEFAULT_FRAME_START)),
-                frame_end=int(payload.get("frame_end", DEFAULT_FRAME_END)),
+                frame_start=frame_start,
+                frame_end=frame_end,
                 return_artifacts=True,
                 possession_engine=payload.get("possession_engine"),
                 segmented=payload.get("segmented"),
