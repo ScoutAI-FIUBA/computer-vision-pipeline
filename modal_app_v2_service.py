@@ -54,6 +54,21 @@ DEFAULT_PROMPT = "basketball player on the court"
 FALLBACK_FRAME_START = 60
 FALLBACK_FRAME_END = 130
 
+# SAM 3.1 is capped at 16 active objects per session, so a single full-video
+# session overflows and identity/team resolution collapses. The intended way to
+# cover a whole clip is SEGMENTED mode: bounded windows (each under the limit)
+# with overlap, whose identities are stitched across the seams.
+#
+# The right window is clip-dependent: it must hold <=16 distinct tracks. We
+# default to the pipeline's documented default (32/1), which is conservative and
+# the most likely to stay under the cap on dense footage. A payload can raise it
+# for sparser clips (e.g. 150/20). NOTE: a clip with spurious/fragmented tracks
+# can still exceed 16 even at a small window -- that is a pipeline data-quality
+# issue, not something the window size alone can fix.
+DEFAULT_SEGMENTED = True
+DEFAULT_SEGMENT_WINDOW = 32
+DEFAULT_SEGMENT_OVERLAP = 1
+
 # v2 nests its box-score outputs under this subdirectory; the backend's stats
 # endpoints read them at the results-key root, so we flatten this prefix away on
 # upload.
@@ -220,7 +235,11 @@ def run_backed_job(payload: dict) -> dict:
                 frame_end=frame_end,
                 return_artifacts=True,
                 possession_engine=payload.get("possession_engine"),
-                segmented=payload.get("segmented"),
+                # Segmented by default so a whole-clip run stays under SAM 3.1's
+                # 16-object-per-session limit and keeps team/identity resolution.
+                segmented=payload.get("segmented", DEFAULT_SEGMENTED),
+                segment_window=payload.get("segment_window", DEFAULT_SEGMENT_WINDOW),
+                segment_overlap=payload.get("segment_overlap", DEFAULT_SEGMENT_OVERLAP),
                 max_artifact_bytes=MAX_ARTIFACT_BYTES,
             )
             result = _await_with_progress(call, job_id)
