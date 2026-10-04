@@ -81,14 +81,15 @@ MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 
 app = modal.App(APP_NAME)
 
-# A light CPU image: no GPU, no models. It needs an S3 client (R2 is
-# S3-compatible), the pipeline package for its R2Storage helper, and ffprobe
-# (from ffmpeg) to read the clip's frame count so we can track the whole video.
+# A light CPU image: no GPU, no models. It needs only an S3 client (R2 is
+# S3-compatible) and ffprobe (from ffmpeg) to read the clip's frame count. We do
+# NOT ship the `pipeline` package: importing it pulls in cv2/torch etc. (via
+# pipeline/__init__ -> results), which this slim image lacks — so R2 access is
+# done with boto3 directly.
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
     .pip_install("boto3==1.35.36", "fastapi==0.115.6")
-    .add_local_python_source("pipeline")
 )
 
 r2_secret = modal.Secret.from_name("scoutai-r2")
@@ -147,6 +148,28 @@ def _report_status(
             print(f"[job {job_id}] reported {status} ({response.status})")
     except Exception as error:  # noqa: BLE001 - reporting must never break a job
         print(f"[job {job_id}] could not report {status}: {error!r}")
+
+
+def _r2_client():
+    """A boto3 S3 client for R2, plus the bucket name, from the scoutai-r2 secret.
+
+    Done inline rather than importing pipeline.storage: that would pull in the
+    whole pipeline package (cv2/torch), which this slim CPU image does not carry.
+    """
+
+    import boto3
+
+    required = ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME", "R2_ENDPOINT_URL")
+    missing = [name for name in required if not (os.getenv(name) or "").strip()]
+    if missing:
+        raise RuntimeError(f"Missing R2 environment variables: {', '.join(missing)}")
+    client = boto3.client(
+        "s3",
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"].strip(),
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"].strip(),
+        endpoint_url=os.environ["R2_ENDPOINT_URL"].strip(),
+    )
+    return client, os.environ["R2_BUCKET_NAME"].strip()
 
 
 def _frame_count(video_path: Path) -> int | None:
@@ -233,18 +256,16 @@ def run_backed_job(payload: dict) -> dict:
     work happens inside the separate `scoutai-pipeline-v2` app, called remotely.
     """
 
-    from pipeline.storage import R2Storage
-
     job_id = payload.get("job_id")
     r2_key = payload.get("r2_key")
     output_prefix = payload.get("output_prefix")
 
     try:
-        storage = R2Storage()
+        s3, bucket = _r2_client()
         with tempfile.TemporaryDirectory(prefix="v2svc_") as work_dir:
             work = Path(work_dir)
             video_path = work / "input.mp4"
-            storage.download(r2_key, video_path)
+            s3.download_file(bucket, r2_key, str(video_path))
 
             # RUNNING only once the video is local, so it means "processing", not
             # "queued behind a download".
@@ -300,7 +321,7 @@ def run_backed_job(payload: dict) -> dict:
                     name = relative_path[len(STATS_PREFIX):]
                     staged = work / "upload.bin"
                     staged.write_bytes(data)
-                    storage.upload(staged, prefix + name)
+                    s3.upload_file(str(staged), bucket, prefix + name)
                     uploaded.append(name)
 
             _report_status(
