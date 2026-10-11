@@ -368,6 +368,108 @@ def test_stats_stage_reads_enriched_staged_tracking_contract(tmp_path: Path, mon
     assert captured["observations"]["team_id"] == 1
 
 
+def test_possession_only_stage_loads_durable_inputs_records_failure_and_retries_idempotently(
+    tmp_path: Path, monkeypatch
+):
+    import numpy as np
+    import modal_app_v2
+    import pipeline.runner as runner
+    from modal_app_v2 import read_job_manifest, write_job_manifest
+    from pipeline.results import (
+        _artifact_ref, _manifest_hash, load_stage_generation, package_artifacts,
+        publish_stage_generation,
+    )
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    job = tmp_path / "job-1"
+    package = job / "package"
+    observations = [{
+        "observation_key": "0:3", "frame_index": 0, "raw_track_id": 3,
+        "bbox_xyxy": [0, 0, 2, 2], "stable_player_id": "player-3", "team_id": 1,
+        "track_state": "tracked",
+    }]
+    package_artifacts(
+        package, observations, {"0:3": np.ones((2, 2), dtype=np.uint8)},
+        input_fingerprint="input", frame_bounds=[0, 0],
+        video_metadata={"fps": 30, "width": 2, "height": 2},
+    )
+    ball_path = package / "ball_tracks.jsonl"
+    ball_path.write_text(
+        json.dumps({"frame_index": 0, "xyxy": [1, 1, 2, 2], "track_state": "tracked"}) + "\n",
+        encoding="utf-8",
+    )
+    tracking_manifest_path = package / "manifest.json"
+    tracking_manifest = json.loads(tracking_manifest_path.read_text(encoding="utf-8"))
+    tracking_manifest["artifacts"]["ball_tracks"] = _artifact_ref(ball_path, "ball_tracks.jsonl")
+    tracking_manifest["artifacts"]["manifest"]["sha256"] = _manifest_hash(tracking_manifest)
+    tracking_manifest_path.write_text(json.dumps(tracking_manifest, sort_keys=True), encoding="utf-8")
+    tracking_artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    tracking = publish_stage_generation(
+        job / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="tracking-request",
+        artifacts=tracking_artifacts, frame_bounds=[0, 0],
+    )
+    write_job_manifest(job, {
+        "job_id": "job-1", "state": "tracked", "input_fingerprint": "input",
+        "tracking_generation": tracking["generation"],
+    })
+
+    heavy_passes = (
+        "_project_v2_rows", "_write_shot_events", "_maybe_write_projected_shots",
+        "run_v2_number_evidence", "build_tracknet_detector",
+    )
+    for name in heavy_passes:
+        monkeypatch.setattr(runner, name, lambda *args, _name=name, **kwargs: pytest.fail(_name))
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_generation", lambda *args, **kwargs: pytest.fail("stats"))
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *args, **kwargs: pytest.fail("TrackNet/player tracking"))
+    monkeypatch.setattr(modal_app_v2, "build_number_predictor", lambda *args, **kwargs: pytest.fail("numbers"))
+    monkeypatch.setattr(modal_app_v2, "build_detector", lambda *args, **kwargs: pytest.fail("numbers"))
+
+    original_helper = modal_app_v2.run_possession_only_from_v2_artifacts
+    helper_calls = []
+
+    def fail_once(output, loaded_observations, loaded_ball_rows, **kwargs):
+        helper_calls.append((loaded_observations, loaded_ball_rows, kwargs))
+        raise RuntimeError("possession transient failure")
+
+    monkeypatch.setattr(modal_app_v2, "run_possession_only_from_v2_artifacts", fail_once)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    with pytest.raises(RuntimeError, match="transient failure"):
+        _raw_method(cls, "possession_only_stage")(
+            cls(), job_id="job-1", possession_engine="v5", worker_id="worker-a"
+        )
+
+    failed = read_job_manifest(job)
+    assert failed["attempts"]["possession"] == 1
+    assert failed["lease"] is None
+    assert failed["errors"][-1]["stage"] == "possession"
+    assert helper_calls[0][0] == observations
+    assert helper_calls[0][1][0]["frame_index"] == 0
+
+    def succeed(*args, **kwargs):
+        helper_calls.append((args[1], args[2], kwargs))
+        return original_helper(*args, **kwargs)
+
+    monkeypatch.setattr(modal_app_v2, "run_possession_only_from_v2_artifacts", succeed)
+    first = _raw_method(cls, "possession_only_stage")(
+        cls(), job_id="job-1", possession_engine="v5", worker_id="worker-a"
+    )
+    second = _raw_method(cls, "possession_only_stage")(
+        cls(), job_id="job-1", possession_engine="v5", worker_id="worker-b"
+    )
+
+    assert first == second
+    assert len(helper_calls) == 2
+    assert read_job_manifest(job)["attempts"]["possession"] == 2
+    possession = load_stage_generation(job / "possession", first["generation"])
+    assert possession["stage"] == "possession"
+    assert possession["tracking_generation"] == tracking["generation"]
+    assert possession["complete"] is True
+    assert len(list((job / "possession" / "generations").iterdir())) == 1
+
+
 def test_stale_and_replacement_inputs_are_isolated_and_stats_rejects_tampering(tmp_path: Path, monkeypatch):
     import modal_app_v2
     from modal_app_v2 import _committed_job_input, _persist_job_input, write_job_manifest
@@ -449,6 +551,62 @@ def test_committed_input_rejects_tampered_immutable_input(tmp_path: Path):
 
     with pytest.raises(ValueError, match="fingerprint mismatch"):
         _committed_job_input(tmp_path, fingerprint)
+
+
+def test_persist_job_input_uses_atomic_rename_for_modal_compatible_publication(
+    tmp_path: Path, monkeypatch
+):
+    import modal_app_v2
+
+    content = b"modal-compatible video"
+    fingerprint = "sha256:" + hashlib.sha256(content).hexdigest()
+    monkeypatch.setattr(modal_app_v2.os, "link", lambda *_args: pytest.fail("os.link must not be used"))
+
+    path = modal_app_v2._persist_job_input(tmp_path / "job-1", fingerprint, content)
+
+    assert path.read_bytes() == content
+
+
+def test_persist_job_input_rejects_hash_mismatch_before_publication(tmp_path: Path):
+    from modal_app_v2 import _persist_job_input
+
+    fingerprint = "sha256:" + hashlib.sha256(b"expected").hexdigest()
+    job = tmp_path / "job-1"
+
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        _persist_job_input(job, fingerprint, b"actual")
+
+    assert not (job / "inputs").exists()
+
+
+def test_persist_job_input_keeps_existing_matching_destination(tmp_path: Path):
+    from modal_app_v2 import _persist_job_input
+
+    content = b"already committed"
+    fingerprint = "sha256:" + hashlib.sha256(content).hexdigest()
+    job = tmp_path / "job-1"
+    first = _persist_job_input(job, fingerprint, content)
+
+    assert _persist_job_input(job, fingerprint, content) == first
+    assert list((job / "inputs").iterdir()) == [first]
+
+
+def test_persist_job_input_cleans_temp_file_when_publication_fails(tmp_path: Path, monkeypatch):
+    import modal_app_v2
+
+    content = b"publication failure"
+    fingerprint = "sha256:" + hashlib.sha256(content).hexdigest()
+
+    def fail_replace(*_args):
+        raise PermissionError("rename failed")
+
+    monkeypatch.setattr(modal_app_v2.os, "replace", fail_replace)
+    job = tmp_path / "job-1"
+
+    with pytest.raises(PermissionError, match="rename failed"):
+        modal_app_v2._persist_job_input(job, fingerprint, content)
+
+    assert list((job / "inputs").iterdir()) == []
 
 
 def test_staged_process_records_failure_and_does_not_fallback(tmp_path: Path, monkeypatch):
@@ -1000,7 +1158,7 @@ def test_local_entrypoint_writes_remote_artifact_bytes(tmp_path: Path, monkeypat
     assert "tracking_identity" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("selected", ["v4", "v3"])
+@pytest.mark.parametrize("selected", ["v4", "v5", "v3"])
 def test_local_entrypoint_forwards_selected_possession_engine(
     tmp_path: Path, monkeypatch, capsys, selected: str
 ):
@@ -1019,12 +1177,9 @@ def test_local_entrypoint_forwards_selected_possession_engine(
         process = FakeProcess()
 
     monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
-    if selected == "v4":
-        modal_app_v2.main(
-            video_path=str(video), output_dir=str(tmp_path / "output"), possession_engine=selected
-        )
-    else:
-        modal_app_v2.main(video_path=str(video), output_dir=str(tmp_path / "output"))
+    modal_app_v2.main(
+        video_path=str(video), output_dir=str(tmp_path / "output"), possession_engine=selected
+    )
 
     assert forwarded["possession_engine"] == selected
 
@@ -1039,7 +1194,7 @@ def test_local_entrypoint_forwards_selected_possession_engine(
         ({"tracking_only": True, "job_id": "job"}, "video-path is required"),
         ({"staged": True}, "job-id is required"),
         ({"stats_only": True}, "job-id is required"),
-        ({"job_id": "job"}, "requires --staged"),
+        ({"job_id": "job"}, "requires --staged, --stats-only, --tracking-only, or --possession-only"),
         ({"stats_only": True, "job_id": "job", "video_path": "input.mp4"}, "cannot be used"),
         ({"staged": True, "job_id": "job"}, "video-path is required"),
     ],
@@ -1079,7 +1234,8 @@ def test_local_entrypoint_routes_staged_process_to_deployed_method(tmp_path, mon
     assert forwarded["job_id"] == "job-1"
 
 
-def test_local_entrypoint_routes_stats_only_to_deployed_stats_method(monkeypatch, capsys):
+@pytest.mark.parametrize("selected", ["v3", "v5"])
+def test_local_entrypoint_routes_stats_only_to_deployed_stats_method(monkeypatch, capsys, selected):
     import modal_app_v2
 
     forwarded = {}
@@ -1093,10 +1249,54 @@ def test_local_entrypoint_routes_stats_only_to_deployed_stats_method(monkeypatch
         stats_stage = FakeStats()
 
     monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
-    modal_app_v2.main(stats_only=True, job_id="job-1")
+    modal_app_v2.main(stats_only=True, job_id="job-1", possession_engine=selected)
 
-    assert forwarded == {"job_id": "job-1", "possession_engine": "v3"}
+    assert forwarded == {"job_id": "job-1", "possession_engine": selected}
     assert "stats-1" in capsys.readouterr().out
+
+
+def test_local_entrypoint_routes_possession_only_without_video(monkeypatch, capsys):
+    import modal_app_v2
+
+    forwarded = {}
+
+    class FakePossession:
+        def remote(self, **kwargs):
+            forwarded.update(kwargs)
+            return {"status": "complete", "generation": "possession-1"}
+
+    class FakePipeline:
+        possession_only_stage = FakePossession()
+
+    monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
+    modal_app_v2.main(possession_only=True, job_id="job-1", possession_engine="v5")
+
+    assert forwarded == {"job_id": "job-1", "possession_engine": "v5"}
+    assert "possession-1" in capsys.readouterr().out
+
+
+def test_possession_only_rejects_video_and_other_modes():
+    from modal_app_v2 import _validate_local_entrypoint_mode
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_local_entrypoint_mode(
+            video_path="input.mp4", job_id="job-1", staged=True,
+            stats_only=False, tracking_only=False, possession_only=True,
+        )
+    with pytest.raises(ValueError, match="cannot be used"):
+        _validate_local_entrypoint_mode(
+            video_path="input.mp4", job_id="job-1", staged=False,
+            stats_only=False, tracking_only=False, possession_only=True,
+        )
+
+
+def test_stats_fingerprint_is_engine_specific():
+    from modal_app_v2 import _stats_stage_fingerprint
+    from pipeline.config import PipelineConfig
+
+    v4 = PipelineConfig(roboflow_api_key="key", possession_engine="v4")
+    v5 = PipelineConfig(roboflow_api_key="key", possession_engine="v5")
+    assert _stats_stage_fingerprint("v4", "tracking-1", v4) != _stats_stage_fingerprint("v5", "tracking-1", v5)
 
 
 def test_local_entrypoint_routes_tracking_only_to_deployed_track_method(tmp_path, monkeypatch, capsys):
@@ -2114,7 +2314,7 @@ def test_process_rejects_legacy_possession_engine(monkeypatch):
         next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))
     ].raw_f
 
-    with pytest.raises(ValueError, match="must be 'v3' or 'v4'"):
+    with pytest.raises(ValueError, match="must be 'v3', 'v4', or 'v5'"):
         process(cls(), video_bytes=b"fake-video", possession_engine="legacy")
 
 

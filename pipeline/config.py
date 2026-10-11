@@ -170,6 +170,8 @@ class PipelineConfig:
     court_keypoint_confidence: float = DEFAULT_COURT_KEYPOINT_CONFIDENCE
 
     # --- SAM 3.1 V2 (kept separate from legacy SAM2 settings) ---
+    # Segmented sessions keep the model/downstream limit at 16; only a bounded
+    # 17-22 object overflow receives deterministic quality-based grace.
     sam31_prompt: str = DEFAULT_SAM31_PROMPT
     sam31_frame_start: int = DEFAULT_SAM31_FRAME_START
     sam31_frame_end: int = DEFAULT_SAM31_FRAME_END
@@ -204,7 +206,7 @@ class PipelineConfig:
 
     @property
     def possession_v3_enabled(self) -> bool:
-        return self.possession_engine in {"v3", "v4"}
+        return self.possession_engine in {"v3", "v4", "v5"}
 
     @property
     def possession_v4_enabled(self) -> bool:
@@ -338,8 +340,8 @@ class PipelineConfig:
     prefetch_detections: bool = True
 
     def __post_init__(self) -> None:
-        if self.possession_engine not in {"legacy", "v3", "v4"}:
-            raise ValueError("Unknown possession_engine: expected 'legacy', 'v3', or 'v4'")
+        if self.possession_engine not in {"legacy", "v3", "v4", "v5"}:
+            raise ValueError("Unknown possession_engine: expected 'legacy', 'v3', 'v4', or 'v5'")
         grace = _finite_v3(self.possession_v3_grace_seconds, "possession_v3_grace_seconds")
         recovery_window = _finite_v3(self.possession_v3_recovery_window_seconds, "possession_v3_recovery_window_seconds")
         hysteresis = _finite_v3(self.possession_v3_hysteresis_margin, "possession_v3_hysteresis_margin")

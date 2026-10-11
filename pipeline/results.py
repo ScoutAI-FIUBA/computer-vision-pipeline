@@ -363,6 +363,7 @@ def publish_stage_generation(
     artifacts: Mapping[str, bytes | Path],
     frame_bounds: list[int] | None = None,
     tracking_generation: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Publish a complete immutable stage generation and atomically advance current.json."""
     root = Path(root)
@@ -394,6 +395,8 @@ def publish_stage_generation(
             "frame_bounds": frame_bounds, "tracking_generation": tracking_generation,
             "complete": True, "artifacts": refs,
         }
+        if metadata:
+            manifest.update(dict(metadata))
         manifest["manifest_sha256"] = hashlib.sha256(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")

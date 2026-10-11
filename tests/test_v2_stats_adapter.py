@@ -412,6 +412,44 @@ def test_v2_stats_v4_emits_diagnostics_without_invoking_v3_scorer(tmp_path, monk
     assert v4_calls
 
 
+def test_v2_stats_v5_dispatches_a4_profile_and_keeps_v4_isolated(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner,
+        "probe",
+        lambda _path: SimpleNamespace(
+            fps=30.0, frame_count=1, width=100, height=100, duration_seconds=1 / 30
+        ),
+    )
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(""))
+    calls = []
+    real_scorer = runner.score_candidates
+
+    def spy_scorer(*args, **kwargs):
+        calls.append(kwargs)
+        return real_scorer(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "score_candidates", spy_scorer)
+    monkeypatch.setattr(runner, "score_candidates_v4", lambda *_args, **_kwargs: pytest.fail("V4 scorer ran"))
+    result = run_stats_from_v2_observations(
+        video,
+        PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none",
+                       number_evidence_enabled=False, possession_engine="v5"),
+        tmp_path / "stats",
+        [{"frame_index": 0, "raw_track_id": 17, "stable_player_id": "player-001",
+          "bbox_xyxy": [10, 10, 30, 50], "team_id": 1, "track_state": "tracked", "confidence": .95}],
+    )
+    manifest = json.loads((tmp_path / "stats" / "possession_v3_manifest.json").read_text())
+    assert calls
+    assert manifest["config"]["engine"] == "v5"
+    assert "v4" not in manifest
+    assert "v4_diagnostics" not in manifest["artifacts"]
+    assert result.config["possession_engine"] == "v5"
+
+
 def test_v2_stats_projects_authoritative_rows_and_shots(tmp_path, monkeypatch):
     import pipeline.runner as runner
 

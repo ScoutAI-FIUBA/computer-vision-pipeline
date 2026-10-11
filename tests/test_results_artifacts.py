@@ -581,6 +581,22 @@ def test_runner_v4_artifacts_publish_public_pointer_hash_and_replay(tmp_path: Pa
     assert payload["possession_v4_schema_version"] == 1
 
 
+def test_identical_inputs_publish_separate_v4_and_v5_generations(tmp_path: Path):
+    players = [{"frame_index": 0, "raw_track_id": 6, "stable_player_id": "player-006",
+                "team_id": 1, "xyxy": [0, 0, 20, 40], "confidence": .9,
+                "mask_valid": True, "mask_contains": True}]
+    balls = [{"frame_index": 0, "timestamp_seconds": 0.0, "track_state": "detected",
+              "confidence": .9, "center_xy": [10, 20]}]
+    v4 = _write_v3_artifacts(tmp_path, players, balls, fps=10,
+                             config=PipelineConfig(roboflow_api_key="key", possession_engine="v4"))
+    v5 = _write_v3_artifacts(tmp_path, players, balls, fps=10,
+                             config=PipelineConfig(roboflow_api_key="key", possession_engine="v5"))
+    assert v4["generation"] != v5["generation"]
+    assert v4["artifacts"]["possession"]["path"] != v5["artifacts"]["possession"]["path"]
+    assert v4["v4"]["feature_flag"] == "v4"
+    assert "v4" not in v5 and "v4_diagnostics" not in v5["artifacts"]
+
+
 def test_v3_writer_is_feature_flag_isolated(tmp_path: Path):
     base = PipelineConfig(roboflow_api_key="test-key")
     assert _write_v3_artifacts(tmp_path / "legacy", [], [], fps=30, config=base) == {}

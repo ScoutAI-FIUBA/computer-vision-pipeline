@@ -102,7 +102,23 @@ def test_non_v4_serialization_omits_spatial_diagnostics(engine):
     record = _json_record(observation, {"engine": engine})
     serialized = json.dumps(record)
     assert all(name not in serialized for name in
-               ("spatial_score", "mask_score", "bbox_score", "mask_bbox_agreement"))
+                ("spatial_score", "mask_score", "bbox_score", "mask_bbox_agreement"))
+
+
+def test_v5_config_selects_a4_compatible_non_v4_profile():
+    config = PipelineConfig(roboflow_api_key="key", possession_engine="v5")
+    assert config.possession_v3_enabled is True
+    assert config.possession_v4_enabled is False
+    assert engine_name(config) == "v5"
+
+
+def test_v5_serialization_has_engine_metadata_without_v4_diagnostics():
+    candidate = score_candidates_v4([player("p1", [0, 0, 20, 20])], {"x": 10, "y": 10})[0]
+    record = _json_record(PossessionObservation(1, PossessionState.OBSERVED, EvidenceKind.OBSERVED,
+                                                candidates=[candidate]), {"engine": "v5"})
+    assert record["config"]["engine"] == "v5"
+    assert "v4" not in record
+    assert "spatial_score" not in json.dumps(record)
 
 
 def test_v4_serialization_keeps_spatial_diagnostics():

@@ -31,15 +31,21 @@ from pipeline.results import (
 from pipeline.config import PipelineConfig
 from pipeline.number_predictor import build_number_predictor
 from pipeline.detection import build_detector
-from pipeline.runner import run_stats_from_v2_observations, run_stats_from_v2_generation
+from pipeline.runner import (
+    run_stats_from_v2_observations,
+    run_stats_from_v2_generation,
+    run_possession_only_from_v2_artifacts,
+)
 from pipeline.runner_v2 import run_v2
 from pipeline.input_integrity import verify_sha256_file
 from pipeline.sam31_tracking import normalize_multiplex_output
 from pipeline.sam31_segments import (
     SAM31_MAX_NUM_OBJECTS,
+    SAM31_SEGMENT_GRACE_MAX_OBJECTS,
     DEFAULT_SEAM_AMBIGUITY_MARGIN,
     DEFAULT_SEAM_MIN_SCORE,
     assert_segment_object_limit,
+    prune_segment_object_overflow,
     deduplicate_segment_observations,
     extract_segment_video,
     plan_segment_windows,
@@ -95,21 +101,26 @@ def _job_input_path(job: Path, input_fingerprint: str) -> Path:
 def _persist_job_input(job: Path, input_fingerprint: str, video_bytes: bytes) -> Path:
     """Persist input by fingerprint; never overwrite another generation's input."""
     path = _job_input_path(job, input_fingerprint)
-    path.parent.mkdir(parents=True, exist_ok=True)
     digest = input_fingerprint.removeprefix("sha256:")
-    if path.is_file():
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-            raise ValueError("job input fingerprint collision")
-        return path
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_bytes(video_bytes)
-    try:
-        os.link(temporary, path)
-    except FileExistsError:
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-            raise ValueError("job input fingerprint collision")
-    finally:
-        temporary.unlink(missing_ok=True)
+    if hashlib.sha256(video_bytes).hexdigest() != digest:
+        raise ValueError("job input fingerprint mismatch")
+
+    job = Path(job)
+    job.mkdir(parents=True, exist_ok=True)
+    with (job / ".job.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise ValueError("job input fingerprint collision")
+            return path
+
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_bytes(video_bytes)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
     return path
 
 
@@ -491,8 +502,14 @@ def _run_v2_stats(video_path: Path, output_dir: Path, observations, *, masks=Non
 
 
 def _validate_possession_engine(value: str) -> str:
-    if value not in {"v3", "v4"}:
-        raise ValueError("--possession-engine must be 'v3' or 'v4'")
+    if value not in {"v3", "v4", "v5"}:
+        raise ValueError("--possession-engine must be 'v3', 'v4', or 'v5'")
+    return value
+
+
+def _validate_possession_only_engine(value: str) -> str:
+    if value not in {"legacy", "v3", "v4", "v5"}:
+        raise ValueError("--possession-engine must be 'legacy', 'v3', 'v4', or 'v5'")
     return value
 
 
@@ -620,6 +637,7 @@ def _track_segmented_video(
     seam_min_score: float = DEFAULT_SEAM_MIN_SCORE,
     seam_ambiguity_margin: float = DEFAULT_SEAM_AMBIGUITY_MARGIN,
     seam_diagnostics: list[dict[str, Any]] | None = None,
+    overflow_diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run independent bounded SAM sessions, then stitch their raw output."""
 
@@ -634,6 +652,15 @@ def _track_segmented_video(
             predictor, segment_path, prompt, 0, segment.frame_count - 1,
             local_propagation=True,
         )
+        rows = prune_segment_object_overflow(
+            rows,
+            diagnostics=overflow_diagnostics,
+            max_objects=SAM31_MAX_NUM_OBJECTS,
+            grace_max_objects=SAM31_SEGMENT_GRACE_MAX_OBJECTS,
+            segment_index=segment.ordinal,
+        )
+        retained_keys = {str(row["observation_key"]) for row in rows}
+        masks = {key: value for key, value in masks.items() if key in retained_keys}
         assert_segment_object_limit(rows, max_objects=SAM31_MAX_NUM_OBJECTS)
         remapped_rows, remapped_masks = remap_segment_rows(rows, masks, segment)
         all_rows.extend(remapped_rows)
@@ -691,6 +718,7 @@ def _tracking_stage_fingerprint(
             "seam_min_score": _segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
             "seam_ambiguity_margin": _segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
             "max_num_objects": SAM31_MAX_NUM_OBJECTS,
+            "segment_grace_max_objects": SAM31_SEGMENT_GRACE_MAX_OBJECTS,
             "reid_backend": os.getenv("REID_BACKEND", "osnet"),
             "team_embedder_backend": os.getenv("TEAM_EMBEDDER_BACKEND", "siglip"),
             "team_embedder_model_id": os.getenv("TEAM_EMBEDDER_MODEL_ID", "Marqo/marqo-fashionSigLIP"),
@@ -703,6 +731,64 @@ def _stats_stage_fingerprint(possession_engine: str | None, generation: str, con
     return stage_fingerprint(
         "stats", possession_engine or config.possession_engine, generation, _config_fingerprint(config)
     )
+
+
+def _possession_only_fingerprint(possession_engine: str, generation: str, config: PipelineConfig) -> str:
+    return stage_fingerprint("possession-only", possession_engine, generation, _config_fingerprint(config))
+
+
+def _load_jsonl_file(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _load_possession_tracking_inputs(job: Path, generation: dict[str, Any]) -> tuple[list[dict], list[dict], dict, dict, float, int, int]:
+    """Load only the immutable tracking package and an existing ball artifact."""
+    root = job / "tracking" / "generations" / generation["generation"]
+    package = json.loads((root / "tracking-manifest.json").read_text(encoding="utf-8"))
+    declared = package.get("artifacts", {})
+    tracks_ref = declared.get("tracks", {})
+    observations = _load_jsonl_file(root / tracks_ref.get("key", "tracks.jsonl"))
+
+    def masks(name: str) -> dict[str, Any]:
+        group = declared.get(name, {})
+        result = {}
+        for key, reference in (group.get("references", {}) if isinstance(group, Mapping) else {}).items():
+            path = root / reference["key"]
+            import cv2
+            value = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if value is None or value.ndim != 2:
+                raise ValueError(f"invalid {name} artifact")
+            result[str(key)] = value
+        return result
+
+    ball_path = None
+    ball_ref = declared.get("ball_tracks")
+    if isinstance(ball_ref, Mapping) and isinstance(ball_ref.get("key"), str):
+        ball_path = root / ball_ref["key"]
+    if ball_path is None or not ball_path.is_file():
+        for candidate in sorted((job / "stats" / "generations").glob("*/manifest.json")):
+            try:
+                stats = load_stage_generation(job / "stats", candidate.parent.name)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if stats.get("tracking_generation") != generation["generation"]:
+                continue
+            ref = stats.get("artifacts", {}).get("ball_tracks")
+            if isinstance(ref, Mapping) and isinstance(ref.get("path"), str):
+                candidate_path = candidate.parent / ref["path"]
+                if candidate_path.is_file():
+                    ball_path = candidate_path
+                    break
+    if ball_path is None or not ball_path.is_file():
+        raise ValueError("validated tracking job has no persisted ball_tracks.jsonl")
+    video = package.get("video", {})
+    fps = float(video.get("fps") or 30.0)
+    mask_values = masks("masks")
+    clean_values = masks("clean_masks")
+    width, height = int(video.get("width") or 0), int(video.get("height") or 0)
+    if (not width or not height) and mask_values:
+        height, width = next(iter(mask_values.values())).shape[:2]
+    return observations, _load_jsonl_file(ball_path), mask_values, clean_values, fps, width, height
 
 
 @app.cls(
@@ -804,6 +890,7 @@ class PipelineV2:
                 source.write_bytes(video_bytes)
                 segmented_run = _segmented_enabled(segmented)
                 seams: list[dict[str, Any]] = []
+                overflow_diagnostics: list[dict[str, Any]] = []
                 if segmented_run:
                     rows, masks = _track_segmented_video(
                         self._ensure_predictor(), source, prompt, frame_start, frame_end, root,
@@ -812,6 +899,7 @@ class PipelineV2:
                         seam_min_score=_segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
                         seam_ambiguity_margin=_segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
                         seam_diagnostics=seams,
+                        overflow_diagnostics=overflow_diagnostics,
                     )
                 else:
                     rows, masks = _track_video(self._ensure_predictor(), source, prompt, frame_start, frame_end)
@@ -831,6 +919,7 @@ class PipelineV2:
                     tracking_result.runtime_diagnostics = {
                         **(getattr(tracking_result, "runtime_diagnostics", {}) or {}),
                         "seam_diagnostics": seams,
+                        "segment_overflow_diagnostics": overflow_diagnostics,
                     }
                 clean_masks = getattr(tracking_result, "cleaned_masks_by_observation", {})
                 _add_clean_mask_references(tracking_result.observations, clean_masks)
@@ -842,15 +931,18 @@ class PipelineV2:
                         "sam31_segment_window": _segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
                         "sam31_segment_overlap": _segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
                         "sam31_max_num_objects": SAM31_MAX_NUM_OBJECTS,
+                        "sam31_segment_grace_max_objects": SAM31_SEGMENT_GRACE_MAX_OBJECTS,
                         "sam31_seam_min_score": _segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
                         "sam31_seam_ambiguity_margin": _segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
                         "sam31_seam_diagnostics": seams,
+                        "sam31_segment_overflow_diagnostics": overflow_diagnostics,
                     })
                 sanitizer_metadata = getattr(tracking_result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
                 if sanitizer_metadata.get("corrected_count", 0) or sanitizer_metadata.get("unresolved_count", 0):
                     artifact_config["bbox_sanitizer"] = sanitizer_metadata
                 package_artifacts(package, tracking_result.observations, masks, clean_masks=clean_masks,
                                   input_fingerprint=input_fingerprint, frame_bounds=[frame_start, frame_end],
+                                  video_metadata=_video_metadata(source),
                                   prompts=[prompt], config=artifact_config,
                                   acceptance=getattr(tracking_result, "acceptance", {}),
                                   acceptance_reasons=getattr(tracking_result, "acceptance_reasons", []))
@@ -959,6 +1051,66 @@ class PipelineV2:
                 _record_job_error_if_owner(Path(V2_JOB_VOLUME_DIR), job_id, "stats", error, owner)
             raise
 
+    def _possession_only_stage(self, *, job_id: str, possession_engine: str,
+                               worker_id: str | None = None) -> dict[str, Any]:
+        engine = _validate_possession_only_engine(possession_engine)
+        job = self._job_dir(job_id)
+        manifest = read_job_manifest(job)
+        tracking = load_stage_generation(job / "tracking", manifest.get("tracking_generation"))
+        config = PipelineConfig.from_env(possession_engine=engine)
+        request = _possession_only_fingerprint(engine, tracking["generation"], config)
+        existing = _find_matching_generation(
+            job / "possession", input_fingerprint=manifest["input_fingerprint"],
+            request_fingerprint=request, tracking_generation=tracking["generation"],
+        )
+        if existing is not None:
+            return {"status": "complete", "generation": existing["generation"],
+                    "tracking_generation": tracking["generation"], "engine": engine,
+                    "fingerprint": request}
+        owner = _stage_owner(worker_id)
+        acquired = False
+        try:
+            acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="possession",
+                              input_fingerprint=manifest["input_fingerprint"], request_fingerprint=request)
+            acquired = True
+            observations, ball_rows, masks, clean_masks, fps, width, height = _load_possession_tracking_inputs(job, tracking)
+            with tempfile.TemporaryDirectory(prefix="v2-possession-") as work:
+                output = Path(work) / "possession"
+                run_possession_only_from_v2_artifacts(
+                    output, observations, ball_rows, fps=fps, config=config,
+                    masks_by_observation=masks, clean_masks_by_observation=clean_masks,
+                    frame_width=width, frame_height=height,
+                )
+                artifacts = {path.relative_to(output).as_posix(): path for path in output.rglob("*") if path.is_file()}
+                published = _finalize_stage(
+                    Path(V2_JOB_VOLUME_DIR), job_id, owner=owner,
+                    publish=lambda: publish_stage_generation(
+                        job / "possession", stage="possession",
+                        input_fingerprint=manifest["input_fingerprint"], request_fingerprint=request,
+                        tracking_generation=tracking["generation"], artifacts=artifacts,
+                        frame_bounds=tracking["frame_bounds"], metadata={"engine": engine},
+                    ),
+                    manifest=lambda value: {
+                        "state": "complete", "lease": None,
+                        "possession_generations": {
+                            **(read_job_manifest(job).get("possession_generations") or {}),
+                            engine: value["generation"],
+                        },
+                    },
+                )
+            return {"status": "complete", "generation": published["generation"],
+                    "tracking_generation": tracking["generation"], "engine": engine,
+                    "fingerprint": request}
+        except Exception as error:
+            if acquired:
+                _record_job_error_if_owner(Path(V2_JOB_VOLUME_DIR), job_id, "possession", error, owner)
+            raise
+
+    @modal.method()
+    def possession_only_stage(self, *, job_id: str, possession_engine: str = "v5",
+                               worker_id: str | None = None) -> dict[str, Any]:
+        return self._possession_only_stage(job_id=job_id, possession_engine=possession_engine, worker_id=worker_id)
+
     @modal.method()
     def stats_stage(self, *, job_id: str, possession_engine: str | None = None,
                     worker_id: str | None = None) -> dict[str, Any]:
@@ -983,7 +1135,16 @@ class PipelineV2:
         possession_engine: str | None = None,
         staged: bool = False,
         job_id: str | None = None,
+        possession_only: bool = False,
     ) -> dict[str, Any]:
+        if possession_only:
+            if not job_id:
+                raise ValueError("job_id is required for possession-only execution")
+            if staged:
+                raise ValueError("--possession-only is mutually exclusive with --staged")
+            return self._possession_only_stage(
+                job_id=job_id, possession_engine=_validate_possession_only_engine(possession_engine or "v5")
+            )
         if staged:
             if not job_id:
                 raise ValueError("job_id is required for staged execution")
@@ -1015,6 +1176,7 @@ class PipelineV2:
                 if getattr(self, "_models_loaded", False):
                     self._ensure_seams()
                 seam_diagnostics: list[dict[str, Any]] = []
+                overflow_diagnostics: list[dict[str, Any]] = []
                 if segmented_run:
                     rows, masks = _track_segmented_video(
                         self._ensure_predictor(), video_path, prompt, frame_start, frame_end, root,
@@ -1023,6 +1185,7 @@ class PipelineV2:
                         seam_min_score=_segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
                         seam_ambiguity_margin=_segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
                         seam_diagnostics=seam_diagnostics,
+                        overflow_diagnostics=overflow_diagnostics,
                     )
                 else:
                     rows, masks = _track_video(
@@ -1043,12 +1206,13 @@ class PipelineV2:
                     result.runtime_diagnostics = {
                         **(getattr(result, "runtime_diagnostics", {}) or {}),
                         "seam_diagnostics": seam_diagnostics,
+                        "segment_overflow_diagnostics": overflow_diagnostics,
                     }
                 clean_masks = getattr(result, "cleaned_masks_by_observation", {})
                 _add_clean_mask_references(result.observations, clean_masks)
                 video_metadata = _video_metadata(video_path)
                 artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
-                if config.possession_engine in {"v3", "v4"}:
+                if config.possession_engine in {"v3", "v4", "v5"}:
                     artifact_config["possession_engine"] = config.possession_engine
                 if segmented_run:
                     artifact_config.update({
@@ -1056,9 +1220,11 @@ class PipelineV2:
                         "sam31_segment_window": _segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
                         "sam31_segment_overlap": _segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
                         "sam31_max_num_objects": SAM31_MAX_NUM_OBJECTS,
+                        "sam31_segment_grace_max_objects": SAM31_SEGMENT_GRACE_MAX_OBJECTS,
                         "sam31_seam_min_score": _segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
                         "sam31_seam_ambiguity_margin": _segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
                         "sam31_seam_diagnostics": seam_diagnostics,
+                        "sam31_segment_overflow_diagnostics": overflow_diagnostics,
                     })
                 sanitizer_metadata = getattr(result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
                 if sanitizer_metadata.get("corrected_count", 0) or sanitizer_metadata.get("unresolved_count", 0):
@@ -1138,18 +1304,21 @@ class PipelineV2:
 
 
 def _validate_local_entrypoint_mode(
-    *, video_path: str, job_id: str, staged: bool, stats_only: bool, tracking_only: bool
+    *, video_path: str, job_id: str, staged: bool, stats_only: bool, tracking_only: bool,
+    possession_only: bool = False,
 ) -> None:
-    selected_modes = sum((staged, stats_only, tracking_only))
+    selected_modes = sum((staged, stats_only, tracking_only, possession_only))
     if selected_modes > 1:
-        raise ValueError("--staged, --stats-only, and --tracking-only are mutually exclusive")
+        raise ValueError("--staged, --stats-only, --tracking-only, and --possession-only are mutually exclusive")
     if selected_modes and not job_id:
-        raise ValueError("--job-id is required with --staged, --stats-only, or --tracking-only")
+        raise ValueError("--job-id is required with --staged, --stats-only, --tracking-only, or --possession-only")
     if job_id and not selected_modes:
-        raise ValueError("--job-id requires --staged or --stats-only")
-    if stats_only and video_path:
-        raise ValueError("--video-path cannot be used with --stats-only")
-    if not stats_only and not video_path:
+        raise ValueError(
+            "--job-id requires --staged, --stats-only, --tracking-only, or --possession-only"
+        )
+    if (stats_only or possession_only) and video_path:
+        raise ValueError("--video-path cannot be used with --stats-only or --possession-only")
+    if not stats_only and not possession_only and not video_path:
         raise ValueError("--video-path is required")
 
 
@@ -1171,16 +1340,21 @@ def main(
     staged: bool = False,
     stats_only: bool = False,
     tracking_only: bool = False,
+    possession_only: bool = False,
     job_id: str = "",
 ) -> None:
     _validate_local_entrypoint_mode(
         video_path=video_path, job_id=job_id, staged=staged, stats_only=stats_only,
-        tracking_only=tracking_only,
+        tracking_only=tracking_only, possession_only=possession_only,
     )
-    _validate_possession_engine(possession_engine)
+    (_validate_possession_only_engine if possession_only else _validate_possession_engine)(possession_engine)
 
     pipeline = PipelineV2()
-    if stats_only:
+    if possession_only:
+        payload = pipeline.possession_only_stage.remote(
+            job_id=job_id, possession_engine=possession_engine
+        )
+    elif stats_only:
         payload = pipeline.stats_stage.remote(
             job_id=job_id, possession_engine=possession_engine
         )
@@ -1225,6 +1399,7 @@ def main(
                 max_artifact_bytes=max_artifact_bytes or None,
                 staged=staged,
                 job_id=job_id or None,
+                possession_only=possession_only,
             )
     artifacts = payload.pop("artifacts", None)
     print(json.dumps(payload, indent=2, sort_keys=True))

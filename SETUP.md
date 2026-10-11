@@ -47,8 +47,9 @@ fallback; the player SAM2/output stream remains at its separate 15 FPS default.
 ### V2 Modal stats
 
 V2 also provides restartable tracking/stats primitives backed by the named `v2-job-data`
-Volume. A job directory contains `job.json`, `input.mp4`, and immutable generation
-directories under `tracking/` and `stats/`; manifests include hashes and fingerprints.
+Volume. A job directory contains `job.json`, immutable inputs under `inputs/<sha256>.mp4`,
+and immutable generation directories under `tracking/`, `stats/`, and `possession/`;
+manifests include hashes and fingerprints.
 Retries reuse matching complete generations, while stale leases can be reclaimed. The
 active lease rejects duplicate workers. The native `modal run` entrypoint exposes restartable
 routing. Use `--staged` with `--job-id` for one command that runs tracking then stats, or use
@@ -64,9 +65,16 @@ modal run modal_app_v2.py --tracking-only --job-id game-03 \
 modal run modal_app_v2.py --stats-only --job-id game-03
 ```
 
-`--tracking-only`, `--staged`, and `--stats-only` are mutually exclusive; each requires
+`--tracking-only`, `--staged`, `--stats-only`, and `--possession-only` are mutually exclusive; each requires
 `--job-id`, and `--tracking-only` also requires `--video-path`. The existing monolithic
 `process` method remains the default and rollback path when neither flag is supplied.
+
+Compare V4 and V5 possession only, reusing the same tracking and ball artifacts:
+
+```bash
+modal run modal_app_v2.py --possession-only --job-id game-03 --possession-engine v4
+modal run modal_app_v2.py --possession-only --job-id game-03 --possession-engine v5
+```
 
 Replay a selected generation locally (read-only apart from the requested MP4 output):
 
@@ -141,7 +149,7 @@ and events. `modal_app.py` remains on the legacy possession engine, and local
 or other callers still default to legacy unless they explicitly set
 `POSSESSION_ENGINE=v3`.
 
-### V4 and rollback commands
+### V4/V5 comparison and rollback commands
 
 Run segmented V4 explicitly; the selection is sent to the Modal container and
 recorded in the root manifest plus stats metadata:
@@ -158,6 +166,24 @@ V4 is exclusive: it does not run V3 in parallel. Roll back V2 with
 pipeline/config path, for example
 `POSSESSION_ENGINE=legacy python -m pipeline.cli clips/game_03.mp4`.
 Calibration is offline and is not run automatically.
+
+V5 selects the possession scoring/resolver profile from commit
+`a4fb4e85979e13d13a3071b25ad8dad25b38f527` without rerunning V2 tracking. To
+compare both engines against identical tracking artifacts, persist tracking
+once and run stats twice; each engine gets its own stats fingerprint and
+generation:
+
+```bash
+modal run modal_app_v2.py --tracking-only --job-id game-03-possession-compare \
+  --video-path clips/game_03.mp4
+modal run modal_app_v2.py --stats-only --job-id game-03-possession-compare \
+  --possession-engine v4
+modal run modal_app_v2.py --stats-only --job-id game-03-possession-compare \
+  --possession-engine v5
+```
+
+Use separate job IDs/output directories when you want independent manifests.
+V5 writes `engine: v5` and never writes V4-only diagnostics.
 
 For a V3-only saved-bundle debug render, pass both exact inputs:
 
@@ -181,6 +207,9 @@ preserve the original model ID/key in `local_raw_track_id` and
 seam grouping and identity resolution.
 When the later overlap owner lacks a mask, the mask is omitted and diagnosed;
 the earlier segment's mask is never reassigned to the later observation.
+If a segment contains 17–22 active objects, the overflow grace ranks and prunes
+the lowest-quality objects back to the downstream limit of 16. More than 22
+active objects remains a failed segment and follows the existing retry policy.
 
 ## Verification
 

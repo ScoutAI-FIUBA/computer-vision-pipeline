@@ -2,6 +2,126 @@
 
 GPU-first basketball pipeline for SAM3.1 player observations, independent ball evidence, team identification, and conservative shot/possession attribution.
 
+## Branch quick path: `feature/modelv2-sam31-grace-v5`
+
+This branch's current production-style path is `modal_app_v2.py`:
+
+```text
+video -> SAM3.1 masks/observations -> stable identity + ReID + Team ID
+      -> TrackNet ball evidence -> shot/number/court evidence
+      -> V3/V4/V5 possession -> stats and derived events
+```
+
+The stats adapter consumes the authoritative SAM3.1 rows. It does not load SAM2,
+run a second player tracker, or recreate players through legacy `run_pipeline`.
+The legacy path remains available through `modal_app.py` and the local CLI.
+
+### SAM3.1 segmented tracking
+
+The default V2 session is one full-video SAM3.1 session. Set
+`SAM31_V2_SEGMENTED=1` for bounded windows (default window `32`, overlap `1`).
+Later segments own overlap rows; seams use mask IoU first, then bbox IoU/center
+fallback, and ambiguous matches fail closed.
+
+SAM3.1 and downstream contracts remain capped at **16 active objects**. A
+segmented window with **17–22** objects receives deterministic grace: IDs are
+ranked by confidence, duration, and temporal consistency, then pruned to 16.
+Overflow counts, dropped IDs, ranking reasons, and grace use are recorded. **More
+than 22 objects is rejected**, so the tracking stage fails and can be retried
+instead of silently dropping an unbounded number of players.
+
+### Components and outputs
+
+- **ReID/Team ID:** stable player IDs are resolved from temporal fragments;
+  mask-gated appearance evidence and team embeddings are clustered conservatively.
+  Under-sampled or contested assignments remain unresolved.
+- **TrackNet:** the Modal image reads
+  `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`.
+  Ball misses become explicit `lost` rows; geometry is never fabricated.
+- **Stats and derived events:** the adapter writes tracks, teams, numbers, shots,
+  ball rows, possession, transitions, and optional court-projected artifacts.
+  Possession, pass/steal/turnover/lost-possession, and V3/V4/V5 events retain
+  evidence and explicit unknown/lost/unassigned states.
+
+### Execution modes
+
+| Mode | Command shape | Durable job |
+| --- | --- | --- |
+| V2 direct | `modal run modal_app_v2.py --video-path ...` | No |
+| V2 staged/full | `--staged --job-id ... --video-path ...` | Yes |
+| Tracking retry | `--tracking-only --job-id ... --video-path ...` | Yes |
+| Stats retry | `--stats-only --job-id ...` | Yes |
+| Possession-only | `--possession-only --job-id ... --possession-engine v4\|v5` | Yes |
+| Legacy rollback | `modal run modal_app.py ...` | No |
+
+Modes are mutually exclusive. Stats-only and possession-only consume the existing
+job and must not receive `--video-path`.
+
+#### Exact full run for `game027`
+
+```bash
+SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py --staged --job-id game027 \
+  --video-path clips/game027.mp4 --frame-start 60 --frame-end 130 \
+  --segment-window 32 --segment-overlap 1 --possession-engine v5
+```
+
+#### Exact V4/V5 possession-only comparison
+
+Run both commands after the full run has produced a tracking generation:
+
+```bash
+modal run modal_app_v2.py --possession-only --job-id game027 --possession-engine v4
+modal run modal_app_v2.py --possession-only --job-id game027 --possession-engine v5
+```
+
+V4 adds diagnostic control/release/acquisition and gate-reason fields. V5 means
+the possession scorer/resolver profile from commit
+`a4fb4e85979e13d13a3071b25ad8dad25b38f527` over the current V2 tracking, masks,
+and ball rows; it is not a new tracker and does not run V4 in parallel. V5 records
+`engine: v5` and omits V4-only diagnostics. V2 defaults to V3.
+
+### Durable job Volume, retries, and download/debug
+
+The named `v2-job-data` Modal Volume is mounted at `/v2-job-data`. Each job has
+`job.json`, immutable SHA-256-addressed inputs, and immutable tracking, stats, and
+possession generations. Manifests contain relative paths, sizes, and hashes;
+`current.json` advances atomically. Input publication uses a locked temporary-file
+rename, so a preempted worker cannot expose a partial input or overwrite another
+video.
+
+Matching completed generations are reused without recomputation. A live lease
+rejects duplicate workers; an expired lease can be reclaimed. Failures are recorded
+in `job.json`; retry the failed stage rather than rerunning completed stages.
+
+Download a job and replay a selected tracking generation without inference:
+
+```bash
+mkdir -p outputs/game027-job
+modal volume get v2-job-data game027 outputs/game027-job
+python scripts/tracking/debug_v2.py \
+  --job-id outputs/game027-job \
+  --generation <tracking-generation> \
+  --output outputs/game027-job/replay.mp4
+```
+
+Direct runs use `--output-dir`; staged runs are read from the downloaded job
+generation. Do not replay an incomplete or hash-invalid generation.
+
+### Limits and troubleshooting
+
+- Crossings/occlusions can still switch IDs; ReID, Team ID, OCR, shots, and
+  possession can remain unknown. Court outputs require a valid homography.
+- Repository tests do not prove live Modal GPU, secret, checkpoint, or Volume
+  integration.
+- **Preemption/failure:** rerun the same stage; completed matching generations are
+  reused.
+- **`active lease exists`:** another worker owns the job; wait for the lease or
+  stop that worker rather than starting a duplicate.
+- **Input fingerprint/collision:** the Volume input is immutable; use the original
+  bytes or a new job ID for a different video.
+- **Timeout:** V2 class invocations use a 1800-second timeout. Reduce frame range
+  or segment/window cost, or split tracking and stats with retryable stages.
+
 ## Current pipeline
 
 The current production path is `pipeline/` plus `modal_app.py`.
@@ -43,15 +163,24 @@ The two commands are equivalent to the existing `--staged` one-command flow,
 but make the tracking and stats retry boundary explicit.
 
 Tracking and stats use the `v2-job-data` Modal Volume at `/v2-job-data`. Each job stores
-`job.json`, the input video, and immutable `tracking/generations/<fingerprint>/` and
-`stats/generations/<fingerprint>/` directories. `current.json` is advanced atomically;
+`job.json`, the immutable input, and immutable `tracking/generations/<fingerprint>/`,
+`stats/generations/<fingerprint>/`, and `possession/generations/<fingerprint>/`
+directories. `current.json` is advanced atomically;
 incomplete or hash-invalid generations are ignored. Use the local replay command with an
 explicit job directory and generation to render saved tracking without inference:
 
 Direct stage retries may call `track_stage(job_id=...)` and `stats_stage(job_id=...)` separately;
 active leases reject duplicate workers, and matching completed generations are returned without
 recomputation. The local `main` command remains monolithic unless a caller explicitly uses the
-`--tracking-only`, `--staged`, or `--stats-only` flag. With neither flag, the monolithic behavior is unchanged.
+`--tracking-only`, `--staged`, `--stats-only`, or `--possession-only` flag. With none of these
+flags, the monolithic behavior is unchanged.
+
+Compare possession engines without rerunning tracking or stats on the same durable job:
+
+```bash
+modal run modal_app_v2.py --possession-only --job-id game-03 --possession-engine v4
+modal run modal_app_v2.py --possession-only --job-id game-03 --possession-engine v5
+```
 
 ```text
 python scripts/tracking/debug_v2.py --job-id /v2-job-data/JOB_ID \
@@ -69,12 +198,15 @@ modal run modal_app_v2.py --video-path clips/game_03.mp4 \
 
 Expected V3 outputs under the returned `stats/` directory are `possession_v3_manifest.json` and generation-scoped `possession_v3/` artifacts for possession rows, transitions, and events. The legacy `modal_app.py` image does not set this variable and keeps the global default unchanged.
 
-### Explicit V4 execution
+### Explicit V4/V5 execution
 
-V2 accepts only `v3` or `v4`; the selected value is passed into the Modal
+V2 accepts `v3`, `v4`, or `v5`; the selected value is passed into the Modal
 container's `PipelineConfig`, so a local `POSSESSION_ENGINE` cannot silently
-select a different remote engine. V4 runs only the V4 scorer, not a parallel
-V3 run. The root manifest, `stats/results.json`, and
+select a different remote engine. V4 runs only the V4 scorer, not a parallel V5
+scorer. V5 uses the possession scorer/resolver behavior from commit
+`a4fb4e85979e13d13a3071b25ad8dad25b38f527`, while reusing the current V2
+tracking, masks, ball tracks, and staged stats flow. It does not emit V4-only
+diagnostics. The root manifest, `stats/results.json`, and
 `stats/possession_v3_manifest.json` record the selected engine. V3 remains the
 default for V2; `modal_app.py` is unchanged.
 
@@ -90,6 +222,21 @@ SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py \
 Expect `stats/possession_v3_manifest.json`, generation-scoped V4 possession
 rows/transitions/events, and V4 diagnostics referenced from `stats/results.json`
 and the root `manifest.json`.
+
+Run the same persisted tracking generation with V4 and V5 into separate stats
+generations (or use separate job IDs when comparing complete jobs):
+
+```bash
+modal run modal_app_v2.py --tracking-only --job-id game-03-possession-compare \
+  --video-path clips/game_03.mp4
+modal run modal_app_v2.py --stats-only --job-id game-03-possession-compare \
+  --possession-engine v4
+modal run modal_app_v2.py --stats-only --job-id game-03-possession-compare \
+  --possession-engine v5
+```
+
+The two stats requests keep distinct fingerprints and generation directories;
+V4 has its diagnostics artifact, while V5 records `engine: v5` without it.
 
 Rollback V2 with `--possession-engine v3`. Use `legacy` only when invoking the
 general local pipeline/config directly, for example
@@ -131,10 +278,13 @@ being reused.
 
 `--segment-window` and `--segment-overlap` may also be set with
 `SAM31_V2_SEGMENT_WINDOW` and `SAM31_V2_SEGMENT_OVERLAP`. The default overlap is
-one frame. SAM3.1 remains configured with `max_num_objects=16`; a segment that
-produces more active objects fails with a diagnostic instead of raising the model
-limit. Roll back by omitting `SAM31_V2_SEGMENTED=1` to use the existing
-full-video path.
+one frame. SAM3.1 remains configured with `max_num_objects=16`. A segmented
+session may temporarily expose 17–22 active IDs; the lowest-ranked IDs are
+deterministically pruned before the existing 16-object guard, using confidence,
+active frame count, and temporal consistency. More than 22 IDs is rejected.
+Overflow counts, dropped raw IDs, ranking reasons, and grace usage are recorded
+alongside seam diagnostics. Roll back by omitting `SAM31_V2_SEGMENTED=1` to use
+the existing full-video path.
 
 Render possession from a saved V2 bundle with the root SAM3.1 video overlay and the legacy stats events/tracks:
 

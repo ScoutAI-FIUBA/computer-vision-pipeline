@@ -237,6 +237,9 @@ def _build_v3_artifacts(output_dir: Path, rows: list[dict], ball_rows: list[dict
         frame_height=frame_height,
     )
     balls = {int(row["frame_index"]): row for row in ball_rows if isinstance(row, dict) and type(row.get("frame_index")) is int}
+    # V5 is the a4-compatible profile: the a4 diff predates both the V4
+    # scorer and resolver gates, so it uses score_candidates plus v4=False.
+    # Keep this branch shared with V3 and explicit so V4 cannot leak diagnostics.
     resolver = PossessionResolver(real_fps=fps, grace_seconds=config.possession_v3_grace_seconds,
                                   recovery_window_seconds=config.possession_v3_recovery_window_seconds,
                                   hysteresis_margin=(config.possession_v4_ambiguity_margin
@@ -647,6 +650,8 @@ class _BallRecordReader:
 def _load_confirmed_numbers_by_track_id(numbers_path: Path) -> dict[int, str]:
     if not numbers_path.exists():
         return {}
+
+
     payload = json.loads(numbers_path.read_text(encoding="utf-8"))
     confirmed_numbers = {}
     for track in payload.get("tracks", []):
@@ -658,6 +663,57 @@ def _load_confirmed_numbers_by_track_id(numbers_path: Path) -> dict[int, str]:
             continue
         confirmed_numbers[int(track_id)] = str(number)
     return confirmed_numbers
+
+
+def run_possession_only_from_v2_artifacts(
+    output_dir: Path,
+    observations: list[dict],
+    ball_rows: list[dict],
+    *,
+    fps: float,
+    config: PipelineConfig,
+    masks_by_observation=None,
+    clean_masks_by_observation=None,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+) -> dict[str, Any]:
+    """Generate possession artifacts only from already-persisted V2 evidence."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    engine = config.possession_engine
+    if frame_width and frame_height:
+        observations = _normalize_v2_stats_rows(observations, width=frame_width, height=frame_height)
+    if engine in {"v3", "v4", "v5"}:
+        manifest = _build_v3_artifacts(
+            output_dir, observations, ball_rows, fps=fps, config=config,
+            masks_by_observation=masks_by_observation,
+            clean_masks_by_observation=clean_masks_by_observation,
+        )
+        files = [path for path in output_dir.rglob("*") if path.is_file()]
+    elif engine == "legacy":
+        team_ids = {
+            int(row["track_id"]): int(row["team_id"])
+            for row in observations
+            if row.get("track_id") is not None and type(row.get("team_id")) is int
+        }
+        possession, transitions = _write_possession_artifacts(
+            output_dir, observations, ball_rows, fps=fps, frame_step=1,
+            team_ids_by_track_id=team_ids, max_frame_gap=config.possession_transition_max_gap,
+        )
+        manifest = {"engine": "legacy", "artifacts": {"possession": possession.name, "transitions": transitions.name}}
+        files = [possession, transitions]
+    else:
+        raise ValueError(f"unsupported possession engine: {engine}")
+    summary = {
+        "schema": "possession-only-v1",
+        "engine": engine,
+        "observation_count": len(observations),
+        "ball_row_count": len(ball_rows),
+        "artifact_count": len(files),
+        "possession": manifest,
+    }
+    (output_dir / "results.json").write_text(json.dumps(summary, sort_keys=True), encoding="utf-8")
+    return summary
 
 
 def _load_team_ids_by_track_id(teams_path: Path) -> dict[int, int]:

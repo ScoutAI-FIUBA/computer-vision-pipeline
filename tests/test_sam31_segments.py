@@ -12,6 +12,7 @@ from pipeline.sam31_segments import (
     extract_segment_video,
     namespace_raw_track_id,
     plan_segment_windows,
+    prune_segment_object_overflow,
     remap_segment_rows,
     stitch_segment_seams,
 )
@@ -335,6 +336,52 @@ def test_segment_object_limit_is_a_hard_guard():
         assert_segment_object_limit(rows)
 
 
+def test_segment_object_grace_accepts_sixteen_without_pruning():
+    diagnostics = []
+    rows = [{"raw_track_id": index, "frame_index": 0, "confidence": 0.5} for index in range(16)]
+
+    retained = prune_segment_object_overflow(rows, diagnostics=diagnostics)
+
+    assert [row["raw_track_id"] for row in retained] == list(range(16))
+    assert diagnostics == []
+    assert_segment_object_limit(retained)
+
+
+def test_segment_object_grace_prunes_seventeen_to_twenty_two_deterministically():
+    rows = []
+    for raw_id in range(17):
+        for frame_index in range(3 if raw_id < 16 else 1):
+            rows.append({
+                "raw_track_id": raw_id,
+                "frame_index": frame_index,
+                "confidence": 0.9 if raw_id < 16 else 0.1,
+                "bbox_xyxy": [raw_id, 0, raw_id + 1, 1],
+            })
+    diagnostics = []
+
+    retained = prune_segment_object_overflow(rows, diagnostics=diagnostics)
+
+    assert {row["raw_track_id"] for row in retained} == set(range(16))
+    assert diagnostics[0]["before_count"] == 17
+    assert diagnostics[0]["after_count"] == 16
+    assert diagnostics[0]["dropped_raw_ids"] == [16]
+    assert diagnostics[0]["grace_applied"] is True
+    assert diagnostics[0]["ranking"][0]["raw_id"] == 16
+
+    rows_22 = [{"raw_track_id": raw_id, "frame_index": 0, "confidence": 0.2} for raw_id in range(22)]
+    first = prune_segment_object_overflow(rows_22)
+    second = prune_segment_object_overflow(list(reversed(rows_22)))
+    assert {row["raw_track_id"] for row in first} == {row["raw_track_id"] for row in second}
+    assert len({row["raw_track_id"] for row in first}) == 16
+
+
+def test_segment_object_grace_rejects_twenty_three():
+    rows = [{"raw_track_id": index, "frame_index": 0} for index in range(23)]
+
+    with pytest.raises(ValueError, match="grace maximum is 22"):
+        prune_segment_object_overflow(rows)
+
+
 def test_extract_segment_preserves_dimensions_fps_and_frame_count(tmp_path: Path):
     source = tmp_path / "source.mp4"
     output = tmp_path / "segment.mp4"
@@ -440,7 +487,7 @@ def test_track_segmented_video_remaps_deduplicates_and_aligns_masks(tmp_path: Pa
     assert int(masks[rows[2]["observation_key"]][0, 0]) == 1
 
 
-def test_track_segmented_video_enforces_sam_object_limit(tmp_path: Path):
+def test_track_segmented_video_rejects_more_than_grace_limit(tmp_path: Path):
     from modal_app_v2 import _track_segmented_video
 
     source = tmp_path / "source.mp4"
@@ -459,9 +506,43 @@ def test_track_segmented_video_enforces_sam_object_limit(tmp_path: Path):
         def handle_stream_request(self, _request):
             yield {
                 "frame_index": 0,
+                "out_obj_ids": list(range(23)),
+                "out_boxes_xywh": [[0, 0, 1, 1]] * 23,
+            }
+
+    with pytest.raises(ValueError, match="grace maximum is 22"):
+        _track_segmented_video(Predictor(), source, "player", 0, 0, tmp_path, window=1, overlap=0)
+
+
+def test_track_segmented_video_applies_grace_before_the_sixteen_object_guard(tmp_path: Path):
+    from modal_app_v2 import _track_segmented_video
+
+    source = tmp_path / "source.mp4"
+    _write_video(source, frame_count=1)
+    overflow_diagnostics = []
+
+    class Model:
+        def init_state(self, **_kwargs):
+            return None
+
+    class Predictor:
+        model = Model()
+
+        def handle_request(self, request):
+            return {"session_id": "segment-0000"} if request["type"] == "start_session" else None
+
+        def handle_stream_request(self, _request):
+            yield {
+                "frame_index": 0,
                 "out_obj_ids": list(range(17)),
                 "out_boxes_xywh": [[0, 0, 1, 1]] * 17,
             }
 
-    with pytest.raises(ValueError, match="maximum is 16"):
-        _track_segmented_video(Predictor(), source, "player", 0, 0, tmp_path, window=1, overlap=0)
+    rows, _ = _track_segmented_video(
+        Predictor(), source, "player", 0, 0, tmp_path, window=1, overlap=0,
+        overflow_diagnostics=overflow_diagnostics,
+    )
+
+    assert {row["raw_track_id"] for row in rows} == set(range(16))
+    assert overflow_diagnostics[0]["segment_index"] == 0
+    assert overflow_diagnostics[0]["dropped_raw_ids"] == [16]
