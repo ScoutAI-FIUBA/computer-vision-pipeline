@@ -9,6 +9,7 @@ from typing import Any, Iterable, Mapping
 
 
 SAM31_MAX_NUM_OBJECTS = 16
+SAM31_SEGMENT_GRACE_MAX_OBJECTS = 22
 _RAW_ID_BASE = 1_000_000
 DEFAULT_SEAM_MIN_SCORE = 0.5
 DEFAULT_SEAM_AMBIGUITY_MARGIN = 0.05
@@ -329,6 +330,99 @@ def assert_segment_object_limit(rows: Iterable[Mapping[str, Any]], *, max_object
     ids = {int(row["raw_track_id"]) for row in rows}
     if len(ids) > max_objects:
         raise ValueError(f"SAM3.1 segment has {len(ids)} active objects; maximum is {max_objects}")
+
+
+def prune_segment_object_overflow(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    diagnostics: list[dict[str, Any]] | None = None,
+    max_objects: int = SAM31_MAX_NUM_OBJECTS,
+    grace_max_objects: int = SAM31_SEGMENT_GRACE_MAX_OBJECTS,
+    segment_index: int | None = None,
+) -> list[dict[str, Any]]:
+    """Keep the strongest 16 IDs when a segmented session briefly overflows."""
+
+    materialized = [dict(row) for row in rows]
+    by_id: dict[int, list[dict[str, Any]]] = {}
+    for row in materialized:
+        by_id.setdefault(int(row["raw_track_id"]), []).append(row)
+    before_count = len(by_id)
+    if before_count <= max_objects:
+        return materialized
+    if before_count > grace_max_objects:
+        raise ValueError(
+            f"SAM3.1 segment has {before_count} active objects; grace maximum is {grace_max_objects}"
+        )
+
+    def finite_values(track_rows: list[dict[str, Any]], names: tuple[str, ...]) -> list[float]:
+        values = []
+        for row in track_rows:
+            for name in names:
+                value = row.get(name)
+                if type(value) in {int, float} and math.isfinite(float(value)):
+                    values.append(float(value))
+        return values
+
+    def bbox_iou_for_rows(left: Mapping[str, Any], right: Mapping[str, Any]) -> float | None:
+        if "bbox_xyxy" not in left or "bbox_xyxy" not in right:
+            return None
+        return _bbox_iou(left["bbox_xyxy"], right["bbox_xyxy"])
+
+    max_frame_count = max(len({int(row["frame_index"]) for row in track_rows}) for track_rows in by_id.values())
+    ranking: list[dict[str, Any]] = []
+    for raw_id, track_rows in by_id.items():
+        track_rows = sorted(track_rows, key=lambda row: (int(row["frame_index"]), str(row.get("observation_key", ""))))
+        frames = sorted({int(row["frame_index"]) for row in track_rows})
+        confidence_values = finite_values(track_rows, ("confidence", "score", "probability"))
+        confidence = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
+        frame_count = len(frames)
+        consecutive = sum(right - left == 1 for left, right in zip(frames, frames[1:]))
+        continuity = consecutive / max(1, frame_count - 1)
+        ious = [
+            score for left, right in zip(track_rows, track_rows[1:])
+            if (score := bbox_iou_for_rows(left, right)) is not None
+        ]
+        spatial_consistency = sum(ious) / len(ious) if ious else continuity
+        temporal_consistency = (continuity + spatial_consistency) / 2.0
+        duration_score = frame_count / max_frame_count
+        quality_score = 0.5 * confidence + 0.3 * duration_score + 0.2 * temporal_consistency
+        ranking.append({
+            "raw_id": raw_id,
+            "quality_score": round(quality_score, 12),
+            "confidence_score": round(confidence, 12),
+            "frame_count": frame_count,
+            "duration_score": round(duration_score, 12),
+            "temporal_consistency": round(temporal_consistency, 12),
+        })
+
+    ranking.sort(key=lambda item: (
+        item["quality_score"], item["confidence_score"], item["frame_count"],
+        item["temporal_consistency"], -item["raw_id"],
+    ))
+    drop_count = before_count - max_objects
+    dropped = ranking[:drop_count]
+    dropped_ids = {item["raw_id"] for item in dropped}
+    for item in ranking:
+        item["dropped"] = item["raw_id"] in dropped_ids
+        item["reason"] = (
+            "short-lived/low-confidence/temporally-inconsistent"
+            if item["dropped"] else "retained by deterministic quality ranking"
+        )
+    if diagnostics is not None:
+        diagnostics.append({
+            "event": "segment_object_overflow",
+            **({"segment_index": segment_index} if segment_index is not None else {}),
+            "before_count": before_count,
+            "after_count": max_objects,
+            "dropped_raw_ids": [item["raw_id"] for item in dropped],
+            "grace_applied": True,
+            "grace_max_objects": grace_max_objects,
+            "ranking": ranking,
+        })
+    return sorted(
+        (row for row in materialized if int(row["raw_track_id"]) not in dropped_ids),
+        key=lambda row: (int(row["frame_index"]), str(row.get("observation_key", "")), int(row["raw_track_id"])),
+    )
 
 
 def extract_segment_video(source: Path, destination: Path, segment: SegmentWindow) -> None:
