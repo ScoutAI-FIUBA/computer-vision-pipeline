@@ -131,7 +131,7 @@ generation. Do not replay an incomplete or hash-invalid generation.
   stop that worker rather than starting a duplicate.
 - **Input fingerprint/collision:** the Volume input is immutable; use the original
   bytes or a new job ID for a different video.
-- **Timeout:** V2 class invocations use a 1800-second timeout. Reduce frame range
+- **Timeout:** V2 class invocations use a 3600-second timeout. Reduce frame range
   or segment/window cost, or split tracking and stats with retryable stages.
 
 ## Current pipeline
@@ -199,7 +199,7 @@ python scripts/tracking/debug_v2.py --job-id /v2-job-data/JOB_ID \
   --generation GENERATION --output replay.mp4
 ```
 
-The current timeout target remains 1800 seconds per invocation. Confirm GPU seconds and
+The current timeout target remains 3600 seconds per invocation. Confirm GPU seconds and
 Volume retention in Modal before enabling staged routing in a caller. To roll back, omit
 staged routing and use `process`; no staged artifacts are consumed.
 

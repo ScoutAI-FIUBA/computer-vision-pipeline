@@ -248,7 +248,7 @@ def _await_with_progress(call, job_id: str | None):
             _report_status(job_id, "RUNNING", progress_percent=percent)
 
 
-@app.function(image=image, secrets=[r2_secret, callback_secret], timeout=1800)
+@app.function(image=image, secrets=[r2_secret, callback_secret], timeout=3600)
 def run_backed_job(payload: dict) -> dict:
     """Fetch the video from R2, run v2 on the GPU, upload its stats, report back.
 

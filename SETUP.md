@@ -609,7 +609,8 @@ comment next to it. Summary:
 | `gpu` | `L4` | ~1/4 the price of an A100. Peak VRAM is a few hundred MB because SAM2 only ever sees one ~16-frame segment, so a bigger GPU buys nothing. |
 | `max_containers` | `2` | Hard ceiling on parallel GPUs. Stops a retry loop from spinning up ten of them. |
 | `scaledown_window` | `60`s | Idle containers are billed. Long enough to reuse a warm container between back-to-back jobs, short enough that forgetting about one costs cents. |
-| `timeout` | `1800`s | A hung job cannot bill forever. Raise when you start on full games. |
+| legacy `timeout` (`modal_app.py`) | `1800`s | A hung legacy job cannot bill forever. |
+| V2 `timeout` (`modal_app_v2.py`) | `3600`s | Allows full-game V2 invocations while retaining a finite billing limit. |
 | `sam2_model_id` | `hiera-small` | The image encoder runs on **every** frame, so this is the biggest single driver of GPU time. Switch to `hiera-large` for final demo runs only. |
 | `target_fps` | `15` | **Biggest lever.** SAM2's encoder runs on every processed frame, so cost tracks frames processed, not video length. 60fps source at 15fps is a 4x saving. |
 | `frame_stride` | `15` | Detector calls are metered by Roboflow. Note that **lowering this makes tracking worse**, not better — see below. |
