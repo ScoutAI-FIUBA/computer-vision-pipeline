@@ -37,6 +37,7 @@ def test_build_projected_shots_matches_shot_anchor_to_projected_player_bbox():
             {
                 "frame_index": 100,
                 "track_id": 23,
+                "stable_player_id": "player-23",
                 "class_name": "player",
                 "track_state": "detected",
                 "xyxy": [42, 18, 68, 92],
@@ -80,12 +81,15 @@ def test_build_projected_shots_matches_shot_anchor_to_projected_player_bbox():
     assert shot["matched_projected_frame_index"] == 100
     assert shot["matched_projected_frame_gap"] == 0
     assert shot["shooter_track_id"] == 23
+    assert shot["shooter_stable_player_id"] == "player-23"
     assert shot["shooter_team_id"] == 1
     assert shot["shooter_confirmed_number"] == "11"
     assert shot["shot_origin_court_xy_m"] == [5.5, 9.2]
     assert shot["shot_origin_projection_method"] == "shooter_foot"
     assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"
+    assert artifact["heuristics"]["team_number_enrichment"].startswith("compatibility-only")
     assert [row["track_id"] for row in shot["projected_player_snapshot"]] == [8, 23, 30, 31, 32]
+    assert shot["projected_player_snapshot"][1]["stable_player_id"] == "player-23"
 
 
 def test_build_projected_shots_matches_nearest_frame_even_outside_max_gap():
@@ -126,9 +130,89 @@ def test_build_projected_shots_matches_nearest_frame_even_outside_max_gap():
     shot = artifact["shots"][0]
     assert shot["matched_projected_frame_index"] == 0
     assert shot["matched_projected_frame_gap"] == 12
+    assert shot["shooter_track_id"] is None
+    assert shot["shooter_stable_player_id"] is None
+    assert shot["shooter_team_id"] is None
+    assert shot["shooter_confirmed_number"] is None
+    assert shot["shot_origin_court_xy_m"] is None
+    assert shot["shot_origin_projection_method"] is None
+    assert shot["shooter_attribution_method"] == "no_stable_player_id"
+    assert shot["projected_player_snapshot"][0]["track_id"] == 3
+
+
+def test_build_projected_shots_does_not_attribute_raw_only_row():
+    artifact = build_projected_shots(
+        [{"event_id": 8, "start_frame_index": 1, "start_image_xy": [10.0, 10.0]}],
+        [{
+            "frame_index": 1,
+            "track_id": 9,
+            "xyxy": [0, 0, 20, 20],
+            "image_foot_xy": [10, 20],
+            "court_xy_m": [2.0, 3.0],
+        }],
+        team_ids_by_track_id={9: 2},
+        confirmed_numbers_by_track_id={9: "7"},
+    )
+
+    shot = artifact["shots"][0]
+    assert shot["shooter_stable_player_id"] is None
+    assert shot["shooter_track_id"] is None
+    assert shot["shooter_team_id"] is None
+    assert shot["shooter_confirmed_number"] is None
+    assert shot["shooter_attribution_method"] == "no_stable_player_id"
+    assert shot["projected_player_snapshot"] == [{
+        "track_id": 9,
+        "stable_player_id": None,
+        "team_id": 2,
+        "confirmed_number": "7",
+        "track_state": None,
+        "image_foot_xy": [10.0, 20.0],
+        "court_xy_m": [2.0, 3.0],
+        "xyxy": [0.0, 0.0, 20.0, 20.0],
+    }]
+
+
+def test_build_projected_shots_copies_selected_track_stable_player_id_for_overlapping_players():
+    artifact = build_projected_shots(
+        [{"event_id": 9, "start_frame_index": 1, "start_image_xy": [10.0, 10.0]}],
+        [
+            {
+                "frame_index": 1,
+                "track_id": 3,
+                "stable_player_id": "player-007",
+                "xyxy": [0, 0, 20, 20],
+                "image_foot_xy": [10, 20],
+                "court_xy_m": [2.0, 3.0],
+            },
+            {
+                "frame_index": 1,
+                "track_id": 5,
+                "stable_player_id": "player-008",
+                "xyxy": [5, 5, 25, 25],
+                "image_foot_xy": [15, 25],
+                "court_xy_m": [4.0, 5.0],
+            },
+            {
+                "frame_index": 1,
+                "track_id": 9,
+                "xyxy": [0, 0, 20, 20],
+                "image_foot_xy": [10, 20],
+                "court_xy_m": [6.0, 7.0],
+            },
+        ],
+    )
+
+    shot = artifact["shots"][0]
     assert shot["shooter_track_id"] == 3
-    assert shot["shot_origin_court_xy_m"] == [1.0, 2.0]
+    assert shot["shooter_stable_player_id"] == "player-007"
+    assert shot["shot_origin_court_xy_m"] == [2.0, 3.0]
     assert shot["shot_origin_projection_method"] == "shooter_foot"
+    assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"
+    assert [(row["track_id"], row["stable_player_id"]) for row in shot["projected_player_snapshot"]] == [
+        (3, "player-007"),
+        (5, "player-008"),
+        (9, None),
+    ]
 
 
 def test_write_projected_shots_image_writes_png_with_plotted_marks(tmp_path: Path):

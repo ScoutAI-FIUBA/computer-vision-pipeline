@@ -70,7 +70,7 @@ def test_shot_contract_references_ball_evidence_and_keeps_identity_unknown():
     assert events[0]["ball_evidence"]["status"] == "unknown"
     assert events[0]["ball_evidence"]["coverage_status"] == "partial"
     assert events[0]["ball_evidence"]["evidence_frame_indices"] == [1, 2, 3]
-    assert events[0]["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert events[0]["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 def test_shot_contract_does_not_hide_an_unrepresented_frame():
@@ -97,7 +97,7 @@ def test_shot_contract_fails_closed_for_malformed_shot_anchor_box():
         player_rows=[player_row(1)],
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 @pytest.mark.parametrize(
@@ -123,7 +123,7 @@ def test_shot_contract_rejects_nonfinite_or_invalid_area_anchor_box(box):
         player_rows=[player_row(1)],
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 def test_shot_contract_rejects_nonfinite_player_geometry():
@@ -134,7 +134,7 @@ def test_shot_contract_rejects_nonfinite_player_geometry():
         player_rows=[player_row(1, box=(10, 10, float("inf"), 20))],
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 @pytest.mark.parametrize("state", ["LOST", " unknown ", "unresolved", "other"])
@@ -146,7 +146,7 @@ def test_shot_contract_rejects_non_authoritative_player_states(state):
         player_rows=[player_row(1, track_state=state)],
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 @pytest.mark.parametrize("state", [" TRACKED ", "DETECTED"])
@@ -155,13 +155,13 @@ def test_shot_contract_accepts_normalized_authoritative_player_states(state):
         [{"event_id": 14, "start_frame_index": 1, "end_frame_index": 1, "start_image_xy": [15, 15]}],
         [row(1)],
         expected_frame_indices=[1],
-        player_rows=[player_row(1, track_state=state)],
+        player_rows=[player_row(1, track_state=state, stable_player_id="player-7")],
     )[0]
 
     assert event["player_identity"]["status"] == "assigned"
 
 
-def test_shot_contract_assigns_unique_player_and_present_team_from_geometry():
+def test_shot_contract_does_not_assign_raw_track_without_stable_identity():
     event = attach_shot_evidence(
         [{"event_id": 3, "start_frame_index": 1, "end_frame_index": 3, "start_image_xy": [15, 15]}],
         [row(1), row(2), row(3)],
@@ -170,10 +170,22 @@ def test_shot_contract_assigns_unique_player_and_present_team_from_geometry():
         team_ids_by_track_id={7: 1},
     )[0]
 
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
+
+
+def test_shot_contract_assigns_unique_player_and_present_team_from_geometry():
+    event = attach_shot_evidence(
+        [{"event_id": 3, "start_frame_index": 1, "end_frame_index": 3, "start_image_xy": [15, 15]}],
+        [row(1), row(2), row(3)],
+        expected_frame_indices=[1, 2, 3],
+        player_rows=[player_row(1, stable_player_id="player-7"), player_row(2, stable_player_id="player-7"), player_row(3, stable_player_id="player-7")],
+        team_ids_by_track_id={7: 1},
+    )[0]
+
     assert event["player_identity"] == {
         "status": "assigned",
         "track_id": 7,
-        "stable_player_id": None,
+        "stable_player_id": "player-7",
         "team_id": 1,
     }
 
@@ -186,7 +198,7 @@ def test_shot_contract_leaves_ambiguous_players_unassigned():
         player_rows=[player_row(1, 7), player_row(1, 8)],
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 def test_shot_contract_requires_observed_ball_evidence_before_attribution():
@@ -198,7 +210,7 @@ def test_shot_contract_requires_observed_ball_evidence_before_attribution():
         team_ids_by_track_id={7: 1},
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 def test_shot_contract_keeps_player_when_team_is_missing():
@@ -228,7 +240,7 @@ def test_shot_contract_rejects_conflicting_stable_identity():
         ],
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 def test_shot_contract_rejects_team_conflict_across_raw_tracks_for_one_stable_player():
@@ -242,7 +254,7 @@ def test_shot_contract_rejects_team_conflict_across_raw_tracks_for_one_stable_pl
         ],
     )[0]
 
-    assert event["player_identity"] == {"status": "unknown", "track_id": None, "team_id": None}
+    assert event["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 def test_runner_evidence_join_reads_final_track_and_team_artifacts(tmp_path):
@@ -258,7 +270,7 @@ def test_runner_evidence_join_reads_final_track_and_team_artifacts(tmp_path):
         encoding="utf-8",
     )
     (tmp_path / "ball_tracks.jsonl").write_text(json.dumps(row(1)) + "\n", encoding="utf-8")
-    (tmp_path / "tracks.jsonl").write_text(json.dumps(player_row(1)) + "\n", encoding="utf-8")
+    (tmp_path / "tracks.jsonl").write_text(json.dumps(player_row(1, stable_player_id="player-7")) + "\n", encoding="utf-8")
     (tmp_path / "teams.json").write_text(json.dumps({"assignments_by_track_id": {"7": 2}}), encoding="utf-8")
 
     _attach_ball_evidence(tmp_path, expected_frame_indices=[1])

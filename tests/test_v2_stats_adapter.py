@@ -461,6 +461,16 @@ def test_v2_stats_projects_authoritative_rows_and_shots(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(runner, "_read_video_frames", lambda _path, indices: {0: object()})
     monkeypatch.setattr(runner, "build_detector", lambda _config, **_kwargs: SimpleNamespace(detect=lambda _frame: {}))
+    monkeypatch.setattr(runner, "build_tracknet_detector", lambda _checkpoint: object())
+    monkeypatch.setattr(
+        runner,
+        "_collect_tracknet_rows",
+        lambda _video, *, output_path, **_kwargs: output_path.write_text(json.dumps({
+            "frame_index": 0, "timestamp_seconds": 0.0, "track_id": 1,
+            "track_state": "detected", "class_name": "ball", "confidence": 0.9,
+            "xyxy": [10.0, 10.0, 20.0, 20.0], "center_xy": [15.0, 15.0],
+        }) + "\n"),
+    )
     monkeypatch.setattr(
         runner, "parse_court_keypoints",
         lambda *_args, **_kwargs: [{"label": "01", "x": 0, "y": 0, "confidence": 1.0}],
@@ -480,7 +490,7 @@ def test_v2_stats_projects_authoritative_rows_and_shots(tmp_path, monkeypatch):
     result = run_stats_from_v2_observations(
         video, PipelineConfig(
             roboflow_api_key="test-key", court_model_id="court/1", team_embedder_backend="none",
-            number_evidence_enabled=False,
+            number_evidence_enabled=False, tracknet_enabled=True, tracknet_checkpoint="test-checkpoint",
         ), tmp_path / "stats", [{
             "frame_index": 0, "raw_track_id": 17, "stable_player_id": "player-001",
             "team_id": 1, "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked",
@@ -492,9 +502,37 @@ def test_v2_stats_projects_authoritative_rows_and_shots(tmp_path, monkeypatch):
     assert projected["stable_player_id"] == "player-001"
     assert projected["team_id"] == 1
     assert projected["court_xy_m"] == [4.0, 2.0]
+    projected_shots = json.loads((tmp_path / "stats" / "projected_shots.json").read_text())
+    shot_evidence = json.loads((tmp_path / "stats" / "shot_evidence.jsonl").read_text().splitlines()[0])
+    assert shot_evidence["player_identity"]["stable_player_id"] == projected_shots["shots"][0]["shooter_stable_player_id"] == "player-001"
+    assert projected_shots["shots"][0]["shooter_stable_player_id"] == "player-001"
+    assert projected_shots["shots"][0]["projected_player_snapshot"][0]["stable_player_id"] == "player-001"
     assert result.projected_tracks_file == "projected_tracks.jsonl"
     assert result.projected_shots_file == "projected_shots.json"
     assert result.projected_shots_image_file == "projected_shots.png"
+
+
+def test_v2_stats_keeps_missing_stable_identity_unknown_in_shot_evidence(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(fps=30.0, frame_count=1, width=100, height=100, duration_seconds=1 / 30))
+    monkeypatch.setattr(runner, "_read_video_frames", lambda _path, indices: {0: object()})
+    monkeypatch.setattr(runner, "build_detector", lambda _config, **_kwargs: SimpleNamespace(detect=lambda _frame: {}))
+    monkeypatch.setattr(runner, "parse_court_keypoints", lambda *_args, **_kwargs: [{"label": "01", "x": 0, "y": 0, "confidence": 1.0}])
+    monkeypatch.setattr(runner, "compute_frame_homography", lambda *_args, **_kwargs: SimpleNamespace(matrix="H", inliers_count=4, reprojection_mean_m=0.0))
+    monkeypatch.setattr(runner, "project_points", lambda _matrix, points: [[4.0, 2.0] for _ in points])
+    monkeypatch.setattr(runner, "_write_shot_events", lambda _video, path, **_kwargs: path.write_text(json.dumps({"event_id": 1, "start_frame_index": 0, "start_image_xy": [20, 30], "outcome": "made"}) + "\n"))
+
+    run_stats_from_v2_observations(
+        video, PipelineConfig(roboflow_api_key="test-key", court_model_id="court/1", team_embedder_backend="none", number_evidence_enabled=False), tmp_path / "stats", [{
+            "frame_index": 0, "raw_track_id": 17, "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked",
+        }],
+    )
+
+    shot_evidence = json.loads((tmp_path / "stats" / "shot_evidence.jsonl").read_text().splitlines()[0])
+    assert shot_evidence["player_identity"] == {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
 
 
 def test_v2_stats_omits_projection_when_court_evidence_is_invalid(tmp_path, monkeypatch):

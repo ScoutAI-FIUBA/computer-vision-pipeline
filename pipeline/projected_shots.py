@@ -188,6 +188,7 @@ def _snapshot_row(row: dict, *, team_ids_by_track_id: dict[int, int], confirmed_
     track_id = None if row.get("track_id") is None else int(row["track_id"])
     return {
         "track_id": track_id,
+        "stable_player_id": row.get("stable_player_id"),
         "team_id": None if track_id is None else team_ids_by_track_id.get(track_id),
         "confirmed_number": None if track_id is None else confirmed_numbers_by_track_id.get(track_id),
         "track_state": row.get("track_state"),
@@ -200,10 +201,20 @@ def _snapshot_row(row: dict, *, team_ids_by_track_id: dict[int, int], confirmed_
 def _select_shooter_row(projected_rows: list[dict], shot_image_xy: tuple[float, float] | None) -> tuple[dict | None, str]:
     if shot_image_xy is None:
         return None, "missing_shot_anchor"
+    if not projected_rows:
+        return None, "no_projected_players"
+
+    eligible_rows = [
+        row
+        for row in projected_rows
+        if isinstance(row.get("stable_player_id"), str) and row["stable_player_id"].strip()
+    ]
+    if not eligible_rows:
+        return None, "no_stable_player_id"
 
     best_row = None
     best_score = None
-    for row in projected_rows:
+    for row in eligible_rows:
         bbox_center = _bbox_center_xy(row.get("xyxy"))
         score = (
             0 if _point_in_xyxy(shot_image_xy, row.get("xyxy")) else 1,
@@ -214,8 +225,6 @@ def _select_shooter_row(projected_rows: list[dict], shot_image_xy: tuple[float, 
         if best_score is None or score < best_score:
             best_score = score
             best_row = row
-    if best_row is None:
-        return None, "no_projected_players"
     return best_row, "nearest_player_bbox_to_shot_anchor"
 
 
@@ -227,6 +236,12 @@ def build_projected_shots(
     team_ids_by_track_id: dict[int, int] | None = None,
     confirmed_numbers_by_track_id: dict[int, str] | None = None,
 ) -> dict:
+    """Build shot projections; track-keyed team/number fields are compatibility enrichment.
+
+    ``stable_player_id`` is the canonical player identity. Raw track IDs remain in the
+    artifact only as frame-local provenance because the existing team/number APIs are
+    track-keyed and do not provide stable-player keyed lookups yet.
+    """
     team_ids_by_track_id = team_ids_by_track_id or {}
     confirmed_numbers_by_track_id = confirmed_numbers_by_track_id or {}
     projected_by_frame = _group_projected_tracks_by_frame(projected_tracks)
@@ -261,6 +276,7 @@ def build_projected_shots(
             shot_origin_projection_method = None
 
         shooter_track_id = None if shooter_row is None or shooter_row.get("track_id") is None else int(shooter_row["track_id"])
+        shooter_stable_player_id = None if shooter_row is None else shooter_row.get("stable_player_id")
         if shooter_row is not None:
             shot_origin_court_xy_m = [float(value) for value in shooter_row.get("court_xy_m", [])[:2]]
             shot_origin_projection_method = "shooter_foot"
@@ -274,6 +290,7 @@ def build_projected_shots(
                 "shot_origin_court_xy_m": shot_origin_court_xy_m,
                 "shot_origin_projection_method": shot_origin_projection_method,
                 "shooter_track_id": shooter_track_id,
+                "shooter_stable_player_id": shooter_stable_player_id,
                 "shooter_team_id": None if shooter_track_id is None else team_ids_by_track_id.get(shooter_track_id),
                 "shooter_confirmed_number": None
                 if shooter_track_id is None
@@ -289,7 +306,8 @@ def build_projected_shots(
             "event_anchor": "start_frame_index/start_image_xy from shot_events.jsonl",
             "frame_matching": "nearest projected frame by minimum temporal distance",
             "shot_origin_projection": "use the attributed shooter's projected foot/court point",
-            "shooter_selection": "prefer projected player bbox containing the shot anchor, then nearest bbox center, then nearest foot point",
+            "shooter_selection": "prefer containing bbox, then nearest bbox center and foot point",
+            "team_number_enrichment": "compatibility-only lookup keyed by raw track_id; stable_player_id remains canonical",
         },
         "shots": shots,
     }

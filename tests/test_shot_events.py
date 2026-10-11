@@ -804,7 +804,7 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
     ]
 
 
-def test_run_pipeline_writes_assigned_player_team_to_external_shot_evidence(
+def test_run_pipeline_keeps_external_shot_evidence_unknown_without_stable_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     import numpy as np
@@ -923,10 +923,10 @@ def test_run_pipeline_writes_assigned_player_team_to_external_shot_evidence(
     ]
     assert evidence[0]["ball_evidence"]["status"] == "observed"
     assert evidence[0]["player_identity"] == {
-        "status": "assigned",
-        "track_id": 1,
+        "status": "unknown",
+        "track_id": None,
         "stable_player_id": None,
-        "team_id": 2,
+        "team_id": None,
     }
 
 
@@ -1226,8 +1226,10 @@ def test_run_pipeline_handles_projected_artifacts_based_on_homography_availabili
         assert projected_tracks[0]["court_xy_m"] == [4.5, 1.25]
         projected_shots_payload = json.loads((output_dir / "projected_shots.json").read_text(encoding="utf-8"))
         assert projected_shots_payload["shots"][0]["matched_projected_frame_index"] == 0
-        assert projected_shots_payload["shots"][0]["shooter_track_id"] == 1
-        assert projected_shots_payload["shots"][0]["shot_origin_court_xy_m"] == [4.5, 1.25]
+        assert projected_shots_payload["shots"][0]["shooter_track_id"] is None
+        assert projected_shots_payload["shots"][0]["shooter_stable_player_id"] is None
+        assert projected_shots_payload["shots"][0]["shooter_attribution_method"] == "no_stable_player_id"
+        assert projected_shots_payload["shots"][0]["shot_origin_court_xy_m"] is None
         assert (output_dir / "projected_shots.png").exists()
         assert results_payload["projected_tracks_file"] == "projected_tracks.jsonl"
         assert results_payload["projected_shots_file"] == "projected_shots.json"
