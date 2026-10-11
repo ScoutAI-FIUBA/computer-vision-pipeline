@@ -57,13 +57,25 @@ instead of silently dropping an unbounded number of players.
 Modes are mutually exclusive. Stats-only and possession-only consume the existing
 job and must not receive `--video-path`.
 
-#### Exact full run for `game027`
+#### Production-style staged V5 run for `game027`
 
 ```bash
-SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py --staged --job-id game027 \
-  --video-path clips/game027.mp4 --frame-start 60 --frame-end 130 \
-  --segment-window 32 --segment-overlap 1 --possession-engine v5
+modal run modal_app_v2.py \
+  --staged \
+  --job-id game027-modelv2-v5-test3 \
+  --video-path "dataset-tracknet/train/game_27/video/clip_027.mp4" \
+  --frame-start 0 \
+  --frame-end 654 \
+  --segmented \
+  --segment-window 150 \
+  --segment-overlap 20 \
+  --possession-engine v5
 ```
+
+This is the full staged V5 run: it persists a durable job while processing the
+complete frame range, enables bounded SAM3.1 sessions with `--segmented`, uses
+150-frame windows, and reuses 20 frames between adjacent windows for seam
+matching.
 
 #### Exact V4/V5 possession-only comparison
 
