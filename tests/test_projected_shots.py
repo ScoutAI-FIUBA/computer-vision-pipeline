@@ -261,10 +261,6 @@ def _player(track_id: int, stable_id: str, xyxy: list[float], court_xy: list[flo
     }
 
 
-def _ball(frame_index: int, x: float, y: float) -> dict:
-    return {"frame_index": frame_index, "track_state": "detected", "center_xy": [x, y]}
-
-
 def _made_event() -> dict:
     return {
         "event_id": 1,
@@ -277,39 +273,102 @@ def _made_event() -> dict:
     }
 
 
-def _release_scene() -> tuple[list[dict], list[dict]]:
+def _pred(class_id: int, class_name: str, xyxy: list[float], confidence: float = 0.8) -> dict:
+    x1, y1, x2, y2 = xyxy
+    return {
+        "class_id": class_id,
+        "class": class_name,
+        "confidence": confidence,
+        "x": (x1 + x2) / 2.0,
+        "y": (y1 + y2) / 2.0,
+        "width": x2 - x1,
+        "height": y2 - y1,
+    }
+
+
+def _ball_pred(x: float, y: float) -> dict:
+    return _pred(0, "ball", [x - 10, y - 10, x + 10, y + 10], 0.9)
+
+
+def _raw_rows(by_frame: dict[int, list[dict]]) -> list[dict]:
+    return [
+        {"frame_index": frame, "timestamp_seconds": frame / 60.0, "predictions": predictions}
+        for frame, predictions in sorted(by_frame.items())
+    ]
+
+
+def _vote_scene() -> tuple[list[dict], dict[int, list[dict]]]:
+    # The shooter (player-shooter) and a teammate (player-mate) both hold a shooting pose. The ball is
+    # at the shooter's hands; it is far above the teammate's box.
+    frames = (10, 12, 14, 16, 18, 20)
     tracks = []
-    for frame_index in (10, 12, 14, 16, 18, 20):
+    for frame_index in frames:
         tracks += [
             _player(1, "player-edge", [0, 430, 45, 620], [18.7, 11.1], frame_index),
             _player(2, "player-shooter", [500, 280, 600, 460], [24.9, 8.3], frame_index),
-            # Spectator behind the basket whose box overlaps the ball when it reaches the rim.
-            _player(3, "player-crowd", [540, 100, 640, 260], [26.0, -2.7], frame_index),
+            _player(3, "player-mate", [200, 300, 300, 480], [20.0, 6.0], frame_index),
+            _player(4, "player-crowd", [540, 100, 640, 260], [26.0, -2.7], frame_index),
         ]
-    ball = [
-        _ball(10, 640, 420),  # outside every box
-        _ball(12, 560, 300),  # in the shooter's hands
-        _ball(14, 570, 240),  # above the shooter, rising
-        _ball(16, 580, 200),
-        _ball(18, 590, 170),  # inside the crowd box at the rim
-        _ball(20, 600, 150),
-    ]
-    return tracks, ball
+    raw = {
+        frame_index: [
+            _pred(7, "player-shot-block", [500, 280, 600, 460]),
+            _pred(7, "player-shot-block", [200, 300, 300, 480], 0.79),
+            _pred(7, "player-shot-block", [540, 100, 640, 260]),
+            _ball_pred(550, 270),
+        ]
+        for frame_index in frames
+    }
+    # Ball for the teammate's pose is 0.43 box-heights above his box; the crowd box is off court.
+    raw[10] = raw[10][:3] + [_ball_pred(250, 230)]
+    return tracks, raw
 
 
-def test_made_shot_is_attributed_to_the_player_who_released_the_ball():
-    tracks, ball = _release_scene()
+def test_made_shot_is_attributed_by_shooting_pose_boxes_with_the_ball_at_the_hands():
+    tracks, raw = _vote_scene()
 
-    shot = build_projected_shots([_made_event()], tracks, ball_rows=ball)["shots"][0]
+    shot = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
 
     assert shot["shooter_stable_player_id"] == "player-shooter"
-    assert shot["shooter_attribution_method"] == "ball_release_before_basket"
+    assert shot["shooter_attribution_method"] == "action_box_vote"
     assert shot["shot_origin_court_xy_m"] == [24.9, 8.3]
-    assert shot["matched_projected_frame_index"] == 12
 
 
-def test_made_shot_falls_back_to_the_anchor_without_ball_rows():
-    tracks, _ = _release_scene()
+def test_pose_box_with_the_ball_far_above_the_box_does_not_vote():
+    tracks, raw = _vote_scene()
+    # Remove the shooter's own boxes: only the teammate (ball 0.43h above his box) and the crowd remain.
+    raw = {
+        frame: [p for p in preds if not (p["class_id"] == 7 and p["x"] == 550.0)] for frame, preds in raw.items()
+    }
+    for frame in raw:
+        raw[frame] = [p for p in raw[frame] if p["class_id"] != 0] + [_ball_pred(250, 230)]
+
+    shot = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["shooter_stable_player_id"] is None
+    assert shot["shooter_attribution_method"] == "ambiguous"
+    assert shot["shot_origin_court_xy_m"] is None
+
+
+def test_close_vote_is_ambiguous_instead_of_a_guess():
+    tracks, raw = _vote_scene()
+    raw = {
+        frame: [
+            _pred(7, "player-shot-block", [500, 280, 600, 460]),
+            _pred(7, "player-shot-block", [200, 300, 300, 480]),
+            _ball_pred(550, 270),
+            _ball_pred(250, 320),
+        ]
+        for frame in raw
+    }
+
+    shot = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["shooter_stable_player_id"] is None
+    assert shot["shooter_attribution_method"] == "ambiguous"
+
+
+def test_made_shot_without_raw_predictions_keeps_the_anchor_rule():
+    tracks, _ = _vote_scene()
 
     shot = build_projected_shots([_made_event()], tracks)["shots"][0]
 
@@ -317,10 +376,10 @@ def test_made_shot_falls_back_to_the_anchor_without_ball_rows():
     assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"
 
 
-def test_release_attribution_ignores_events_without_a_basket_frame():
-    tracks, ball = _release_scene()
+def test_shot_without_a_basket_frame_keeps_the_anchor_rule_even_with_raw_predictions():
+    tracks, raw = _vote_scene()
     event = {k: v for k, v in _made_event().items() if k != "ball_in_basket_frame_index"}
 
-    shot = build_projected_shots([event], tracks, ball_rows=ball)["shots"][0]
+    shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
 
     assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"

@@ -913,7 +913,11 @@ def _maybe_write_projected_shots(output_dir: Path) -> tuple[str | None, str | No
         projected_tracks,
         team_ids_by_track_id=_load_team_ids_by_track_id(output_dir / TEAMS_FILENAME),
         confirmed_numbers_by_track_id=_load_confirmed_numbers_by_track_id(output_dir / NUMBERS_FILENAME),
-        ball_rows=load_ball_track_rows(output_dir / BALL_TRACKS_FILENAME),
+        raw_prediction_rows=(
+            _load_jsonl_rows(output_dir / SHOT_RAW_PREDICTIONS_FILENAME)
+            if (output_dir / SHOT_RAW_PREDICTIONS_FILENAME).exists()
+            else None
+        ),
     )
     projected_shots_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     write_projected_shots_image(artifact, projected_shots_image_path)

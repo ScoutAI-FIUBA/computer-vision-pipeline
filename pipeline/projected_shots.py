@@ -228,82 +228,138 @@ def _select_shooter_row(projected_rows: list[dict], shot_image_xy: tuple[float, 
     return best_row, "nearest_player_bbox_to_shot_anchor"
 
 
-RELEASE_MAX_LOOKBACK_FRAMES = 180
-RELEASE_RISE_JITTER_PX = 12.0
-RELEASE_BOX_PADDING_RATIO = 0.1
-RELEASE_COURT_MARGIN_M = 0.5
-
-
-def _ball_center_by_frame(ball_rows: list[dict] | None) -> dict[int, tuple[float, float]]:
-    centers: dict[int, tuple[float, float]] = {}
-    for row in ball_rows or []:
-        center = row.get("center_xy")
-        if row.get("track_state") != "detected" or row.get("frame_index") is None:
-            continue
-        if isinstance(center, (list, tuple)) and len(center) >= 2:
-            centers[int(row["frame_index"])] = (float(center[0]), float(center[1]))
-    return centers
+ACTION_WINDOW_SECONDS = 2.0
+ACTION_MIN_BOX_IOU = 0.3
+ACTION_MIN_BALL_CONFIDENCE = 0.4
+ACTION_BALL_X_MARGIN_RATIO = 0.1
+ACTION_BALL_ABOVE_BOX_RATIO = 0.25
+ACTION_BALL_BELOW_TOP_RATIO = 0.6
+ACTION_MIN_VOTE_SCORE = 1.0
+ACTION_MIN_WINNER_RATIO = 2.0
+ACTION_COURT_MARGIN_M = 0.5
+# The detector labels a player with the ball and the shooting pose with these classes.
+ACTION_CLASS_IDS = {4, 5, 6, 7}
+ACTION_CLASS_NAMES = {"player_in_possession", "player_jump_shot", "player_layup_dunk", "player_shot_block"}
+BALL_CLASS_ID = 0
 
 
 def _on_court(row: dict) -> bool:
     court_xy = row.get("court_xy_m")
     if not isinstance(court_xy, (list, tuple)) or len(court_xy) < 2:
         return False
-    margin = RELEASE_COURT_MARGIN_M
+    margin = ACTION_COURT_MARGIN_M
     return (
         -margin <= float(court_xy[0]) <= COURT_LENGTH_M + margin
         and -margin <= float(court_xy[1]) <= COURT_WIDTH_M + margin
     )
 
 
-def _padded_contains(point_xy: tuple[float, float], xyxy: list[float] | None) -> bool:
-    if xyxy is None or len(xyxy) != 4:
-        return False
-    x1, y1, x2, y2 = [float(value) for value in xyxy]
-    pad = RELEASE_BOX_PADDING_RATIO * max(x2 - x1, y2 - y1)
-    return x1 - pad <= point_xy[0] <= x2 + pad and y1 - pad <= point_xy[1] <= y2 + pad
+def _iou(box_a: tuple[float, float, float, float], box_b: list[float] | tuple[float, ...]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = [float(value) for value in box_b]
+    inter_w = min(ax2, bx2) - max(ax1, bx1)
+    inter_h = min(ay2, by2) - max(ay1, by1)
+    if inter_w <= 0 or inter_h <= 0:
+        return 0.0
+    inter = inter_w * inter_h
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
 
 
-def _release_shooter_row(
+def _raw_prediction_fps(raw_rows_by_frame: dict[int, dict]) -> float | None:
+    timed = [
+        (frame, row["timestamp_seconds"])
+        for frame, row in sorted(raw_rows_by_frame.items())
+        if row.get("timestamp_seconds") is not None
+    ]
+    if len(timed) < 2 or timed[-1][1] <= timed[0][1]:
+        return None
+    return (timed[-1][0] - timed[0][0]) / (timed[-1][1] - timed[0][1])
+
+
+def _action_box_shooter_row(
     event: dict,
-    ball_centers: dict[int, tuple[float, float]],
+    raw_rows_by_frame: dict[int, dict],
     projected_by_frame: dict[int, list[dict]],
 ) -> tuple[dict | None, int | None]:
-    """Attribute a made shot to the last player holding the ball before it flew to the rim.
+    """Vote for the shooter among the detector's shooting-pose boxes before a made basket.
 
-    Walks back from ``ball_in_basket`` through the ball's continuous upward flight, then takes
-    the latest frame in it where the ball sits inside (or beside) a stable player's box.
+    A box votes for the projected player it overlaps most, but only when a ball detection sits at
+    that box's hands or overhead in the same frame. That ball check is what separates the shooter
+    from a teammate in the same pose with the ball far above his head. The winner needs a clear
+    margin; otherwise the shooter is left unknown instead of guessed.
     """
+    from pipeline.shot_events import (
+        prediction_confidence,
+        prediction_has_class_id,
+        normalize_prediction_class_name,
+        prediction_xyxy,
+    )
+
     basket_frame = event.get("ball_in_basket_frame_index")
-    if basket_frame is None or not ball_centers:
+    fps = _raw_prediction_fps(raw_rows_by_frame)
+    if basket_frame is None or fps is None:
         return None, None
     basket_frame = int(basket_frame)
-    detected = sorted(
-        (frame for frame in ball_centers if basket_frame - RELEASE_MAX_LOOKBACK_FRAMES <= frame <= basket_frame),
-        reverse=True,
-    )
-    flight: list[int] = []
-    highest_y_so_far = None
-    for frame in detected:
-        y = ball_centers[frame][1]
-        if highest_y_so_far is not None and y < highest_y_so_far - RELEASE_RISE_JITTER_PX:
-            break
-        flight.append(frame)
-        highest_y_so_far = y if highest_y_so_far is None else max(highest_y_so_far, y)
+    window_start = basket_frame - round(ACTION_WINDOW_SECONDS * fps)
 
-    for frame in flight:
-        rows = [
-            row
-            for row in projected_by_frame.get(frame, [])
-            if isinstance(row.get("stable_player_id"), str)
-            and row["stable_player_id"].strip()
-            and _on_court(row)
-            and _padded_contains(ball_centers[frame], row.get("xyxy"))
-        ]
-        if rows:
-            row, _ = _select_shooter_row(rows, ball_centers[frame])
-            return row, frame
-    return None, None
+    scores: dict[str, float] = {}
+    best_box: dict[str, tuple[float, int, dict]] = {}
+    for frame in range(window_start, basket_frame + 1):
+        predictions = (raw_rows_by_frame.get(frame) or {}).get("predictions") or []
+        balls = []
+        for prediction in predictions:
+            if not isinstance(prediction, dict):
+                continue
+            if prediction_has_class_id(prediction, BALL_CLASS_ID) or normalize_prediction_class_name(
+                prediction.get("class")
+            ) == "ball":
+                ball_xyxy = prediction_xyxy(prediction)
+                if ball_xyxy is not None and (prediction_confidence(prediction) or 0.0) >= ACTION_MIN_BALL_CONFIDENCE:
+                    balls.append(((ball_xyxy[0] + ball_xyxy[2]) / 2.0, (ball_xyxy[1] + ball_xyxy[3]) / 2.0))
+        if not balls:
+            continue
+        for prediction in predictions:
+            if not isinstance(prediction, dict):
+                continue
+            is_action = any(prediction_has_class_id(prediction, class_id) for class_id in ACTION_CLASS_IDS) or (
+                normalize_prediction_class_name(prediction.get("class")) in ACTION_CLASS_NAMES
+            )
+            box = prediction_xyxy(prediction)
+            if not is_action or box is None:
+                continue
+            x1, y1, x2, y2 = box
+            width, height = x2 - x1, y2 - y1
+            if not any(
+                x1 - ACTION_BALL_X_MARGIN_RATIO * width <= ball_x <= x2 + ACTION_BALL_X_MARGIN_RATIO * width
+                and y1 - ACTION_BALL_ABOVE_BOX_RATIO * height <= ball_y <= y1 + ACTION_BALL_BELOW_TOP_RATIO * height
+                for ball_x, ball_y in balls
+            ):
+                continue
+            candidates = [
+                row
+                for row in projected_by_frame.get(frame, [])
+                if isinstance(row.get("stable_player_id"), str)
+                and row["stable_player_id"].strip()
+                and _on_court(row)
+                and _iou(box, row.get("xyxy") or [0, 0, 0, 0]) >= ACTION_MIN_BOX_IOU
+            ]
+            if not candidates:
+                continue
+            row = max(candidates, key=lambda candidate: _iou(box, candidate["xyxy"]))
+            confidence = prediction_confidence(prediction) or 0.0
+            stable_id = row["stable_player_id"]
+            scores[stable_id] = scores.get(stable_id, 0.0) + confidence
+            if stable_id not in best_box or confidence > best_box[stable_id][0]:
+                best_box[stable_id] = (confidence, frame, row)
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if not ranked or ranked[0][1] < ACTION_MIN_VOTE_SCORE:
+        return None, None
+    if len(ranked) > 1 and ranked[0][1] < ACTION_MIN_WINNER_RATIO * ranked[1][1]:
+        return None, None
+    _, frame, row = best_box[ranked[0][0]]
+    return row, frame
 
 
 def build_projected_shots(
@@ -313,7 +369,7 @@ def build_projected_shots(
     max_frame_gap: int = 6,
     team_ids_by_track_id: dict[int, int] | None = None,
     confirmed_numbers_by_track_id: dict[int, str] | None = None,
-    ball_rows: list[dict] | None = None,
+    raw_prediction_rows: list[dict] | None = None,
 ) -> dict:
     """Build shot projections; track-keyed team/number fields are compatibility enrichment.
 
@@ -325,7 +381,11 @@ def build_projected_shots(
     confirmed_numbers_by_track_id = confirmed_numbers_by_track_id or {}
     projected_by_frame = _group_projected_tracks_by_frame(projected_tracks)
     available_frame_indexes = sorted(projected_by_frame)
-    ball_centers = _ball_center_by_frame(ball_rows)
+    raw_rows_by_frame = (
+        None
+        if raw_prediction_rows is None
+        else {int(row["frame_index"]): row for row in raw_prediction_rows if row.get("frame_index") is not None}
+    )
 
     shots: list[dict] = []
     for event in shot_events:
@@ -349,22 +409,30 @@ def build_projected_shots(
                 frame_rows,
                 shot_anchor_image_xy,
             )
-            release_row, release_frame_index = _release_shooter_row(event, ball_centers, projected_by_frame)
-            if release_row is not None:
-                shooter_row = release_row
-                attribution_method = "ball_release_before_basket"
-                snapshot_rows = [
-                    _snapshot_row(
-                        row,
-                        team_ids_by_track_id=team_ids_by_track_id,
-                        confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
-                    )
-                    for row in sorted(
-                        projected_by_frame.get(release_frame_index, []),
-                        key=lambda row: (row.get("track_id") is None, row.get("track_id")),
-                    )
-                ]
-                matched_frame_index = release_frame_index
+            if raw_rows_by_frame is not None and event.get("ball_in_basket_frame_index") is not None:
+                action_row, action_frame_index = _action_box_shooter_row(
+                    event, raw_rows_by_frame, projected_by_frame
+                )
+                if action_row is not None:
+                    shooter_row = action_row
+                    attribution_method = "action_box_vote"
+                elif shooter_row is not None:
+                    # The anchor rule would have guessed; an unclear vote leaves the shooter unknown instead.
+                    shooter_row = None
+                    attribution_method = "ambiguous"
+                if action_row is not None:
+                    snapshot_rows = [
+                        _snapshot_row(
+                            row,
+                            team_ids_by_track_id=team_ids_by_track_id,
+                            confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+                        )
+                        for row in sorted(
+                            projected_by_frame.get(action_frame_index, []),
+                            key=lambda row: (row.get("track_id") is None, row.get("track_id")),
+                        )
+                    ]
+                    matched_frame_index = action_frame_index
             shot_origin_court_xy_m = None
             shot_origin_projection_method = None
         else:
@@ -402,7 +470,7 @@ def build_projected_shots(
             "event_anchor": "start_frame_index/start_image_xy from shot_events.jsonl",
             "frame_matching": "nearest projected frame by minimum temporal distance",
             "shot_origin_projection": "use the attributed shooter's projected foot/court point",
-            "shooter_selection": "made shots: last player holding the ball before its upward flight to the rim; otherwise prefer containing bbox, then nearest bbox center and foot point",
+            "shooter_selection": "made shots with raw detector predictions: vote among shooting-pose boxes with the ball at their hands in the 2s before the basket, ambiguous when unclear; otherwise prefer containing bbox, then nearest bbox center and foot point",
             "team_number_enrichment": "compatibility-only lookup keyed by raw track_id; stable_player_id remains canonical",
         },
         "shots": shots,
