@@ -894,15 +894,23 @@ def _project_v2_rows(
 
 def _maybe_write_projected_shots(output_dir: Path) -> tuple[str | None, str | None]:
     projected_tracks_path = output_dir / PROJECTED_TRACKS_FILENAME
+    projected_shots_path = output_dir / PROJECTED_SHOTS_FILENAME
+    projected_shots_image_path = output_dir / PROJECTED_SHOTS_IMAGE_FILENAME
     if not projected_tracks_path.exists():
+        projected_shots_path.unlink(missing_ok=True)
+        projected_shots_image_path.unlink(missing_ok=True)
         return None, None
 
     shot_events_path = output_dir / SHOT_EVENTS_FILENAME
-    projected_shots_path = output_dir / PROJECTED_SHOTS_FILENAME
-    projected_shots_image_path = output_dir / PROJECTED_SHOTS_IMAGE_FILENAME
+    projected_tracks = _load_jsonl_rows(projected_tracks_path)
+    if not projected_tracks:
+        projected_tracks_path.unlink(missing_ok=True)
+        projected_shots_path.unlink(missing_ok=True)
+        projected_shots_image_path.unlink(missing_ok=True)
+        return None, None
     artifact = build_projected_shots(
         _load_jsonl_rows(shot_events_path),
-        _load_jsonl_rows(projected_tracks_path),
+        projected_tracks,
         team_ids_by_track_id=_load_team_ids_by_track_id(output_dir / TEAMS_FILENAME),
         confirmed_numbers_by_track_id=_load_confirmed_numbers_by_track_id(output_dir / NUMBERS_FILENAME),
     )
@@ -1046,7 +1054,8 @@ def _write_shot_events(
 
 
 def _attach_ball_evidence(
-    output_dir: Path, *, expected_frame_indices, team_ids_by_track_id: dict[int, int] | None = None
+    output_dir: Path, *, expected_frame_indices, team_ids_by_track_id: dict[int, int] | None = None,
+    projected_shots: dict | None = None,
 ) -> None:
     events = _load_jsonl_rows(output_dir / SHOT_EVENTS_FILENAME)
     evidence_path = output_dir / SHOT_EVIDENCE_FILENAME
@@ -1060,6 +1069,30 @@ def _attach_ball_evidence(
         player_rows=tracks,
         team_ids_by_track_id=team_ids_by_track_id,
     )
+    if projected_shots is None:
+        projected_shots_path = output_dir / PROJECTED_SHOTS_FILENAME
+        if projected_shots_path.exists():
+            projected_shots = json.loads(projected_shots_path.read_text(encoding="utf-8"))
+    if projected_shots is not None:
+        projected_by_event_id = {
+            shot.get("event_id"): shot
+            for shot in projected_shots.get("shots", [])
+            if isinstance(shot, dict) and shot.get("event_id") is not None
+        }
+        for event in enriched:
+            identity = event.get("player_identity", {})
+            projected = projected_by_event_id.get(event.get("event_id"))
+            stable_player_id = projected.get("shooter_stable_player_id") if projected else None
+            if identity.get("status") != "unknown" or not isinstance(stable_player_id, str) or not stable_player_id.strip():
+                continue
+            event["player_identity"] = {
+                "status": "inferred",
+                "track_id": projected.get("shooter_track_id"),
+                "stable_player_id": stable_player_id.strip(),
+                "team_id": projected.get("shooter_team_id"),
+                "attribution_method": "projected_shot_track",
+                "authority": "non_authoritative",
+            }
     evidence_path.write_text("".join(json.dumps(event) + "\n" for event in enriched), encoding="utf-8")
 
 
@@ -1260,12 +1293,12 @@ def run_stats_from_v2_observations(
         on_progress=shot_progress,
     ))
     shot_progress.complete(info.frame_count if info.frame_count > 0 else None)
-    phase("shot evidence", lambda: _attach_ball_evidence(
-        output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id
-    ))
     projected_shots_file, projected_shots_image_file = phase(
         "projected shot artifacts", lambda: _maybe_write_projected_shots(output_dir)
     )
+    phase("shot evidence", lambda: _attach_ball_evidence(
+        output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id
+    ))
     emit("possession start")
     possession_path, transitions_path = phase("possession", lambda: _write_possession_artifacts(
         output_dir, rows, ball_rows, fps=info.fps, frame_step=1,
@@ -1996,6 +2029,9 @@ def run_pipeline(
         step=shot_step,
         config=config,
     )
+    if projected_track_records == 0 and projected_tracks_path.exists():
+        projected_tracks_path.unlink()
+    results.projected_shots_file, results.projected_shots_image_file = _maybe_write_projected_shots(output_dir)
     ball_rows = load_ball_track_rows(output_dir / BALL_TRACKS_FILENAME)
     ball_step = 1 if config.ball_all_frames else frame_step_for(info.fps, config.ball_target_fps)
     expected_ball_count = info.frame_count
@@ -2126,9 +2162,6 @@ def run_pipeline(
         for record in suspected_swaps:
             handle.write(json.dumps(record) + "\n")
 
-    if projected_track_records == 0 and projected_tracks_path.exists():
-        projected_tracks_path.unlink()
-    results.projected_shots_file, results.projected_shots_image_file = _maybe_write_projected_shots(output_dir)
     results.write(output_dir / RESULTS_FILENAME)
 
     logger.info(

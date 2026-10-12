@@ -250,7 +250,7 @@ def _player_identity_for_shot(
     player_rows: Iterable[dict],
     team_ids_by_track_id: Mapping[int, int] | None,
 ) -> dict:
-    unknown = {"status": "unknown", "track_id": None, "team_id": None}
+    unknown = {"status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None}
     if ball_evidence["status"] != "observed":
         return unknown
     point = _shot_anchor(event)
@@ -284,25 +284,22 @@ def _player_identity_for_shot(
     if not candidates:
         return unknown
 
-    identities: dict[int, str | int] = {}
+    identities: dict[int, str] = {}
     for raw_id, rows in candidates.items():
-        has_stable_fields = any("stable_player_id" in row for row in rows)
         stable_values = {
             row.get("stable_player_id")
             for row in rows
             if isinstance(row.get("stable_player_id"), str) and row["stable_player_id"].strip()
         }
         statuses = {str(row.get("status", "resolved")).lower() for row in rows}
-        if has_stable_fields:
-            if len(stable_values) != 1 or any(
-                not isinstance(row.get("stable_player_id"), str)
-                or not row["stable_player_id"].strip()
-                for row in rows
-            ) or statuses - {"resolved"}:
-                return unknown
-            identities[raw_id] = next(iter(stable_values)).strip()
-        else:
-            identities[raw_id] = raw_id
+        if len(stable_values) != 1 or any(
+            not isinstance(row.get("stable_player_id"), str)
+            or not row["stable_player_id"].strip()
+            for row in rows
+        ) or statuses - {"resolved"}:
+            # A raw tracker ID identifies provenance only; it is not a player identity.
+            return unknown
+        identities[raw_id] = next(iter(stable_values)).strip()
 
     unique_identities = set(identities.values())
     if len(unique_identities) != 1:
@@ -341,11 +338,10 @@ def _player_identity_for_shot(
                 return unknown
     if len(team_values) > 1:
         return unknown
-    stable_id = identities[raw_id] if isinstance(identities[raw_id], str) else None
     return {
         "status": "assigned",
         "track_id": raw_id,
-        "stable_player_id": stable_id,
+        "stable_player_id": identities[raw_id],
         "team_id": next(iter(team_values), None),
     }
 

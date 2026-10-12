@@ -797,7 +797,7 @@ def _load_possession_tracking_inputs(job: Path, generation: dict[str, Any]) -> t
     # volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data}
     volumes=V2_VOLUMES,
     secrets=[hf_secret, roboflow_secret],
-    timeout=1800,
+    timeout=3600,
 )
 class PipelineV2:
     @modal.enter()

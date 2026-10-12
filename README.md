@@ -57,13 +57,25 @@ instead of silently dropping an unbounded number of players.
 Modes are mutually exclusive. Stats-only and possession-only consume the existing
 job and must not receive `--video-path`.
 
-#### Exact full run for `game027`
+#### Production-style staged V5 run for `game027`
 
 ```bash
-SAM31_V2_SEGMENTED=1 modal run modal_app_v2.py --staged --job-id game027 \
-  --video-path clips/game027.mp4 --frame-start 60 --frame-end 130 \
-  --segment-window 32 --segment-overlap 1 --possession-engine v5
+modal run modal_app_v2.py \
+  --staged \
+  --job-id game027-modelv2-v5-test3 \
+  --video-path "dataset-tracknet/train/game_27/video/clip_027.mp4" \
+  --frame-start 0 \
+  --frame-end 654 \
+  --segmented \
+  --segment-window 150 \
+  --segment-overlap 20 \
+  --possession-engine v5
 ```
+
+This is the full staged V5 run: it persists a durable job while processing the
+complete frame range, enables bounded SAM3.1 sessions with `--segmented`, uses
+150-frame windows, and reuses 20 frames between adjacent windows for seam
+matching.
 
 #### Exact V4/V5 possession-only comparison
 
@@ -119,8 +131,13 @@ generation. Do not replay an incomplete or hash-invalid generation.
   stop that worker rather than starting a duplicate.
 - **Input fingerprint/collision:** the Volume input is immutable; use the original
   bytes or a new job ID for a different video.
-- **Timeout:** V2 class invocations use a 1800-second timeout. Reduce frame range
+- **Timeout:** V2 class invocations use a 3600-second timeout. Reduce frame range
   or segment/window cost, or split tracking and stats with retryable stages.
+- **Nested possession manifest self-hash warning:** a downloaded
+  `possession_v3_manifest.json` can report a SHA-256 value for itself that does not
+  match the file's actual hash. Treat that as a validation warning, not as a
+  successful self-integrity check; the parent stats manifest remains the source
+  for the recorded hash of the nested file.
 
 ## Current pipeline
 
@@ -142,6 +159,15 @@ High-level flow:
 
 `stats/results.json`, `stats/tracks.jsonl`, `stats/teams.json`, `stats/shot_events.jsonl`, `stats/shot_evidence.jsonl`, `stats/possession_events.jsonl`, `stats/possession_transitions.jsonl`, and `stats/ball_tracks.jsonl` use the legacy contracts and are referenced in the V2 manifest with relative paths, sizes, and hashes. For jersey numbers, V2 samples its authoritative rows, invokes the configured basketball object detector on those frames only, associates its `number` boxes to V2 players, and sends only those number crops to OCR. It never calls legacy `run_pipeline` or legacy player tracking. Number votes are keyed by authoritative `stable_player_id`, while raw IDs remain provenance. The adapter carries through V2 raw/stable IDs, boxes, team IDs, confidence, state, and frame indices. For stats geometry, rows marked `bbox_coordinate_space: "normalized"` are converted to pixel `xyxy` using the probed video dimensions; pixel or unspecified legacy rows are preserved. Ball tracking remains an independent pass: the V2 Modal image enables TrackNet by default from the mounted `tracknet-data` Volume at `/tracknet-data/tracknet-finetune/runs/basketball-v1-20ep-r3/checkpoints/TrackNet_best.pt`; local callers can enable it with `TRACKNET_ENABLED=1` and `TRACKNET_CHECKPOINT`. If TrackNet is disabled, exact V2 frames receive lost ball evidence rather than fabricated data. Shot detection keeps its own model pass, then shot evidence, possession, and transitions join to the supplied V2 player rows.
 When `COURT_MODEL_ID` is configured and valid court keypoints are detected, the same V2 rows also produce optional `stats/projected_tracks.jsonl`, `stats/projected_shots.json`, and `stats/projected_shots.png`. `projected_tracks.jsonl` uses pixel foot points and legacy court-meter coordinates while retaining raw `track_id`, `stable_player_id`, and `team_id`; the shot artifacts are built from the existing shot-event and projected-shot helpers. Missing frames, detector failures, insufficient keypoints, and invalid homographies omit these pointers rather than fabricating geometry. The V2 manifest includes each emitted file as a relative path with size and SHA-256 hash.
+When a projected shot has a stable shooter identity but ball-control evidence cannot authoritatively confirm possession, `projected_shots.json` selects the shooter from the projected track and exposes its `stable_player_id`. `shot_evidence.jsonl` retains that deduced identity with `status: "inferred"`, `attribution_method: "projected_shot_track"`, and `authority: "non_authoritative"`. This is a shooter attribution, not confirmed possession: possession remains an independent artifact and may be `unknown` or `lost`. Do not interpret the shooter identity as proof that the player controlled the ball. A projected shot without a stable identity leaves shot evidence unknown; raw track IDs are provenance only.
+
+For a real Modal validation run, compare the same event across the artifacts rather
+than checking only that a shot exists. At minimum, compare `event_id`,
+`shooter_track_id`, and `shooter_stable_player_id` between `projected_shots.json`
+and the corresponding `shot_evidence.jsonl` row, then verify the shot-evidence
+fields (`status`, `attribution_method`, `authority`). Check possession separately
+in its possession artifact; an `unknown`/`lost` possession result is compatible
+with inferred shooter evidence and must not be upgraded to `confirmed`.
 
 The V2 Modal image sets `POSSESSION_ENGINE=v3`, so its existing stats adapter also writes the additive V3 artifacts. Run it with:
 
@@ -187,7 +213,7 @@ python scripts/tracking/debug_v2.py --job-id /v2-job-data/JOB_ID \
   --generation GENERATION --output replay.mp4
 ```
 
-The current timeout target remains 1800 seconds per invocation. Confirm GPU seconds and
+The current timeout target remains 3600 seconds per invocation. Confirm GPU seconds and
 Volume retention in Modal before enabling staged routing in a caller. To roll back, omit
 staged routing and use `process`; no staged artifacts are consumed.
 

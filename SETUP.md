@@ -69,6 +69,25 @@ modal run modal_app_v2.py --stats-only --job-id game-03
 `--job-id`, and `--tracking-only` also requires `--video-path`. The existing monolithic
 `process` method remains the default and rollback path when neither flag is supplied.
 
+For the full production-style staged V5 run:
+
+```bash
+modal run modal_app_v2.py \
+  --staged \
+  --job-id game027-modelv2-v5-test3 \
+  --video-path "dataset-tracknet/train/game_27/video/clip_027.mp4" \
+  --frame-start 0 \
+  --frame-end 654 \
+  --segmented \
+  --segment-window 150 \
+  --segment-overlap 20 \
+  --possession-engine v5
+```
+
+This runs the complete frame range through the durable staged V5 flow. `--segmented`
+uses bounded SAM3.1 windows; `--segment-window 150` sets each window size and
+`--segment-overlap 20` shares frames between adjacent windows for seam matching.
+
 Compare V4 and V5 possession only, reusing the same tracking and ball artifacts:
 
 ```bash
@@ -590,7 +609,8 @@ comment next to it. Summary:
 | `gpu` | `L4` | ~1/4 the price of an A100. Peak VRAM is a few hundred MB because SAM2 only ever sees one ~16-frame segment, so a bigger GPU buys nothing. |
 | `max_containers` | `2` | Hard ceiling on parallel GPUs. Stops a retry loop from spinning up ten of them. |
 | `scaledown_window` | `60`s | Idle containers are billed. Long enough to reuse a warm container between back-to-back jobs, short enough that forgetting about one costs cents. |
-| `timeout` | `1800`s | A hung job cannot bill forever. Raise when you start on full games. |
+| legacy `timeout` (`modal_app.py`) | `1800`s | A hung legacy job cannot bill forever. |
+| V2 `timeout` (`modal_app_v2.py`) | `3600`s | Allows full-game V2 invocations while retaining a finite billing limit. |
 | `sam2_model_id` | `hiera-small` | The image encoder runs on **every** frame, so this is the biggest single driver of GPU time. Switch to `hiera-large` for final demo runs only. |
 | `target_fps` | `15` | **Biggest lever.** SAM2's encoder runs on every processed frame, so cost tracks frames processed, not video length. 60fps source at 15fps is a 4x saving. |
 | `frame_stride` | `15` | Detector calls are metered by Roboflow. Note that **lowering this makes tracking worse**, not better — see below. |
