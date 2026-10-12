@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 from pipeline.court_projection import project_points
@@ -241,6 +242,8 @@ ACTION_COURT_MARGIN_M = 0.5
 ACTION_CLASS_IDS = {4, 5, 6, 7}
 ACTION_CLASS_NAMES = {"player_in_possession", "player_jump_shot", "player_layup_dunk", "player_shot_block"}
 BALL_CLASS_ID = 0
+# Shooting-pose frames further apart than this belong to different attempts (e.g. an earlier miss before a putback).
+ACTION_RELEASE_MAX_GAP_SECONDS = 0.25
 
 
 def _on_court(row: dict) -> bool:
@@ -277,17 +280,30 @@ def _raw_prediction_fps(raw_rows_by_frame: dict[int, dict]) -> float | None:
     return (timed[-1][0] - timed[0][0]) / (timed[-1][1] - timed[0][1])
 
 
-def _action_box_shooter_row(
+@dataclass(frozen=True)
+class ActionVote:
+    row: dict
+    best_frame: int
+    release_frame: int
+    release_row: dict
+    release_xyxy: list[float]
+    release_timestamp_seconds: float | None
+
+
+def _action_box_vote(
     event: dict,
     raw_rows_by_frame: dict[int, dict],
     projected_by_frame: dict[int, list[dict]],
-) -> tuple[dict | None, int | None]:
+) -> ActionVote | None:
     """Vote for the shooter among the detector's shooting-pose boxes before a made basket.
 
     A box votes for the projected player it overlaps most, but only when a ball detection sits at
     that box's hands or overhead in the same frame. That ball check is what separates the shooter
     from a teammate in the same pose with the ball far above his head. The winner needs a clear
     margin; otherwise the shooter is left unknown instead of guessed.
+
+    The release is the first frame of the winner's last run of qualifying frames, so a putback is
+    not anchored to an earlier miss.
     """
     from pipeline.shot_events import (
         prediction_confidence,
@@ -299,12 +315,13 @@ def _action_box_shooter_row(
     basket_frame = event.get("ball_in_basket_frame_index")
     fps = _raw_prediction_fps(raw_rows_by_frame)
     if basket_frame is None or fps is None:
-        return None, None
+        return None
     basket_frame = int(basket_frame)
     window_start = basket_frame - round(ACTION_WINDOW_SECONDS * fps)
 
     scores: dict[str, float] = {}
     best_box: dict[str, tuple[float, int, dict]] = {}
+    boxes_by_frame: dict[str, dict[int, tuple[float, tuple[float, float, float, float], dict]]] = {}
     for frame in range(window_start, basket_frame + 1):
         predictions = (raw_rows_by_frame.get(frame) or {}).get("predictions") or []
         balls = []
@@ -352,14 +369,32 @@ def _action_box_shooter_row(
             scores[stable_id] = scores.get(stable_id, 0.0) + confidence
             if stable_id not in best_box or confidence > best_box[stable_id][0]:
                 best_box[stable_id] = (confidence, frame, row)
+            frame_boxes = boxes_by_frame.setdefault(stable_id, {})
+            if frame not in frame_boxes or confidence > frame_boxes[frame][0]:
+                frame_boxes[frame] = (confidence, box, row)
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     if not ranked or ranked[0][1] < ACTION_MIN_VOTE_SCORE:
-        return None, None
+        return None
     if len(ranked) > 1 and ranked[0][1] < ACTION_MIN_WINNER_RATIO * ranked[1][1]:
-        return None, None
-    _, frame, row = best_box[ranked[0][0]]
-    return row, frame
+        return None
+    winner = ranked[0][0]
+    _, best_frame, row = best_box[winner]
+    max_gap = max(1, round(ACTION_RELEASE_MAX_GAP_SECONDS * fps))
+    frames = sorted(boxes_by_frame[winner])
+    release_frame = frames[0]
+    for previous, current in zip(frames, frames[1:]):
+        if current - previous > max_gap:
+            release_frame = current
+    _, release_box, release_row = boxes_by_frame[winner][release_frame]
+    return ActionVote(
+        row=row,
+        best_frame=best_frame,
+        release_frame=release_frame,
+        release_row=release_row,
+        release_xyxy=[float(value) for value in release_box],
+        release_timestamp_seconds=(raw_rows_by_frame.get(release_frame) or {}).get("timestamp_seconds"),
+    )
 
 
 def build_projected_shots(
@@ -393,6 +428,7 @@ def build_projected_shots(
         matched_frame_index = _nearest_projected_frame(available_frame_indexes, target_frame_index, max_frame_gap)
         snapshot_rows = []
         shooter_row = None
+        start_fields: dict = {"start_frame_source": "shot_detector"}
         attribution_method = "no_projected_frame_within_gap"
         if matched_frame_index is not None:
             frame_rows = projected_by_frame.get(matched_frame_index, [])
@@ -410,17 +446,10 @@ def build_projected_shots(
                 shot_anchor_image_xy,
             )
             if raw_rows_by_frame is not None and event.get("ball_in_basket_frame_index") is not None:
-                action_row, action_frame_index = _action_box_shooter_row(
-                    event, raw_rows_by_frame, projected_by_frame
-                )
-                if action_row is not None:
-                    shooter_row = action_row
+                vote = _action_box_vote(event, raw_rows_by_frame, projected_by_frame)
+                if vote is not None:
+                    shooter_row = vote.release_row
                     attribution_method = "action_box_vote"
-                elif shooter_row is not None:
-                    # The anchor rule would have guessed; an unclear vote leaves the shooter unknown instead.
-                    shooter_row = None
-                    attribution_method = "ambiguous"
-                if action_row is not None:
                     snapshot_rows = [
                         _snapshot_row(
                             row,
@@ -428,11 +457,26 @@ def build_projected_shots(
                             confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
                         )
                         for row in sorted(
-                            projected_by_frame.get(action_frame_index, []),
+                            projected_by_frame.get(vote.release_frame, []),
                             key=lambda row: (row.get("track_id") is None, row.get("track_id")),
                         )
                     ]
-                    matched_frame_index = action_frame_index
+                    matched_frame_index = vote.release_frame
+                    target_frame_index = vote.release_frame
+                    center = _bbox_center_xy(vote.release_xyxy)
+                    start_fields = {
+                        "start_frame_index": vote.release_frame,
+                        "start_timestamp_seconds": vote.release_timestamp_seconds,
+                        "start_shot_xyxy": vote.release_xyxy,
+                        "start_image_xy": None if center is None else [center[0], center[1]],
+                        "detector_start_frame_index": event["start_frame_index"],
+                        "detector_start_timestamp_seconds": event.get("start_timestamp_seconds"),
+                        "start_frame_source": "action_box_release",
+                    }
+                elif shooter_row is not None:
+                    # The anchor rule would have guessed; an unclear vote leaves the shooter unknown instead.
+                    shooter_row = None
+                    attribution_method = "ambiguous"
             shot_origin_court_xy_m = None
             shot_origin_projection_method = None
         else:
@@ -447,6 +491,7 @@ def build_projected_shots(
         shots.append(
             {
                 **event,
+                **start_fields,
                 "matched_projected_frame_index": matched_frame_index,
                 "matched_projected_frame_gap": None
                 if matched_frame_index is None
@@ -467,7 +512,7 @@ def build_projected_shots(
     return {
         "schema_version": 1,
         "heuristics": {
-            "event_anchor": "start_frame_index/start_image_xy from shot_events.jsonl",
+            "event_anchor": "made shots with a clear shooting-pose vote: first frame of the winner's last shooting-pose run; otherwise start_frame_index/start_image_xy from shot_events.jsonl",
             "frame_matching": "nearest projected frame by minimum temporal distance",
             "shot_origin_projection": "use the attributed shooter's projected foot/court point",
             "shooter_selection": "made shots with raw detector predictions: vote among shooting-pose boxes with the ball at their hands in the 2s before the basket, ambiguous when unclear; otherwise prefer containing bbox, then nearest bbox center and foot point",

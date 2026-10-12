@@ -126,6 +126,7 @@ POSSESSION_V3_MANIFEST_FILENAME = "possession_v3_manifest.json"
 PROJECTED_TRACKS_FILENAME = "projected_tracks.jsonl"
 PROJECTED_SHOTS_FILENAME = "projected_shots.json"
 PROJECTED_SHOTS_IMAGE_FILENAME = "projected_shots.png"
+RELEASE_START_FIELDS = ("start_frame_index", "start_timestamp_seconds", "start_image_xy", "start_shot_xyxy")
 
 
 def _build_detector_for_model(config: PipelineConfig, *, model_id: str | None = None):
@@ -1067,6 +1068,25 @@ def _attach_ball_evidence(
     tracks = _load_jsonl_rows(output_dir / TRACKS_FILENAME)
     if team_ids_by_track_id is None:
         team_ids_by_track_id = _load_team_ids_by_track_id(output_dir / TEAMS_FILENAME)
+    if projected_shots is None:
+        projected_shots_path = output_dir / PROJECTED_SHOTS_FILENAME
+        if projected_shots_path.exists():
+            projected_shots = json.loads(projected_shots_path.read_text(encoding="utf-8"))
+    projected_by_event_id = None
+    if projected_shots is not None:
+        projected_by_event_id = {
+            shot.get("event_id"): shot
+            for shot in projected_shots.get("shots", [])
+            if isinstance(shot, dict) and shot.get("event_id") is not None
+        }
+        # Evidence windows follow the corrected release frame; shot_events.jsonl itself stays as detected.
+        events = [
+            {**event, **{key: projected[key] for key in RELEASE_START_FIELDS}}
+            if (projected := projected_by_event_id.get(event.get("event_id")))
+            and projected.get("start_frame_source") == "action_box_release"
+            else event
+            for event in events
+        ]
     enriched = attach_shot_evidence(
         events,
         load_ball_track_rows(output_dir / BALL_TRACKS_FILENAME),
@@ -1074,16 +1094,7 @@ def _attach_ball_evidence(
         player_rows=tracks,
         team_ids_by_track_id=team_ids_by_track_id,
     )
-    if projected_shots is None:
-        projected_shots_path = output_dir / PROJECTED_SHOTS_FILENAME
-        if projected_shots_path.exists():
-            projected_shots = json.loads(projected_shots_path.read_text(encoding="utf-8"))
-    if projected_shots is not None:
-        projected_by_event_id = {
-            shot.get("event_id"): shot
-            for shot in projected_shots.get("shots", [])
-            if isinstance(shot, dict) and shot.get("event_id") is not None
-        }
+    if projected_by_event_id is not None:
         for event in enriched:
             identity = event.get("player_identity", {})
             projected = projected_by_event_id.get(event.get("event_id"))

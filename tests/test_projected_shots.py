@@ -383,3 +383,77 @@ def test_shot_without_a_basket_frame_keeps_the_anchor_rule_even_with_raw_predict
     shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
 
     assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"
+
+
+def _shooter_only_scene(frames: list[int]) -> tuple[list[dict], dict[int, list[dict]]]:
+    tracks = [_player(2, "player-shooter", [500, 280, 600, 460], [24.9, 8.3], frame) for frame in frames]
+    raw = {
+        frame: [_pred(7, "player-shot-block", [500, 280, 600, 460]), _ball_pred(550, 270)] for frame in frames
+    }
+    return tracks, raw
+
+
+def _basket_event(basket_frame: int) -> dict:
+    return {**_made_event(), "start_frame_index": basket_frame, "ball_in_basket_frame_index": basket_frame}
+
+
+def test_made_shot_start_moves_to_the_first_shooting_pose_frame():
+    tracks, raw = _vote_scene()
+    raw[10].append(_ball_pred(550, 270))  # the scene's frame 10 only has the ball at the teammate
+
+    shot = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["start_frame_index"] == 10
+    assert shot["start_timestamp_seconds"] == 10 / 60.0
+    assert shot["start_shot_xyxy"] == [500, 280, 600, 460]
+    assert shot["start_image_xy"] == [550, 370]
+    assert shot["detector_start_frame_index"] == 20
+    assert shot["detector_start_timestamp_seconds"] == 0.3
+    assert shot["matched_projected_frame_index"] == 10
+    assert shot["matched_projected_frame_gap"] == 0
+    assert shot["start_frame_source"] == "action_box_release"
+
+
+def test_release_is_the_start_of_the_last_run_so_a_putback_beats_an_earlier_miss():
+    tracks, raw = _shooter_only_scene([0, 2, 30, 32, 34])
+
+    shot = build_projected_shots([_basket_event(40)], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["start_frame_index"] == 30
+    assert shot["matched_projected_frame_index"] == 30
+
+
+def test_a_step_of_exactly_the_max_gap_does_not_split_the_run():
+    # 0.25s at 60fps is 15 frames.
+    tracks, raw = _shooter_only_scene([0, 15, 30])
+    shot = build_projected_shots([_basket_event(40)], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+    assert shot["start_frame_index"] == 0
+
+    tracks, raw = _shooter_only_scene([0, 15, 31])
+    shot = build_projected_shots([_basket_event(40)], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+    assert shot["start_frame_index"] == 31
+
+
+def test_start_is_unchanged_when_the_vote_is_ambiguous_or_cannot_run():
+    tracks, raw = _vote_scene()
+    close = {
+        frame: [
+            _pred(7, "player-shot-block", [500, 280, 600, 460]),
+            _pred(7, "player-shot-block", [200, 300, 300, 480]),
+            _ball_pred(550, 270),
+            _ball_pred(250, 320),
+        ]
+        for frame in raw
+    }
+    no_basket = {k: v for k, v in _made_event().items() if k != "ball_in_basket_frame_index"}
+    cases = [
+        build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(close))["shots"][0],
+        build_projected_shots([_made_event()], tracks)["shots"][0],
+        build_projected_shots([no_basket], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0],
+    ]
+
+    for shot in cases:
+        assert shot["start_frame_index"] == 20
+        assert shot["start_timestamp_seconds"] == 0.3
+        assert shot["start_image_xy"] == [20.0, 520.0]
+        assert shot["start_frame_source"] == "shot_detector"
