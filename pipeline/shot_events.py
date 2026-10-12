@@ -19,6 +19,11 @@ BALL_CLASS_NAMES = {"ball"}
 # be wrong, and confident mid-court shot boxes must survive that.
 SHOT_BALL_MAX_DISTANCE_BOX_HEIGHTS = 2.0
 SHOT_BOX_EDGE_TOLERANCE_PX = 1.0
+# A ball-in-basket box is a false positive when the detector sees the ball confidently far away
+# (a pass in a player's hands). A ball hidden in the net is often missed or low-confidence, so
+# only confident balls count.
+BASKET_CONTRADICTING_BALL_MIN_CONFIDENCE = 0.5
+BASKET_CONTRADICTING_BALL_MIN_DISTANCE_BASKET_WIDTHS = 10.0
 SAME_EVENT_WINDOW_SECONDS = 1.0
 OPENING_CONFIRMATION_WINDOW_SECONDS = 0.3
 POST_MADE_SUPPRESSION_SECONDS = 2.0
@@ -218,15 +223,19 @@ def _shot_prediction_is_truncated_and_far_from_ball(
     return nearest > max_distance
 
 
-def reject_shot_predictions_far_from_ball(predictions: list) -> list:
-    ball_centers = [
-        center
+def _ball_detections(predictions: list) -> list[tuple[tuple[float, float], float]]:
+    return [
+        (center, comparable_prediction_confidence(prediction))
         for prediction in predictions
         if isinstance(prediction, dict)
         and prediction_matches(prediction, class_id=BALL_CLASS_ID, class_names=BALL_CLASS_NAMES)
         for center in [prediction_center_xy(prediction)]
         if center is not None
     ]
+
+
+def reject_shot_predictions_far_from_ball(predictions: list) -> list:
+    ball_centers = [center for center, _ in _ball_detections(predictions)]
     return [
         prediction
         for prediction in predictions
@@ -241,9 +250,46 @@ def reject_shot_predictions_far_from_ball(predictions: list) -> list:
     ]
 
 
+def _basket_is_contradicted_by_confident_ball(
+    prediction: dict, confident_ball_centers: list[tuple[float, float]]
+) -> bool:
+    """True when a confident ball is detected this frame and every one is far from the basket box."""
+    if not confident_ball_centers:
+        return False
+    xyxy = prediction_xyxy(prediction)
+    center = prediction_center_xy(prediction)
+    if xyxy is None or center is None:
+        return False
+    min_distance = BASKET_CONTRADICTING_BALL_MIN_DISTANCE_BASKET_WIDTHS * max(xyxy[2] - xyxy[0], 1.0)
+    nearest = min(
+        ((center[0] - ball_x) ** 2 + (center[1] - ball_y) ** 2) ** 0.5 for ball_x, ball_y in confident_ball_centers
+    )
+    return nearest > min_distance
+
+
+def reject_ball_in_basket_predictions_contradicted_by_ball(predictions: list) -> list:
+    confident_ball_centers = [
+        center
+        for center, confidence in _ball_detections(predictions)
+        if confidence >= BASKET_CONTRADICTING_BALL_MIN_CONFIDENCE
+    ]
+    return [
+        prediction
+        for prediction in predictions
+        if not (
+            isinstance(prediction, dict)
+            and prediction_matches(
+                prediction, class_id=BALL_IN_BASKET_CLASS_ID, class_names=BALL_IN_BASKET_CLASS_NAMES
+            )
+            and _basket_is_contradicted_by_confident_ball(prediction, confident_ball_centers)
+        )
+    ]
+
+
 def shot_frame_signals(result: object) -> dict[str, object]:
     predictions = result.get("predictions", []) if isinstance(result, dict) else []
     predictions = reject_shot_predictions_far_from_ball(predictions)
+    predictions = reject_ball_in_basket_predictions_contradicted_by_ball(predictions)
     result = {"predictions": predictions}
     shot_type_signal, shot_prediction = best_shot_prediction(result)
     has_jump_shot = any(

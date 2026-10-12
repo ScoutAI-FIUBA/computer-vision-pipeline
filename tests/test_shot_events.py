@@ -1281,3 +1281,67 @@ def test_confident_mid_frame_shot_box_is_kept_even_when_the_detected_ball_is_far
     )
 
     assert signals["shot_type_signal"] == "jump_shot"
+
+
+def test_ball_in_basket_is_rejected_when_a_confident_ball_is_far_away():
+    # Regression: derrick frame 362 had a false basket at the rim while the ball was in a player's hands.
+    signals = shot_frame_signals(
+        {"predictions": [_box(1, 790.0, 146.0, 38, 40, 0.74), _box(0, 240.0, 371.0, 20, 20, 0.92)]}
+    )
+
+    assert signals["has_ball_in_basket"] is False
+
+
+def test_ball_in_basket_is_kept_when_a_confident_ball_is_within_five_basket_widths():
+    # Regression: queta2pts frame 443 had the real ball 172px from the basket.
+    signals = shot_frame_signals(
+        {"predictions": [_box(1, 638.0, 187.0, 49, 40, 0.6), _box(0, 752.0, 316.0, 20, 20, 0.82)]}
+    )
+
+    assert signals["has_ball_in_basket"] is True
+
+
+def test_ball_in_basket_is_kept_when_no_ball_is_detected():
+    # Regression: derrick frames 521-536 are a real make with the ball hidden in the net.
+    signals = shot_frame_signals({"predictions": [_box(1, 748.0, 172.0, 43, 40, 0.8)]})
+
+    assert signals["has_ball_in_basket"] is True
+
+
+def test_ball_in_basket_is_kept_when_the_only_far_ball_is_low_confidence():
+    # Regression: brown2pts frames 467-469 had only weak balls far from the basket.
+    signals = shot_frame_signals(
+        {"predictions": [_box(1, 670.0, 208.0, 42, 40, 0.8), _box(0, 789.0, 90.0, 20, 20, 0.46)]}
+    )
+
+    assert signals["has_ball_in_basket"] is True
+
+
+def test_false_ball_in_basket_leaves_the_shot_open_until_a_real_basket_arrives():
+    false_basket = {"predictions": [_box(1, 790.0, 146.0, 38, 40, 0.74), _box(0, 240.0, 371.0, 20, 20, 0.92)]}
+    real_basket = {"predictions": [_box(1, 748.0, 172.0, 43, 40, 0.8)]}
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        None, next_event_id=1, frame_index=350, timestamp_seconds=14.0, signals=shot_frame_signals(frame(5))
+    )
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=361,
+        timestamp_seconds=14.4,
+        signals=shot_frame_signals(false_basket),
+    )
+
+    assert resolved is None
+    assert candidate is not None
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=521,
+        timestamp_seconds=20.8,
+        signals=shot_frame_signals(real_basket),
+    )
+
+    assert resolved is not None
+    assert resolved["outcome"] == "made"
