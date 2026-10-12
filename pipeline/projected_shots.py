@@ -228,6 +228,84 @@ def _select_shooter_row(projected_rows: list[dict], shot_image_xy: tuple[float, 
     return best_row, "nearest_player_bbox_to_shot_anchor"
 
 
+RELEASE_MAX_LOOKBACK_FRAMES = 180
+RELEASE_RISE_JITTER_PX = 12.0
+RELEASE_BOX_PADDING_RATIO = 0.1
+RELEASE_COURT_MARGIN_M = 0.5
+
+
+def _ball_center_by_frame(ball_rows: list[dict] | None) -> dict[int, tuple[float, float]]:
+    centers: dict[int, tuple[float, float]] = {}
+    for row in ball_rows or []:
+        center = row.get("center_xy")
+        if row.get("track_state") != "detected" or row.get("frame_index") is None:
+            continue
+        if isinstance(center, (list, tuple)) and len(center) >= 2:
+            centers[int(row["frame_index"])] = (float(center[0]), float(center[1]))
+    return centers
+
+
+def _on_court(row: dict) -> bool:
+    court_xy = row.get("court_xy_m")
+    if not isinstance(court_xy, (list, tuple)) or len(court_xy) < 2:
+        return False
+    margin = RELEASE_COURT_MARGIN_M
+    return (
+        -margin <= float(court_xy[0]) <= COURT_LENGTH_M + margin
+        and -margin <= float(court_xy[1]) <= COURT_WIDTH_M + margin
+    )
+
+
+def _padded_contains(point_xy: tuple[float, float], xyxy: list[float] | None) -> bool:
+    if xyxy is None or len(xyxy) != 4:
+        return False
+    x1, y1, x2, y2 = [float(value) for value in xyxy]
+    pad = RELEASE_BOX_PADDING_RATIO * max(x2 - x1, y2 - y1)
+    return x1 - pad <= point_xy[0] <= x2 + pad and y1 - pad <= point_xy[1] <= y2 + pad
+
+
+def _release_shooter_row(
+    event: dict,
+    ball_centers: dict[int, tuple[float, float]],
+    projected_by_frame: dict[int, list[dict]],
+) -> tuple[dict | None, int | None]:
+    """Attribute a made shot to the last player holding the ball before it flew to the rim.
+
+    Walks back from ``ball_in_basket`` through the ball's continuous upward flight, then takes
+    the latest frame in it where the ball sits inside (or beside) a stable player's box.
+    """
+    basket_frame = event.get("ball_in_basket_frame_index")
+    if basket_frame is None or not ball_centers:
+        return None, None
+    basket_frame = int(basket_frame)
+    detected = sorted(
+        (frame for frame in ball_centers if basket_frame - RELEASE_MAX_LOOKBACK_FRAMES <= frame <= basket_frame),
+        reverse=True,
+    )
+    flight: list[int] = []
+    highest_y_so_far = None
+    for frame in detected:
+        y = ball_centers[frame][1]
+        if highest_y_so_far is not None and y < highest_y_so_far - RELEASE_RISE_JITTER_PX:
+            break
+        flight.append(frame)
+        highest_y_so_far = y if highest_y_so_far is None else max(highest_y_so_far, y)
+
+    for frame in flight:
+        rows = [
+            row
+            for row in projected_by_frame.get(frame, [])
+            if isinstance(row.get("stable_player_id"), str)
+            and row["stable_player_id"].strip()
+            and _on_court(row)
+            and _padded_contains(ball_centers[frame], row.get("xyxy"))
+        ]
+        if rows:
+            row, _ = _select_shooter_row(rows, ball_centers[frame])
+            return row, frame
+    return None, None
+
+
 def build_projected_shots(
     shot_events: list[dict],
     projected_tracks: list[dict],
@@ -235,6 +313,7 @@ def build_projected_shots(
     max_frame_gap: int = 6,
     team_ids_by_track_id: dict[int, int] | None = None,
     confirmed_numbers_by_track_id: dict[int, str] | None = None,
+    ball_rows: list[dict] | None = None,
 ) -> dict:
     """Build shot projections; track-keyed team/number fields are compatibility enrichment.
 
@@ -246,6 +325,7 @@ def build_projected_shots(
     confirmed_numbers_by_track_id = confirmed_numbers_by_track_id or {}
     projected_by_frame = _group_projected_tracks_by_frame(projected_tracks)
     available_frame_indexes = sorted(projected_by_frame)
+    ball_centers = _ball_center_by_frame(ball_rows)
 
     shots: list[dict] = []
     for event in shot_events:
@@ -269,6 +349,22 @@ def build_projected_shots(
                 frame_rows,
                 shot_anchor_image_xy,
             )
+            release_row, release_frame_index = _release_shooter_row(event, ball_centers, projected_by_frame)
+            if release_row is not None:
+                shooter_row = release_row
+                attribution_method = "ball_release_before_basket"
+                snapshot_rows = [
+                    _snapshot_row(
+                        row,
+                        team_ids_by_track_id=team_ids_by_track_id,
+                        confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+                    )
+                    for row in sorted(
+                        projected_by_frame.get(release_frame_index, []),
+                        key=lambda row: (row.get("track_id") is None, row.get("track_id")),
+                    )
+                ]
+                matched_frame_index = release_frame_index
             shot_origin_court_xy_m = None
             shot_origin_projection_method = None
         else:
@@ -306,7 +402,7 @@ def build_projected_shots(
             "event_anchor": "start_frame_index/start_image_xy from shot_events.jsonl",
             "frame_matching": "nearest projected frame by minimum temporal distance",
             "shot_origin_projection": "use the attributed shooter's projected foot/court point",
-            "shooter_selection": "prefer containing bbox, then nearest bbox center and foot point",
+            "shooter_selection": "made shots: last player holding the ball before its upward flight to the rim; otherwise prefer containing bbox, then nearest bbox center and foot point",
             "team_number_enrichment": "compatibility-only lookup keyed by raw track_id; stable_player_id remains canonical",
         },
         "shots": shots,

@@ -246,3 +246,81 @@ def test_write_projected_shots_image_writes_png_with_plotted_marks(tmp_path: Pat
     assert output_path.exists()
     assert image is not None
     assert image.shape[:2] == (300, 560)
+
+
+def _player(track_id: int, stable_id: str, xyxy: list[float], court_xy: list[float], frame_index: int) -> dict:
+    return {
+        "frame_index": frame_index,
+        "track_id": track_id,
+        "stable_player_id": stable_id,
+        "class_name": "player",
+        "track_state": "tracked",
+        "xyxy": xyxy,
+        "image_foot_xy": [(xyxy[0] + xyxy[2]) / 2.0, xyxy[3]],
+        "court_xy_m": court_xy,
+    }
+
+
+def _ball(frame_index: int, x: float, y: float) -> dict:
+    return {"frame_index": frame_index, "track_state": "detected", "center_xy": [x, y]}
+
+
+def _made_event() -> dict:
+    return {
+        "event_id": 1,
+        "shot_type": "jump_shot",
+        "outcome": "made",
+        "start_frame_index": 20,
+        "start_timestamp_seconds": 0.3,
+        "start_image_xy": [20.0, 520.0],  # an edge false positive near the cut-off player
+        "ball_in_basket_frame_index": 20,
+    }
+
+
+def _release_scene() -> tuple[list[dict], list[dict]]:
+    tracks = []
+    for frame_index in (10, 12, 14, 16, 18, 20):
+        tracks += [
+            _player(1, "player-edge", [0, 430, 45, 620], [18.7, 11.1], frame_index),
+            _player(2, "player-shooter", [500, 280, 600, 460], [24.9, 8.3], frame_index),
+            # Spectator behind the basket whose box overlaps the ball when it reaches the rim.
+            _player(3, "player-crowd", [540, 100, 640, 260], [26.0, -2.7], frame_index),
+        ]
+    ball = [
+        _ball(10, 640, 420),  # outside every box
+        _ball(12, 560, 300),  # in the shooter's hands
+        _ball(14, 570, 240),  # above the shooter, rising
+        _ball(16, 580, 200),
+        _ball(18, 590, 170),  # inside the crowd box at the rim
+        _ball(20, 600, 150),
+    ]
+    return tracks, ball
+
+
+def test_made_shot_is_attributed_to_the_player_who_released_the_ball():
+    tracks, ball = _release_scene()
+
+    shot = build_projected_shots([_made_event()], tracks, ball_rows=ball)["shots"][0]
+
+    assert shot["shooter_stable_player_id"] == "player-shooter"
+    assert shot["shooter_attribution_method"] == "ball_release_before_basket"
+    assert shot["shot_origin_court_xy_m"] == [24.9, 8.3]
+    assert shot["matched_projected_frame_index"] == 12
+
+
+def test_made_shot_falls_back_to_the_anchor_without_ball_rows():
+    tracks, _ = _release_scene()
+
+    shot = build_projected_shots([_made_event()], tracks)["shots"][0]
+
+    assert shot["shooter_stable_player_id"] == "player-edge"
+    assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"
+
+
+def test_release_attribution_ignores_events_without_a_basket_frame():
+    tracks, ball = _release_scene()
+    event = {k: v for k, v in _made_event().items() if k != "ball_in_basket_frame_index"}
+
+    shot = build_projected_shots([event], tracks, ball_rows=ball)["shots"][0]
+
+    assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"

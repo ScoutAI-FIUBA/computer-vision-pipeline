@@ -1244,3 +1244,40 @@ def test_run_pipeline_handles_projected_artifacts_based_on_homography_availabili
         assert "projected_tracks_file" not in results_payload
         assert "projected_shots_file" not in results_payload
         assert "projected_shots_image_file" not in results_payload
+
+
+def _box(class_id: int, x: float, y: float, width: float, height: float, confidence: float = 0.6) -> dict:
+    return {"class_id": class_id, "x": x, "y": y, "width": width, "height": height, "confidence": confidence}
+
+
+def test_edge_truncated_shot_box_far_from_the_ball_is_not_a_shot_signal():
+    # Regression: queta2pts frames 420-423 produced a left-edge jump-shot box while the ball sat at the rim.
+    signals = shot_frame_signals(
+        {"predictions": [_box(5, 22.5, 523.5, 45, 197), _box(0, 661.5, 160.0, 23, 22)]}
+    )
+
+    assert signals["shot_type_signal"] is None
+    assert signals["has_jump_shot"] is False
+
+
+def test_edge_truncated_shot_box_near_the_ball_is_kept():
+    signals = shot_frame_signals(
+        {"predictions": [_box(5, 22.5, 523.5, 45, 197), _box(0, 60.0, 500.0, 23, 22)]}
+    )
+
+    assert signals["shot_type_signal"] == "jump_shot"
+
+
+def test_edge_truncated_shot_box_is_kept_when_no_ball_is_detected():
+    signals = shot_frame_signals({"predictions": [_box(5, 22.5, 523.5, 45, 197)]})
+
+    assert signals["shot_type_signal"] == "jump_shot"
+
+
+def test_confident_mid_frame_shot_box_is_kept_even_when_the_detected_ball_is_far():
+    # Regression: queta2pts shot 3 had a "ball" 500px away; a bad ball must not erase real shots.
+    signals = shot_frame_signals(
+        {"predictions": [_box(5, 304.0, 428.0, 70, 151, 0.8), _box(0, 810.0, 390.0, 23, 22)]}
+    )
+
+    assert signals["shot_type_signal"] == "jump_shot"

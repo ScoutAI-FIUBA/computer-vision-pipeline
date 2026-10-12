@@ -8,10 +8,17 @@ from dataclasses import dataclass
 BALL_IN_BASKET_CLASS_ID = 1
 JUMP_SHOT_CLASS_ID = 5
 LAYUP_DUNK_CLASS_ID = 6
+BALL_CLASS_ID = 0
 
 BALL_IN_BASKET_CLASS_NAMES = {"ball_in_basket"}
 JUMP_SHOT_CLASS_NAMES = {"jump_shot"}
 LAYUP_DUNK_CLASS_NAMES = {"layup_dunk"}
+BALL_CLASS_NAMES = {"ball"}
+# A shot box is a false positive when it is cut off by the image edge and the detector sees
+# the ball only far away from it. Distance alone is not enough: the detector's ball can itself
+# be wrong, and confident mid-court shot boxes must survive that.
+SHOT_BALL_MAX_DISTANCE_BOX_HEIGHTS = 2.0
+SHOT_BOX_EDGE_TOLERANCE_PX = 1.0
 SAME_EVENT_WINDOW_SECONDS = 1.0
 OPENING_CONFIRMATION_WINDOW_SECONDS = 0.3
 POST_MADE_SUPPRESSION_SECONDS = 2.0
@@ -188,8 +195,56 @@ def best_shot_prediction(result: object) -> tuple[str | None, dict | None]:
     return None, None
 
 
+def _shot_prediction_is_truncated_and_far_from_ball(
+    prediction: dict, ball_centers: list[tuple[float, float]]
+) -> bool:
+    """True for an edge-truncated shot box when every ball detected this frame is far from it.
+
+    A frame with no ball detection never rejects a shot, so occluded balls cost no recall. The
+    right edge cannot be checked because the frame width is not part of the detector result.
+    """
+    if not ball_centers:
+        return False
+    xyxy = prediction_xyxy(prediction)
+    center = prediction_center_xy(prediction)
+    if xyxy is None or center is None:
+        return False
+    if xyxy[0] > SHOT_BOX_EDGE_TOLERANCE_PX and xyxy[1] > SHOT_BOX_EDGE_TOLERANCE_PX:
+        return False
+    max_distance = SHOT_BALL_MAX_DISTANCE_BOX_HEIGHTS * max(xyxy[3] - xyxy[1], 1.0)
+    nearest = min(
+        ((center[0] - ball_x) ** 2 + (center[1] - ball_y) ** 2) ** 0.5 for ball_x, ball_y in ball_centers
+    )
+    return nearest > max_distance
+
+
+def reject_shot_predictions_far_from_ball(predictions: list) -> list:
+    ball_centers = [
+        center
+        for prediction in predictions
+        if isinstance(prediction, dict)
+        and prediction_matches(prediction, class_id=BALL_CLASS_ID, class_names=BALL_CLASS_NAMES)
+        for center in [prediction_center_xy(prediction)]
+        if center is not None
+    ]
+    return [
+        prediction
+        for prediction in predictions
+        if not (
+            isinstance(prediction, dict)
+            and (
+                prediction_matches(prediction, class_id=JUMP_SHOT_CLASS_ID, class_names=JUMP_SHOT_CLASS_NAMES)
+                or prediction_matches(prediction, class_id=LAYUP_DUNK_CLASS_ID, class_names=LAYUP_DUNK_CLASS_NAMES)
+            )
+            and _shot_prediction_is_truncated_and_far_from_ball(prediction, ball_centers)
+        )
+    ]
+
+
 def shot_frame_signals(result: object) -> dict[str, object]:
     predictions = result.get("predictions", []) if isinstance(result, dict) else []
+    predictions = reject_shot_predictions_far_from_ball(predictions)
+    result = {"predictions": predictions}
     shot_type_signal, shot_prediction = best_shot_prediction(result)
     has_jump_shot = any(
         prediction_matches(prediction, class_id=JUMP_SHOT_CLASS_ID, class_names=JUMP_SHOT_CLASS_NAMES)
