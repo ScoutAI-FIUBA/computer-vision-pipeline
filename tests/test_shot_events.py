@@ -326,8 +326,17 @@ def test_shot_becomes_missed_after_five_seconds_without_ball_in_basket():
     candidate, resolved, next_event_id = update_shot_event_candidate(
         candidate,
         next_event_id=next_event_id,
+        frame_index=100 + 1,
+        timestamp_seconds=4.5,
+        signals=shot_frame_signals(frame(6)),
+    )
+    assert resolved is None
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
         frame_index=225,
-        timestamp_seconds=9.0,
+        timestamp_seconds=9.5,
         signals=shot_frame_signals(frame()),
     )
 
@@ -356,6 +365,15 @@ def test_new_shot_outside_same_event_window_after_reset_misses_previous_and_star
         candidate,
         next_event_id=next_event_id,
         frame_index=101,
+        timestamp_seconds=4.05,
+        signals=shot_frame_signals(frame(5)),
+    )
+    assert resolved is None
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=102,
         timestamp_seconds=4.1,
         signals=shot_frame_signals(frame()),
     )
@@ -365,7 +383,7 @@ def test_new_shot_outside_same_event_window_after_reset_misses_previous_and_star
         candidate,
         next_event_id=next_event_id,
         frame_index=130,
-        timestamp_seconds=5.0,
+        timestamp_seconds=5.1,
         signals=shot_frame_signals(frame(5)),
     )
     assert resolved is not None
@@ -521,6 +539,85 @@ def test_open_shot_flushes_as_unknown_at_end_of_clip():
     assert final_event is not None
     assert final_event["outcome"] == "unknown"
     assert final_event["resolution_reason"] == "end_of_clip"
+
+
+def _run_shot_frames(steps: list[tuple[int, float, tuple[int, ...]]]) -> tuple[object, list[dict], int]:
+    candidate = None
+    next_event_id = 1
+    events = []
+    for frame_index, timestamp_seconds, class_ids in steps:
+        candidate, resolved, next_event_id = update_shot_event_candidate(
+            candidate,
+            next_event_id=next_event_id,
+            frame_index=frame_index,
+            timestamp_seconds=timestamp_seconds,
+            signals=shot_frame_signals(frame(*class_ids)),
+        )
+        if resolved is not None:
+            events.append(resolved)
+    return candidate, events, next_event_id
+
+
+def test_single_frame_shot_followed_by_new_shot_start_emits_no_missed_event():
+    candidate, events, next_event_id = _run_shot_frames(
+        [(100, 4.0, (5,)), (101, 4.1, ()), (130, 5.2, (5,))]
+    )
+
+    assert events == []
+    assert candidate is not None
+    assert candidate.start_frame_index == 130
+    assert next_event_id == 3
+
+    candidate, resolved, _ = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=140,
+        timestamp_seconds=5.6,
+        signals=shot_frame_signals(frame(1)),
+    )
+    assert resolved is not None
+    assert resolved["outcome"] == "made"
+    assert resolved["event_id"] == 2
+
+
+def test_multi_frame_shot_followed_by_new_shot_start_still_emits_missed_event():
+    _, events, _ = _run_shot_frames(
+        [(100, 4.0, (5,)), (101, 4.05, (5,)), (102, 4.1, ()), (130, 5.2, (5,))]
+    )
+
+    assert len(events) == 1
+    assert events[0]["outcome"] == "missed"
+    assert events[0]["resolution_reason"] == "new_shot_started"
+
+
+def test_single_frame_shot_timeout_emits_nothing_but_multi_frame_timeout_is_missed():
+    candidate, events, _ = _run_shot_frames([(100, 4.0, (5,)), (225, 9.0, ())])
+    assert candidate is None
+    assert events == []
+
+    candidate, events, _ = _run_shot_frames([(100, 4.0, (5,)), (101, 4.5, (5,)), (225, 9.5, ())])
+    assert candidate is None
+    assert len(events) == 1
+    assert events[0]["outcome"] == "missed"
+    assert events[0]["resolution_reason"] == "shot_timeout"
+
+
+def test_single_frame_shot_with_ball_in_basket_is_still_made():
+    _, events, _ = _run_shot_frames([(100, 4.0, (5,)), (130, 5.2, (1,))])
+
+    assert len(events) == 1
+    assert events[0]["outcome"] == "made"
+
+
+def test_single_frame_candidate_still_flushes_as_unknown_at_end_of_clip():
+    candidate, events, _ = _run_shot_frames([(100, 4.0, (5,))])
+    assert events == []
+
+    final_event = flush_open_shot_event(candidate, frame_index=100, timestamp_seconds=4.0)
+
+    assert final_event is not None
+    assert final_event["outcome"] == "unknown"
+    assert final_event["start_frame_index"] == final_event["end_frame_index"] == 100
 
 
 def test_shot_signal_trace_record_reports_active_and_resolved_states():

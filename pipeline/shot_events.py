@@ -377,6 +377,13 @@ def finalize_shot_event(
     }
 
 
+def drop_single_frame_miss(event: dict) -> dict | None:
+    # A single shot box is detector noise (e.g. a pass read as a shot); a real attempt spans several frames.
+    if event["end_frame_index"] == event["start_frame_index"]:
+        return None
+    return event
+
+
 def elapsed_seconds(start: float | None, end: float | None) -> float | None:
     if start is None or end is None:
         return None
@@ -504,12 +511,14 @@ def update_shot_event_candidate(
             candidate.shot_signal_active = True
             return candidate, None, next_event_id
         if shot_gap_seconds is not None and shot_gap_seconds >= SAME_EVENT_WINDOW_SECONDS:
-            resolved = finalize_shot_event(
-                candidate,
-                outcome="missed",
-                resolved_frame_index=frame_index,
-                resolved_timestamp_seconds=timestamp_seconds,
-                resolution_reason="new_shot_started",
+            resolved = drop_single_frame_miss(
+                finalize_shot_event(
+                    candidate,
+                    outcome="missed",
+                    resolved_frame_index=frame_index,
+                    resolved_timestamp_seconds=timestamp_seconds,
+                    resolution_reason="new_shot_started",
+                )
             )
             replacement = ShotEventCandidate(
                 event_id=next_event_id,
@@ -539,12 +548,14 @@ def update_shot_event_candidate(
     if inactive_gap_seconds is not None and inactive_gap_seconds >= MISSED_SHOT_TIMEOUT_SECONDS:
         return (
             None,
-            finalize_shot_event(
-                candidate,
-                outcome="missed",
-                resolved_frame_index=frame_index,
-                resolved_timestamp_seconds=timestamp_seconds,
-                resolution_reason="shot_timeout",
+            drop_single_frame_miss(
+                finalize_shot_event(
+                    candidate,
+                    outcome="missed",
+                    resolved_frame_index=frame_index,
+                    resolved_timestamp_seconds=timestamp_seconds,
+                    resolution_reason="shot_timeout",
+                )
             ),
             next_event_id,
         )
