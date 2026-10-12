@@ -12,6 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pipeline.projected_shots import build_projected_shots, write_projected_shots_image  # noqa: E402
 
 
+def test_projected_shot_artifacts_are_removed_without_projected_rows(tmp_path: Path):
+    from pipeline.runner import _maybe_write_projected_shots
+
+    for projected_tracks in (None, ""):
+        if projected_tracks is not None:
+            (tmp_path / "projected_tracks.jsonl").write_text(projected_tracks, encoding="utf-8")
+        for filename in ("projected_shots.json", "projected_shots.png"):
+            (tmp_path / filename).write_text("stale", encoding="utf-8")
+
+        assert _maybe_write_projected_shots(tmp_path) == (None, None)
+        assert not (tmp_path / "projected_shots.json").exists()
+        assert not (tmp_path / "projected_shots.png").exists()
+        (tmp_path / "projected_tracks.jsonl").unlink(missing_ok=True)
+
+
 def test_build_projected_shots_matches_shot_anchor_to_projected_player_bbox():
     artifact = build_projected_shots(
         [

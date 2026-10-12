@@ -5,6 +5,7 @@ import json
 import pytest
 
 from pipeline.ball_contract import attach_shot_evidence, validate_ball_track_rows
+from pipeline.possession import resolve_possession_events
 
 
 def row(frame, state="detected", track_id=1):
@@ -277,3 +278,86 @@ def test_runner_evidence_join_reads_final_track_and_team_artifacts(tmp_path):
 
     evidence = json.loads((tmp_path / "shot_evidence.jsonl").read_text())
     assert evidence["player_identity"]["team_id"] == 2
+
+
+def test_runner_evidence_uses_projected_shooter_when_ball_control_is_not_authoritative(tmp_path):
+    from pipeline.runner import _attach_ball_evidence
+
+    event = {"event_id": 1, "start_frame_index": 1, "end_frame_index": 1, "start_image_xy": [15, 15]}
+    (tmp_path / "shot_events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    (tmp_path / "ball_tracks.jsonl").write_text(json.dumps(row(1, "lost")) + "\n", encoding="utf-8")
+    (tmp_path / "tracks.jsonl").write_text(json.dumps(player_row(1, stable_player_id="player-008")) + "\n", encoding="utf-8")
+    (tmp_path / "projected_shots.json").write_text(json.dumps({"shots": [
+        {"event_id": 1, "shooter_track_id": 8, "shooter_stable_player_id": "player-008", "shooter_team_id": 2},
+    ]}), encoding="utf-8")
+
+    _attach_ball_evidence(tmp_path, expected_frame_indices=[1])
+
+    evidence = json.loads((tmp_path / "shot_evidence.jsonl").read_text())
+    assert evidence["ball_evidence"]["status"] == "lost"
+    assert evidence["player_identity"] == {
+        "status": "inferred",
+        "track_id": 8,
+        "stable_player_id": "player-008",
+        "team_id": 2,
+        "attribution_method": "projected_shot_track",
+        "authority": "non_authoritative",
+    }
+
+    possession = resolve_possession_events(
+        [player_row(1, stable_player_id="player-008")], [row(1, "lost")]
+    )
+    assert possession[0]["status"] == "lost"
+    assert possession[0]["stable_player_id"] is None
+
+
+def test_runner_projected_shots_selector_identity_reaches_final_shot_evidence(tmp_path):
+    from pipeline.runner import _attach_ball_evidence, _maybe_write_projected_shots
+
+    event = {
+        "event_id": 3,
+        "start_frame_index": 100,
+        "end_frame_index": 100,
+        "start_image_xy": [50.0, 80.0],
+    }
+    (tmp_path / "shot_events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    (tmp_path / "ball_tracks.jsonl").write_text(json.dumps(row(100, "lost")) + "\n", encoding="utf-8")
+    (tmp_path / "tracks.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "projected_tracks.jsonl").write_text("".join(json.dumps(projected_row) + "\n" for projected_row in [
+        {"frame_index": 100, "track_id": 8, "xyxy": [0, 0, 20, 20], "image_foot_xy": [0, 0], "court_xy_m": [0, 0]},
+        {"frame_index": 100, "track_id": 23, "stable_player_id": "player-023", "xyxy": [42, 18, 68, 92], "image_foot_xy": [55, 92], "court_xy_m": [5.5, 9.2]},
+    ]), encoding="utf-8")
+
+    projected_file, _ = _maybe_write_projected_shots(tmp_path)
+    assert projected_file == "projected_shots.json"
+    projected = json.loads((tmp_path / projected_file).read_text(encoding="utf-8"))
+    assert projected["shots"][0]["shooter_stable_player_id"] == "player-023"
+
+    _attach_ball_evidence(tmp_path, expected_frame_indices=[100])
+
+    evidence = json.loads((tmp_path / "shot_evidence.jsonl").read_text())
+    assert evidence["player_identity"]["stable_player_id"] == "player-023"
+    assert evidence["player_identity"]["track_id"] == 23
+    assert evidence["ball_evidence"]["status"] == "lost"
+    assert resolve_possession_events(
+        [player_row(100, 23, stable_player_id="player-023")], [row(100, "lost")]
+    )[0]["stable_player_id"] is None
+
+
+def test_runner_projected_shooter_fallback_keeps_unknown_without_stable_identity(tmp_path):
+    from pipeline.runner import _attach_ball_evidence
+
+    event = {"event_id": 2, "start_frame_index": 1, "end_frame_index": 1, "start_image_xy": [15, 15]}
+    (tmp_path / "shot_events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    (tmp_path / "ball_tracks.jsonl").write_text(json.dumps(row(1, "lost")) + "\n", encoding="utf-8")
+    (tmp_path / "tracks.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "projected_shots.json").write_text(json.dumps({"shots": [
+        {"event_id": 2, "shooter_track_id": 8, "shooter_stable_player_id": None},
+    ]}), encoding="utf-8")
+
+    _attach_ball_evidence(tmp_path, expected_frame_indices=[1])
+
+    evidence = json.loads((tmp_path / "shot_evidence.jsonl").read_text())
+    assert evidence["player_identity"] == {
+        "status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None,
+    }
