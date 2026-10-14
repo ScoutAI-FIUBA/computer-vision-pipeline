@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -346,7 +347,7 @@ def test_pose_box_with_the_ball_far_above_the_box_does_not_vote():
 
     assert shot["shooter_stable_player_id"] is None
     assert shot["shooter_attribution_method"] == "ambiguous"
-    assert shot["shot_origin_court_xy_m"] is None
+    assert shot["shot_origin_projection_method"] == "shot_anchor_homography_from_projected_players"
 
 
 def test_close_vote_is_ambiguous_instead_of_a_guess():
@@ -457,3 +458,47 @@ def test_start_is_unchanged_when_the_vote_is_ambiguous_or_cannot_run():
         assert shot["start_timestamp_seconds"] == 0.3
         assert shot["start_image_xy"] == [20.0, 520.0]
         assert shot["start_frame_source"] == "shot_detector"
+
+
+def _close_vote_raw(frames) -> dict[int, list[dict]]:
+    return {
+        frame: [
+            _pred(7, "player-shot-block", [500, 280, 600, 460]),
+            _pred(7, "player-shot-block", [200, 300, 300, 480]),
+            _ball_pred(550, 270),
+            _ball_pred(250, 320),
+        ]
+        for frame in frames
+    }
+
+
+def _affine_tracks(tracks: list[dict]) -> list[dict]:
+    # court = foot / 20 makes the image->court homography well defined for any four players.
+    return [{**row, "court_xy_m": [row["image_foot_xy"][0] / 20.0, row["image_foot_xy"][1] / 20.0]} for row in tracks]
+
+
+def test_ambiguous_made_shot_keeps_an_origin_projected_from_the_detector_box_foot():
+    tracks, raw = _vote_scene()
+    event = {**_made_event(), "start_shot_xyxy": [300.0, 300.0, 400.0, 500.0]}
+
+    shot = build_projected_shots(
+        [event], _affine_tracks(tracks), raw_prediction_rows=_raw_rows(_close_vote_raw(raw))
+    )["shots"][0]
+
+    assert shot["shooter_stable_player_id"] is None
+    assert shot["shooter_attribution_method"] == "ambiguous"
+    assert shot["start_frame_source"] == "shot_detector"
+    assert shot["shot_origin_court_xy_m"] == pytest.approx([17.5, 25.0], abs=1e-3)
+    assert shot["shot_origin_projection_method"] == "shot_anchor_homography_from_projected_players"
+
+
+def test_ambiguous_made_shot_without_four_projected_players_has_no_origin():
+    tracks, raw = _vote_scene()
+    tracks = _affine_tracks([row for row in tracks if row["track_id"] in (2, 3)])
+    event = {**_made_event(), "start_shot_xyxy": [300.0, 300.0, 400.0, 500.0]}
+
+    shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(_close_vote_raw(raw)))["shots"][0]
+
+    assert shot["shooter_attribution_method"] == "ambiguous"
+    assert shot["shot_origin_court_xy_m"] is None
+    assert shot["shot_origin_projection_method"] is None

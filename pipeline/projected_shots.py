@@ -479,6 +479,18 @@ def build_projected_shots(
                     attribution_method = "ambiguous"
             shot_origin_court_xy_m = None
             shot_origin_projection_method = None
+            if attribution_method == "ambiguous":
+                # The backend drops shots without an origin; keep an approximate one so the make stays on the chart as unattributed.
+                shot_box = event.get("start_shot_xyxy")
+                foot_anchor = (
+                    ((float(shot_box[0]) + float(shot_box[2])) / 2.0, float(shot_box[3]))
+                    if isinstance(shot_box, (list, tuple)) and len(shot_box) == 4
+                    else shot_anchor_image_xy
+                )
+                origin_xy, origin_method = _project_shot_anchor_court_xy(frame_rows, foot_anchor)
+                if origin_xy is not None:
+                    shot_origin_court_xy_m = origin_xy
+                    shot_origin_projection_method = origin_method
         else:
             shot_origin_court_xy_m = None
             shot_origin_projection_method = None
@@ -514,7 +526,7 @@ def build_projected_shots(
         "heuristics": {
             "event_anchor": "made shots with a clear shooting-pose vote: first frame of the winner's last shooting-pose run; otherwise start_frame_index/start_image_xy from shot_events.jsonl",
             "frame_matching": "nearest projected frame by minimum temporal distance",
-            "shot_origin_projection": "use the attributed shooter's projected foot/court point",
+            "shot_origin_projection": "use the attributed shooter's projected foot/court point; ambiguous made shots project the detector shot box foot point through a homography from projected players when at least 4 are available",
             "shooter_selection": "made shots with raw detector predictions: vote among shooting-pose boxes with the ball at their hands in the 2s before the basket, ambiguous when unclear; otherwise prefer containing bbox, then nearest bbox center and foot point",
             "team_number_enrichment": "compatibility-only lookup keyed by raw track_id; stable_player_id remains canonical",
         },
