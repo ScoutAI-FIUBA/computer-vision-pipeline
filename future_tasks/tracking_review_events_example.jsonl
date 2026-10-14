@@ -1,3 +1,7 @@
 {"clip":"crossing_clip_01","frame_index":120,"event":"id_switch","track_id":7,"notes":"blue guard swaps with wing after overlap"}
 {"clip":"crossing_clip_01","frame_index":188,"event":"full_loss","track_id":12,"notes":"player disappears behind screener and returns with new ID"}
 {"clip":"crossing_clip_01","frame_index":214,"event":"successful_recovery","track_id":5,"notes":"same player returns with original ID"}
+{"clip":"crossing_clip_01","frame_index":121,"event":"id_switch","track_id":9,"stable_player_id":"player-008","notes":"human-confirmed: stable_player_id is canonical, track_id is only provenance"}
+{"clip":"occlusion_clip_02","frame_index":64,"event":"successful_recovery","track_id":3,"stable_player_id":"player-003","notes":"partial occlusion behind screener, same stable id afterwards"}
+{"clip":"occlusion_clip_02","frame_index":150,"event":"full_loss","track_id":4,"notes":"stable identity could not be established"}
+{"record_type":"clip_review","clip":"occlusion_clip_02","declared_scenario":"partial_occlusion","scenario_present":"pending","id_switch":"pending","full_loss":"pending","recovery":"pending","stable_identity_involved":"pending","stable_player_id":null,"notes":""}
