@@ -1,81 +1,66 @@
 # v2-job-data retention policy (draft, issue #6)
 
-Status: DRAFT. Every number below is **proposed, owner to confirm**. Only a read-only
-report exists today; nothing deletes data.
+Status: DRAFT. Every number below is **proposed, owner to confirm**.
 
-## Volume layout (from `modal_app_v2.py`, `pipeline/results.py`)
+Principle: keep what is useful, delete what is objectively useless. When in doubt a path
+is PROTECTED. `job.json` has no owner field, so deletion decisions belong to whoever
+created the job.
 
-Per job in `v2-job-data`: `job.json`, `.job.lock`, `inputs/<sha256>.mp4` (immutable),
-and per stage `tracking|stats|possession`: `current.json` plus
-`generations/<id>/manifest.json` and artifacts. Leftovers from interrupted writes:
-`<stage>/.stage-*`, `<stage>/.current.json.tmp`, `.job.json.<uuid>.tmp`, `inputs/.*.tmp`.
-A lease is `job.json["lease"] = {"owner", "expires_at"}` (TTL 1800 s, `JOB_LEASE_SECONDS`).
+## Scope
 
-## Proposed defaults (owner to confirm)
+Only the `v2-job-data` Modal Volume (`<job>/job.json`, `.job.lock`, `inputs/<sha>.mp4`,
+`{tracking,stats,possession}/{current.json,generations/<id>}`).
 
-| Item | Proposed | Notes |
+NEVER in scope and never touched: `tracknet-data` (fine-tuning data and checkpoints; the live
+pipeline reads its ball model from there), `scoutai-model-cache`, R2 source videos, and any
+fine-tuning data, checkpoints, weights or datasets. Code enforces this: any path with a
+component matching `tracknet`, `finetune`, `fine-tune`, `fine_tune`, `checkpoint`, `dataset`,
+`weights`, `model-cache`, `model_cache`, `runs`, `*.pt`, `*.pth`, `*.ckpt`, `*.onnx` is
+PROTECTED (`protected_data_class`), and the tools refuse a `--root` or volume with such a name.
+
+## Classes (`scripts/ops/v2_retention_report.py`, read-only)
+
+| Class | What | Proposed default |
 |---|---|---|
-| Generations kept per job/stage | 2 (current counts as one) | `--keep-generations` |
-| Failed / abandoned in-progress jobs | 7 days since `job.json` change | `--max-age-days` |
-| Unreferenced raw inputs | 30 days | `--input-max-age-days` |
-| Orphan tmp/staging entries | 24 h minimum age | `--orphan-min-age-hours` |
-| Debug environment | shorter: 3 days jobs, 1 generation, 7 days inputs | production uses the rows above |
+| ELIGIBLE (1) | orphan temp files: `.stage-*`, `.*.tmp`, `.current.json.tmp` | older than 7 days (`--orphan-min-age-days`) |
+| ELIGIBLE (2) | generations/orphans of a failed or never-completed job, no live lease | job older than 30 days (`--failed-job-min-age-days`) |
+| ELIGIBLE (3) | superseded generations: non-current, not referenced by a retained generation | beyond newest 2 (current counts) and older than 30 days (`--keep-generations`, `--generation-min-age-days`) |
+| REVIEW | mask-only compaction of complete jobs older than 90 days | NOT implemented, open owner decision |
+| PROTECTED | everything else | always |
 
-Completed, healthy jobs are not expired by age in this draft; only their surplus
-generations are. Whether finished jobs should ever expire is open.
+Complete jobs with a current pointer are PROTECTED at any age. In a failed job, current
+pointer targets, `job.json`, `.job.lock` and inputs stay PROTECTED (inputs are never
+deleted), so only a small skeleton remains. REVIEW exists but no tool acts on it: dropping
+masks would break hash validation, replay and stats re-runs.
 
-## Protected (never candidates)
+## Applying (`scripts/ops/v2_retention_apply.py`, the only deleting code)
 
-- the target of every stage `current.json` and the `tracking_generation`, `stats_generation`
-  and `possession_generations` values in `job.json`;
-- the newest N generations per stage;
-- any tracking generation referenced (`tracking_generation`) by a retained stats/possession manifest;
-- every input named by `job.json` or a retained generation's `input_fingerprint`;
-- whole jobs with `lease.owner` set and `lease.expires_at` in the future;
-- jobs in `created|tracking|stats|possession` state younger than the failed-job age;
-- files the report cannot classify (`other`), and tmp/staging entries younger than 24 h.
+Locked to the volume `v2-job-data`; `--only JOB[,JOB]` is mandatory; dry-run by default.
+Only ELIGIBLE generations and orphans matching an exact path allowlist can be removed, and
+each one is re-validated against the live volume first (skipped if it became current,
+referenced, leased, or its failed job resumed).
 
-## Eligible
+1. Download a snapshot of the volume (or of the jobs concerned) to a local directory.
+2. Run the planner on it with `--json` and save the plan; it contains a plan hash.
+3. Review the plan with the creator of each job; pick explicit job ids, no wildcards.
+4. Run the apply tool with `--plan`, `--only` and no `--apply`: a dry run printing what would go.
+5. Repeat with `--apply --yes --plan-hash <hash from the plan>`.
+6. Keep the JSONL log it writes (paths, bytes, files, failures) with the issue.
 
-Non-current generations beyond keep-N (and not referenced), generations without a complete
-manifest, unreferenced old inputs, aged tmp/staging orphans, and every non-`other` item
-of a failed or abandoned job older than the max age (unless it holds an active lease).
+Who may run it: the creator of the jobs listed in `--only`, or someone they ask. Nobody
+runs it for other people's jobs without their agreement.
 
-## What the report does
+## What it cannot know
 
-`python -m scripts.ops.v2_retention_report --root <tree> [--json] [--now EPOCH|ISO]`
-lists every job and generation with bytes, file count, PROTECTED/ELIGIBLE and a reason,
-plus totals. Output is deterministic for a given tree and `--now`. Each file belongs to
-exactly one item, so totals add up. It contains no delete, move or write code path; a test
-checks the tree is byte-identical (content and mtime) after a run. Files inside a
-generation that its manifest does not list are noted as `unlisted_files` only.
+- Not race safe: the plan comes from a snapshot; the re-validation narrows but cannot close the window.
+- No ownership data in `job.json`, and age comes from file times (a fresh download resets them;
+  prefer snapshot metadata).
+- Orphan age is not re-checked on the live volume.
+- The Modal adapter is untested against the real volume.
 
-## What it does not do
+## Open questions for the owner
 
-No deletion, no Modal access, no Volume locking (it reads a snapshot and can race a live
-writer: run it on a copy, or treat a plan as stale once leases change), no metrics emission.
-Live storage growth for issue #5 is not measured yet.
-
-## How a future deletion step must work
-
-- Input is an explicit list of job/generation/input identifiers taken from a saved plan,
-  never a path glob or "everything eligible".
-- Dry-run is the default; deletion needs an explicit flag.
-- Re-verify each target immediately before removal under the job lock (`.job.lock`):
-  lease still expired, pointer/job.json still not naming it, no retained manifest referencing it.
-- Remove a generation as a whole directory; never edit retained manifests.
-- Idempotent: a missing target is a no-op, not a failure; reruns produce no further change.
-- Log every decision and failure (job, stage, id, files, bytes, reason) and a summary of
-  deleted bytes/files/generations; failures do not stop the other targets.
-- Recovery: deletion is permanent. Modal Volumes have no per-file undo, so recovery means
-  re-running the pipeline from the retained input, which is why inputs outlive generations.
-  Owner to decide whether to snapshot/copy before the first destructive run.
-
-## Open for the owner
-
-- Confirm or change every default above, including debug versus production values.
-- Does a retained input matter after its generations are gone (reproducibility versus cost)?
-- Should completed jobs ever expire, and should a failed job with a valid earlier current
-  generation lose it after 7 days?
-- Where cleanup runs (scheduled Modal function or manual) and how metrics are surfaced.
-- How to snapshot safely given concurrent writers.
+- Add an `owner` (and `created_at`) field to `job.json`?
+- Snapshot cadence for planning?
+- Should inputs of failed jobs ever be removed, and mask-only compaction at 90 days?
+- Confirm the numbers above (7 / 30 / 2 / 30 days).

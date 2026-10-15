@@ -119,6 +119,14 @@ python scripts/tracking/debug_v2.py \
 Direct runs use `--output-dir`; staged runs are read from the downloaded job
 generation. Do not replay an incomplete or hash-invalid generation.
 
+#### Retention report and apply tool
+
+`scripts/ops/v2_retention_report.py --root <downloaded volume copy>` is read-only: it
+classifies jobs and generations as PROTECTED, REVIEW or ELIGIBLE and prints a plan hash.
+`scripts/ops/v2_retention_apply.py` is the only deleting tool (dry-run by default, needs
+`--only JOB`, `--apply --yes` and the plan hash). Policy:
+[docs/v2-retention-policy.md](docs/v2-retention-policy.md).
+
 ### Limits and troubleshooting
 
 - Crossings/occlusions can still switch IDs; ReID, Team ID, OCR, shots, and

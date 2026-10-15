@@ -13,11 +13,17 @@ Layout it understands (verified against ``modal_app_v2.py`` and ``pipeline/resul
     <job>/<stage>/.stage-*  <job>/<stage>/.current.json.tmp  <job>/**/.*.tmp
 
 Every file under a job belongs to exactly one reported item, so totals add up.
-Default thresholds are proposals for the owner, not decided policy.
+Default thresholds are proposals for the owner, not decided policy. The tool is
+deliberately conservative: keep what is useful, only objectively useless data is
+ELIGIBLE (for ``v2_retention_apply.py``, which is the only deleting code and is separate).
+REVIEW is reserved for mask-only compaction of old complete jobs: an open owner
+decision that is NOT implemented, so nothing is REVIEW today.
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import hashlib
 import json
 import os
 import sys
@@ -26,18 +32,56 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-REPORT_SCHEMA = "v2-retention-report-1"
+REPORT_SCHEMA = "v2-retention-report-2"
 STAGES = ("tracking", "stats", "possession")
 IN_PROGRESS_STATES = {"created", *STAGES}
-PROTECTED, ELIGIBLE = "PROTECTED", "ELIGIBLE"
+PROTECTED, REVIEW, ELIGIBLE = "PROTECTED", "REVIEW", "ELIGIBLE"
+PROTECTED_REASON = "protected_data_class"
+OWNERSHIP_NOTICE = ("job.json has no owner field: deletion decisions belong to whoever created the job; "
+                    "this planner never deletes anything (the separate apply tool needs --only JOB, "
+                    "--apply --yes and the plan hash).")
+
+# Anything whose name matches (any path component, case-insensitive) is fine-tuning,
+# model or dataset data and can never be ELIGIBLE or REVIEW.
+PROTECTED_NAME_SUBSTRINGS = ("tracknet", "finetune", "fine-tune", "fine_tune", "checkpoint", "dataset",
+                             "weights", "model-cache", "model_cache")
+PROTECTED_NAME_PATTERNS = ("*.pt", "*.pth", "*.ckpt", "*.onnx", "runs")
 
 # Proposed defaults, owner to confirm.
 DEFAULTS = {
     "keep_generations": 2,
-    "max_age_days": 7.0,
-    "input_max_age_days": 30.0,
-    "orphan_min_age_hours": 24.0,
+    "orphan_min_age_days": 7.0,
+    "generation_min_age_days": 30.0,
+    "failed_job_min_age_days": 30.0,
 }
+
+
+class GuardedRootError(ValueError):
+    """Raised when --root is (or is named like) protected fine-tuning/model data."""
+
+
+def is_protected_name(name: str) -> bool:
+    lowered = name.lower()
+    return (any(sub in lowered for sub in PROTECTED_NAME_SUBSTRINGS)
+            or any(fnmatch.fnmatchcase(lowered, pat) for pat in PROTECTED_NAME_PATTERNS))
+
+
+def _tree_has_protected_name(path: Path) -> bool:
+    """True if any entry inside ``path`` (not following symlinks) has a protected name."""
+    if not path.is_dir() or path.is_symlink():
+        return False
+    for _dirpath, dirs, files in os.walk(path):
+        if any(is_protected_name(n) for n in (*dirs, *files)):
+            return True
+    return False
+
+
+def check_root(root: Path) -> None:
+    names = {Path(root).name, Path(os.path.abspath(root)).name, Path(os.path.realpath(root)).name}
+    for name in names:
+        if is_protected_name(name):
+            raise GuardedRootError(f"refusing --root {root}: name {name!r} matches the protected-data guard "
+                                   "(fine-tuning/model/dataset data is never in scope; only v2-job-data is)")
 
 
 def _walk_stats(path: Path) -> tuple[int, int, float]:
@@ -81,17 +125,19 @@ class _Job:
         job_json = path / "job.json"
         mtime = job_json.stat().st_mtime if job_json.is_file() else path.stat().st_mtime
         self.age_days = max(0.0, (now - mtime) / 86400)
-        self.old = self.age_days > policy["max_age_days"]
-        self.in_progress = self.state in IN_PROGRESS_STATES and not self.old
-        self.expired = not self.lease_active and self.old and (
-            self.state == "failed" or self.state in IN_PROGRESS_STATES)
+        self.has_pointer = any((_read_json(path / st / "current.json") or {}).get("generation") for st in STAGES)
+        # Failed or never-completed (no current pointer, not complete), no live lease, old enough.
+        self.stale = not self.lease_active and self.age_days > policy["failed_job_min_age_days"] and (
+            self.state == "failed" or (self.state != "complete" and not self.has_pointer))
+        self.in_progress = self.state in IN_PROGRESS_STATES and not self.stale
 
     def add(self, kind: str, stage: str | None, ident: str, path: Path, status: str, reason: str) -> dict[str, Any]:
         size, count, newest = _walk_stats(path)
+        rel = Path(self.job_id) / path.relative_to(self.path)
+        guarded = any(is_protected_name(part) for part in rel.parts) or _tree_has_protected_name(path)
         item = {"kind": kind, "job": self.job_id, "stage": stage, "id": ident,
-                "path": str(Path(self.job_id) / path.relative_to(self.path)),
-                "bytes": size, "files": count, "status": status, "reason": reason,
-                "_mtime": newest}
+                "path": str(rel), "bytes": size, "files": count, "status": status, "reason": reason,
+                "_mtime": newest, "_guard": guarded, "_pinned": False}
         self.items.append(item)
         return item
 
@@ -111,71 +157,67 @@ class _Job:
 
     def classify(self) -> None:
         job = self.path
-        referenced_inputs: set[str] = set()
-        if self.manifest.get("input_fingerprint"):
-            referenced_inputs.add(str(self.manifest["input_fingerprint"]))
         retained_tracking_refs: dict[str, str] = {}
         gens: dict[str, list[dict[str, Any]]] = {}
+        keep = int(self.policy["keep_generations"])
+        min_age = self.policy["generation_min_age_days"]
 
-        # Pass 1: generations, per stage, current/keep-N.
+        # Pass 1: generations, per stage. Only old, non-current, beyond-keep ones are REVIEW.
         for stage in STAGES:
             root = job / stage / "generations"
             if not root.is_dir():
                 continue
             pointers = self.pointer_targets(stage)
-            entries = []
+            valid_entries, invalid_entries = [], []
             for gen_dir in sorted(p for p in root.iterdir() if p.is_dir() and not p.is_symlink()):
                 manifest = _read_json(gen_dir / "manifest.json")
-                size, count, _ = _walk_stats(gen_dir)
-                mtime = (gen_dir / "manifest.json").stat().st_mtime if manifest else gen_dir.stat().st_mtime
-                entries.append((gen_dir, manifest, mtime))
-            entries.sort(key=lambda e: (-e[2], e[0].name))
-            for rank, (gen_dir, manifest, _mtime) in enumerate(entries):
-                name = gen_dir.name
-                valid = bool(manifest and manifest.get("complete") is True)
-                if name in pointers:
-                    status, reason = PROTECTED, "current pointer / job.json target"
-                elif not valid:
-                    status, reason = ELIGIBLE, "orphan: generation without a complete manifest"
-                elif rank < self.policy["keep_generations"]:
-                    status, reason = PROTECTED, f"within newest {int(self.policy['keep_generations'])} generations"
+                if manifest and manifest.get("complete") is True:
+                    mtime = (gen_dir / "manifest.json").stat().st_mtime
+                    valid_entries.append((gen_dir, manifest, mtime))
                 else:
-                    status, reason = ELIGIBLE, f"non-current, beyond keep-generations (rank {rank + 1})"
+                    invalid_entries.append((gen_dir, None, gen_dir.stat().st_mtime))
+            valid_entries.sort(key=lambda e: (-e[2], e[0].name))
+            for rank, (gen_dir, manifest, mtime) in enumerate(valid_entries):
+                name = gen_dir.name
+                age_days = (self.now - mtime) / 86400
+                pinned = name in pointers
+                if pinned:
+                    status, reason = PROTECTED, "current pointer / job.json target"
+                elif rank < keep:
+                    status, reason = PROTECTED, f"within newest {keep} generations"
+                elif age_days <= min_age:
+                    status, reason = PROTECTED, f"non-current but younger than {min_age:g} days"
+                else:
+                    status, reason = ELIGIBLE, (f"superseded: non-current, beyond keep-generations "
+                                                f"(rank {rank + 1}), older than {min_age:g} days")
                 item = self.add("generation", stage, name, gen_dir, status, reason)
-                item["_manifest"] = manifest if valid else None
+                item["_manifest"] = manifest
+                item["_pinned"] = pinned
                 gens.setdefault(stage, []).append(item)
-                if status == PROTECTED and valid:
-                    if manifest.get("input_fingerprint"):
-                        referenced_inputs.add(str(manifest["input_fingerprint"]))
-                    if manifest.get("tracking_generation") and stage != "tracking":
-                        retained_tracking_refs[str(manifest["tracking_generation"])] = f"{stage}/{name}"
-                if valid:
-                    self._unlisted_files(gen_dir, manifest, stage, name, status)
+                if status == PROTECTED and manifest.get("tracking_generation") and stage != "tracking":
+                    retained_tracking_refs[str(manifest["tracking_generation"])] = f"{stage}/{name}"
+                self._unlisted_files(gen_dir, manifest, stage, name, status)
+            for gen_dir, _manifest, _mtime in invalid_entries:
+                item = self.add("generation", stage, gen_dir.name, gen_dir, PROTECTED,
+                                "generation without a complete manifest (maybe in flight); not a candidate")
+                item["_manifest"] = None
+                gens.setdefault(stage, []).append(item)
 
-        # Pass 2: tracking generations referenced by retained downstream manifests.
+        # Pass 2: generations referenced by retained downstream manifests stay protected.
         for item in gens.get("tracking", []):
             ref = retained_tracking_refs.get(item["id"])
             if ref and item["status"] == ELIGIBLE:
                 item["status"], item["reason"] = PROTECTED, f"referenced by retained {ref} (tracking_generation)"
-                if item["_manifest"].get("input_fingerprint"):
-                    referenced_inputs.add(str(item["_manifest"]["input_fingerprint"]))
+                item["_pinned"] = True
 
-        # Inputs.
+        # Inputs are never candidates by themselves.
         inputs = job / "inputs"
         if inputs.is_dir():
             for path in sorted(inputs.iterdir()):
                 if _is_orphan_name(path.name):
                     self._orphan(path, "input")
-                    continue
-                fingerprint = f"sha256:{path.stem}"
-                age_days = (self.now - path.lstat().st_mtime) / 86400
-                if fingerprint in referenced_inputs:
-                    self.add("input", None, path.name, path, PROTECTED, "referenced by job.json or a retained generation")
-                elif age_days > self.policy["input_max_age_days"]:
-                    self.add("input", None, path.name, path, ELIGIBLE,
-                             f"unreferenced input older than {self.policy['input_max_age_days']:g} days")
                 else:
-                    self.add("input", None, path.name, path, PROTECTED, "unreferenced but younger than raw-input retention")
+                    self.add("input", None, path.name, path, PROTECTED, "inputs are never candidates by themselves")
 
         # Orphans and metadata in job and stage dirs; everything else is unclassified.
         for path in sorted(job.iterdir()):
@@ -221,12 +263,14 @@ class _Job:
                 item["unlisted_files"] = {"files": len(extra), "bytes": sum(sizes)}
 
     def _orphan(self, path: Path, stage: str | None) -> None:
-        age_h = (self.now - _walk_stats(path)[2]) / 3600
-        if age_h < self.policy["orphan_min_age_hours"]:
+        age_days = (self.now - _walk_stats(path)[2]) / 86400
+        min_age = self.policy["orphan_min_age_days"]
+        if age_days <= min_age:
             self.add("orphan", stage, path.name, path, PROTECTED,
-                     f"temporary/staging entry younger than {self.policy['orphan_min_age_hours']:g}h (maybe in flight)")
+                     f"temporary/staging entry not older than {min_age:g} days (maybe in flight)")
         else:
-            self.add("orphan", stage, path.name, path, ELIGIBLE, "orphan temporary/staging entry")
+            self.add("orphan", stage, path.name, path, ELIGIBLE,
+                     f"orphan temporary/staging entry older than {min_age:g} days")
 
     def _apply_job_level(self) -> None:
         if self.lease_active:
@@ -235,12 +279,18 @@ class _Job:
         elif self.in_progress:
             for item in self.items:
                 item["status"], item["reason"] = PROTECTED, f"in-progress stage (state={self.state!r}, lease expired)"
-        elif self.expired:
+        elif self.stale:
             for item in self.items:
-                if item["kind"] != "other" and item["status"] == PROTECTED:
+                # Whole failed/never-completed job: generations and orphans only. Inputs, job.json,
+                # pointers and anything a current pointer still needs stay PROTECTED.
+                if item["kind"] in ("generation", "orphan") and item["status"] == PROTECTED and not item["_pinned"]:
                     item["status"] = ELIGIBLE
-                    item["reason"] = (f"job {self.state!r} and older than "
-                                      f"{self.policy['max_age_days']:g} days (was: {item['reason']})")
+                    item["reason"] = (f"job {self.state!r}, no live lease, no current pointer needing it, older than "
+                                      f"{self.policy['failed_job_min_age_days']:g} days (was: {item['reason']})")
+        # Hard guard last: protected data classes can never be ELIGIBLE or REVIEW.
+        for item in self.items:
+            if item["_guard"]:
+                item["status"], item["reason"] = PROTECTED, PROTECTED_REASON
 
 
 def _num(value: Any) -> float:
@@ -257,31 +307,53 @@ def _sum(items: list[dict[str, Any]]) -> dict[str, int]:
 def build_report(root: Path, *, now: float | None = None, **overrides: float) -> dict[str, Any]:
     """Build the retention plan. Pure inspection; never modifies ``root``."""
     root = Path(root)
+    check_root(root)
     policy = {**DEFAULTS, **{k: v for k, v in overrides.items() if v is not None}}
     now = time.time() if now is None else now
-    jobs, skipped, all_items = [], [], []
+    jobs, skipped, all_items, protected_paths = [], [], [], []
     for path in sorted(root.iterdir()):
-        if path.is_dir() and not path.is_symlink() and (path / "job.json").is_file():
+        if is_protected_name(path.name):
+            size, count, _ = _walk_stats(path)
+            protected_paths.append({"path": path.name, "bytes": size, "files": count, "reason": PROTECTED_REASON})
+            skipped.append(path.name)
+        elif path.is_dir() and not path.is_symlink() and (path / "job.json").is_file():
             job = _Job(path, path.name, now, policy)
             job.classify()
             items = sorted(job.items, key=lambda i: (i["stage"] or "", i["kind"], i["id"]))
             for item in items:
                 item.pop("_mtime", None)
                 item.pop("_manifest", None)
+                item.pop("_pinned", None)
+                if item.pop("_guard"):
+                    protected_paths.append({"path": item["path"], "bytes": item["bytes"], "files": item["files"],
+                                            "reason": PROTECTED_REASON})
             all_items += items
             jobs.append({"job_id": job.job_id, "state": job.state, "lease_active": job.lease_active,
-                         "age_days": round(job.age_days, 3), "bytes": sum(i["bytes"] for i in items),
+                         "age_days": round(job.age_days, 3), "stale_candidate": job.stale, "bytes": sum(i["bytes"] for i in items),
                          "files": sum(i["files"] for i in items),
-                         "protected": _sum([i for i in items if i["status"] == PROTECTED]),
-                         "eligible": _sum([i for i in items if i["status"] == ELIGIBLE]),
+                         **{c.lower(): _sum([i for i in items if i["status"] == c])
+                            for c in (PROTECTED, REVIEW, ELIGIBLE)},
                          "items": items})
         else:
             skipped.append(path.name)
-    return {"schema": REPORT_SCHEMA, "root": str(root), "now": now, "dry_run": True, "policy": policy,
-            "jobs": jobs, "skipped": skipped,
-            "totals": {"all": _sum(all_items),
-                       "protected": _sum([i for i in all_items if i["status"] == PROTECTED]),
-                       "eligible": _sum([i for i in all_items if i["status"] == ELIGIBLE])}}
+    report = {"schema": REPORT_SCHEMA, "root": str(root), "now": now, "dry_run": True, "policy": policy,
+              "defaults": dict(DEFAULTS), "ownership_notice": OWNERSHIP_NOTICE,
+              "jobs": jobs, "skipped": skipped, "protected_paths": protected_paths,
+              "totals": {"all": _sum(all_items),
+                         **{c.lower(): _sum([i for i in all_items if i["status"] == c])
+                            for c in (PROTECTED, REVIEW, ELIGIBLE)}}}
+    report["plan_hash"] = compute_plan_hash(report)
+    return report
+
+
+def compute_plan_hash(report: dict[str, Any]) -> str:
+    """sha256 over the ELIGIBLE selection (what an apply tool may act on), the policy and the schema."""
+    eligible = sorted([i["path"], i["kind"], i["bytes"], i["files"]]
+                      for j in report["jobs"] for i in j["items"] if i["status"] == ELIGIBLE)
+    stale = sorted(j["job_id"] for j in report["jobs"] if j.get("stale_candidate"))
+    blob = json.dumps({"schema": report["schema"], "policy": report["policy"], "eligible": eligible,
+                       "stale_jobs": stale}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def _fmt_bytes(n: int) -> str:
@@ -295,7 +367,11 @@ def _fmt_bytes(n: int) -> str:
 
 def format_table(report: dict[str, Any]) -> str:
     lines = [f"v2 retention report (READ-ONLY, nothing is deleted)  root={report['root']}",
-             "policy (proposed, owner to confirm): " + ", ".join(f"{k}={v:g}" for k, v in report["policy"].items())]
+             "active policy (defaults are proposed, owner to confirm): "
+             + ", ".join(f"{k}={v:g}" for k, v in report["policy"].items()),
+             "plan hash: " + report["plan_hash"],
+             "defaults: " + ", ".join(f"{k}={v:g}" for k, v in report["defaults"].items()),
+             "NOTE: " + report["ownership_notice"]]
     for job in report["jobs"]:
         lines += ["", f"job {job['job_id']}  state={job['state']}  lease_active={job['lease_active']}  "
                       f"age={job['age_days']:.1f}d  {_fmt_bytes(job['bytes'])}  {job['files']} files"]
@@ -306,9 +382,12 @@ def format_table(report: dict[str, Any]) -> str:
                          f"{ident}: {i['reason']}")
     t = report["totals"]
     lines += ["", "totals:"]
-    for key in ("all", "protected", "eligible"):
+    for key in ("all", "protected", "review", "eligible"):
         lines.append(f"  {key:<10}{t[key]['items']:>6} items{t[key]['files']:>9} files{t[key]['bytes']:>14} bytes "
                      f"({_fmt_bytes(t[key]['bytes'])})")
+    if report["protected_paths"]:
+        lines.append("protected data-class paths (never candidates):")
+        lines += [f"  {p['path']}  ({p['files']} files, {p['bytes']} bytes)" for p in report["protected_paths"]]
     if report["skipped"]:
         lines.append("skipped (no job.json): " + ", ".join(report["skipped"]))
     return "\n".join(lines)
@@ -327,19 +406,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     parser.add_argument("--now", type=_parse_now, default=None, help="epoch seconds or ISO time (default: current time)")
     parser.add_argument("--keep-generations", type=int, default=None, dest="keep_generations",
-                        help=f"generations kept per job/stage (proposed {DEFAULTS['keep_generations']})")
-    parser.add_argument("--max-age-days", type=float, default=None, dest="max_age_days",
-                        help=f"failed/expired job age (proposed {DEFAULTS['max_age_days']:g})")
-    parser.add_argument("--input-max-age-days", type=float, default=None, dest="input_max_age_days",
-                        help=f"unreferenced raw input age (proposed {DEFAULTS['input_max_age_days']:g})")
-    parser.add_argument("--orphan-min-age-hours", type=float, default=None, dest="orphan_min_age_hours",
-                        help=f"minimum age before tmp/staging entries are eligible (proposed {DEFAULTS['orphan_min_age_hours']:g})")
+                        help=f"newest generations kept per job/stage, current included (default {DEFAULTS['keep_generations']})")
+    parser.add_argument("--orphan-min-age-days", type=float, default=None, dest="orphan_min_age_days",
+                        help=f"age before tmp/staging entries are ELIGIBLE (default {DEFAULTS['orphan_min_age_days']:g})")
+    parser.add_argument("--generation-min-age-days", type=float, default=None, dest="generation_min_age_days",
+                        help=f"age before surplus generations are REVIEW (default {DEFAULTS['generation_min_age_days']:g})")
+    parser.add_argument("--failed-job-min-age-days", type=float, default=None, dest="failed_job_min_age_days",
+                        help=f"age before failed/stale jobs are REVIEW (default {DEFAULTS['failed_job_min_age_days']:g})")
     args = parser.parse_args(argv)
     if not args.root.is_dir():
         parser.error(f"--root is not a directory: {args.root}")
+    try:
+        check_root(args.root)
+    except GuardedRootError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     report = build_report(args.root, now=args.now, keep_generations=args.keep_generations,
-                          max_age_days=args.max_age_days, input_max_age_days=args.input_max_age_days,
-                          orphan_min_age_hours=args.orphan_min_age_hours)
+                          orphan_min_age_days=args.orphan_min_age_days,
+                          generation_min_age_days=args.generation_min_age_days,
+                          failed_job_min_age_days=args.failed_job_min_age_days)
     print(json.dumps(report, indent=2, sort_keys=True) if args.json else format_table(report))
     return 0
 
