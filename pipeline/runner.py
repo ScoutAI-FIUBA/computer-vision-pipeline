@@ -1061,7 +1061,7 @@ def _write_shot_events(
 
 
 def _refine_shot_outcomes(output_dir: Path, config: PipelineConfig) -> None:
-    if not getattr(config, "shot_rim_trajectory_outcome", False):
+    if not getattr(config, "shot_rim_trajectory_outcome", True):
         return
     refine_shot_events_file(
         output_dir / SHOT_EVENTS_FILENAME,

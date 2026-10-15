@@ -307,21 +307,21 @@ def write_stats_dir(output_dir: Path) -> None:
     write_jsonl(output_dir / runner.BALL_TRACKS_FILENAME, balls(MADE_PATH))
 
 
-def test_flag_defaults_off_and_reads_the_environment(monkeypatch):
+def test_flag_defaults_on_and_reads_the_environment(monkeypatch):
     monkeypatch.setenv("ROBOFLOW_API_KEY", "dummy")
     monkeypatch.delenv("SHOT_RIM_TRAJECTORY_OUTCOME", raising=False)
-    assert PipelineConfig(roboflow_api_key="dummy").shot_rim_trajectory_outcome is False
-    assert PipelineConfig.from_env().shot_rim_trajectory_outcome is False
-
-    monkeypatch.setenv("SHOT_RIM_TRAJECTORY_OUTCOME", "1")
+    assert PipelineConfig(roboflow_api_key="dummy").shot_rim_trajectory_outcome is True
     assert PipelineConfig.from_env().shot_rim_trajectory_outcome is True
+
+    monkeypatch.setenv("SHOT_RIM_TRAJECTORY_OUTCOME", "0")
+    assert PipelineConfig.from_env().shot_rim_trajectory_outcome is False
 
 
 def test_flag_off_leaves_the_written_files_byte_identical(tmp_path):
     write_stats_dir(tmp_path)
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
 
-    runner._refine_shot_outcomes(tmp_path, PipelineConfig(roboflow_api_key="dummy"))
+    runner._refine_shot_outcomes(tmp_path, PipelineConfig(roboflow_api_key="dummy", shot_rim_trajectory_outcome=False))
 
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
 

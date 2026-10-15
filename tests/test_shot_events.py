@@ -987,6 +987,10 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
             "start_image_xy": None,
             "start_shot_xyxy": None,
             "resolution_reason": "ball_in_basket",
+            # Added by the rim-trajectory refinement, which runs by default.
+            "outcome_source": "ball_in_basket",
+            "rim_pass_frame_index": None,
+            "rim_exit_frame_index": None,
         }
     ]
     shot_evidence = [
