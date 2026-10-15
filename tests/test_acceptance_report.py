@@ -234,3 +234,258 @@ def test_cli_json_and_markdown(job, tmp_path, capsys):
     assert "## Acceptance checklist" in capsys.readouterr().out
     (job / "stats" / "generations" / STATS_GEN / "teams.json").write_bytes(b"bad")
     assert ar.main(["--log", str(log), "--job", str(job), "--commit", "abc"]) == 1
+
+
+# ------------------------------------------------------------ new evidence
+def _status(rep, prefix):
+    return next(c for c in rep["checklist"] if c["item"].startswith(prefix))
+
+
+def _stats_dir(job):
+    return job / "stats" / "generations" / STATS_GEN
+
+
+def _track_rows(n_with, n_without):
+    rows = [{"frame_index": i, "stable_player_id": f"player-{i}"} for i in range(n_with)]
+    rows += [{"frame_index": i} for i in range(n_without)]
+    return "\n".join(json.dumps(r) for r in rows).encode()
+
+
+def _set_tracking(job, manifest_extra, tracks=None):
+    gen = job / "tracking" / "generations" / TRACK_GEN
+    path = gen / "tracking-manifest.json"
+    data = json.loads(path.read_text())
+    data.update(manifest_extra)
+    path.write_text(json.dumps(data))
+    if tracks is not None:
+        (_stats_dir(job) / "tracks.jsonl").write_bytes(tracks)
+
+
+def test_identity_rejected_without_stable_ids_fails(job):
+    _set_tracking(job, {
+        "acceptance": {"tracking_identity": "rejected"},
+        "acceptance_reasons": ["identity_authority:missing_stage_receipt:reid"],
+    }, tracks=_track_rows(0, 4))
+    rep = ar.build_report(LOG, job, commit="x")
+    ident = rep["tracking_identity"]
+    assert ident["rows_total"] == 4 and ident["rows_with_stable_player_id"] == 0
+    assert ident["rows_without_stable_player_id"] == 4
+    row = _status(rep, "Stable player identity")
+    assert row["status"] == ar.FAIL
+    assert "0 of 4" in row["evidence"] and "missing_stage_receipt" in row["evidence"]
+    assert "absent" in ar.render_markdown(rep)  # excluded-observation fields predate this run
+
+
+def test_identity_accepted_with_stable_ids_passes(job):
+    _set_tracking(job, {
+        "acceptance": {"tracking_identity": "accepted"},
+        "identity_excluded_observations": 3,
+        "identity_excluded_observation_keys": ["k1", "k2", "k3"],
+    }, tracks=_track_rows(5, 0))
+    rep = ar.build_report(LOG, job, commit="x")
+    assert _status(rep, "Stable player identity")["status"] == ar.PASS
+    assert rep["tracking_identity"]["identity_excluded_observations"] == 3
+    assert rep["tracking_identity"]["tracks_source"] == "stats/tracks.jsonl"
+
+
+def test_identity_excluded_fields_absent_is_not_zero(job):
+    rep = ar.build_report(LOG, job, commit="x")
+    assert rep["tracking_identity"]["identity_excluded_observations"] is None
+    assert "identity_excluded_observations: absent" in ar.render_markdown(rep)
+    assert _status(rep, "Stable player identity")["status"] == ar.NOT_MEASURED  # fixture rows unparseable
+
+
+def test_identity_falls_back_to_tracking_tracks(job):
+    (job / "tracking" / "generations" / TRACK_GEN / "tracks.jsonl").write_bytes(_track_rows(2, 1))
+    rep = ar.build_report(LOG, job, commit="x")
+    assert rep["tracking_identity"]["tracks_source"] == "tracking/tracks.jsonl"
+    assert rep["tracking_identity"]["rows_with_stable_player_id"] == 2
+
+
+def _set_results(job, **extra):
+    path = _stats_dir(job) / "results.json"
+    data = json.loads(path.read_text())
+    data.update(extra)
+    path.write_text(json.dumps(data))
+    return data
+
+
+def test_numbers_missing_artifact_fails_with_explanation(job):
+    _set_results(job, numbers_file=None, config={"number_predictor_backend": "roboflow-hosted"})
+    rep = ar.build_report(LOG, job, commit="x")
+    row = _status(rep, "Jersey number OCR")
+    assert row["status"] == ar.FAIL
+    assert ("configured (NUMBER_PREDICTOR_BACKEND=roboflow-hosted in the image) "
+            "but no numbers artifact was produced") in row["evidence"]
+    # the integrations row must not claim success and must point at the OCR row
+    ext = _status(rep, "Configured external")
+    assert ext["status"] == ar.NOT_MEASURED and "Jersey number OCR ran" in ext["evidence"]
+
+
+def test_numbers_file_named_but_missing_on_disk_fails(job):
+    _set_results(job, numbers_file="numbers.json")
+    assert _status(ar.build_report(LOG, job, commit="x"), "Jersey number OCR")["status"] == ar.FAIL
+
+
+def test_numbers_artifact_present_passes(job):
+    (_stats_dir(job) / "numbers.json").write_text("{}")
+    _set_results(job, numbers_file="numbers.json")
+    row = _status(ar.build_report(LOG, job, commit="x"), "Jersey number OCR")
+    assert row["status"] == ar.PASS and "not that its numbers are correct" in row["evidence"]
+
+
+def test_numbers_not_measured_without_results(job):
+    (_stats_dir(job) / "results.json").unlink()
+    assert _status(ar.build_report(LOG, job, commit="x"), "Jersey number OCR")["status"] == ar.NOT_MEASURED
+
+
+def _write_outcomes(job, events, shots):
+    gen = _stats_dir(job)
+    (gen / "shot_events.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+    (gen / "projected_shots.json").write_text(json.dumps({"shots": shots}))
+
+
+def test_outcome_summary_counts(job):
+    _write_outcomes(
+        job,
+        [{"outcome": "made", "outcome_source": "ball_in_basket"},
+         {"outcome": "made", "outcome_source": "rim_trajectory"},
+         {"outcome": "missed", "outcome_source": "shot_detector"},
+         {"outcome": "missed"}],
+        [{"shooter_track_id": 1, "shooter_attribution_method": "action_box_vote"},
+         {"shooter_track_id": None, "shooter_stable_player_id": None, "shooter_attribution_method": "none"},
+         {"shooter_stable_player_id": "player-001", "shooter_attribution_method": "action_box_vote"}],
+    )
+    out = ar.build_report(LOG, job, commit="x")["outcome_summary"]
+    assert out["events"] == 4 and out["projected_shots"] == 3
+    assert out["by_outcome"] == {"made": 2, "missed": 2}
+    assert out["by_outcome_source"] == {"absent": 1, "ball_in_basket": 1, "rim_trajectory": 1, "shot_detector": 1}
+    assert out["by_shooter_attribution_method"] == {"action_box_vote": 2, "none": 1}
+    assert out["shots_with_null_shooter"] == 1
+    assert out["ball_tracks"] == {"rows": 6, "non_lost_rows": 1}
+    assert "Outcome summary" in ar.render_markdown(ar.build_report(LOG, job, commit="x"))
+
+
+def test_outcome_fields_absent_when_not_emitted(job):
+    _write_outcomes(job, [{"outcome": "made"}], [{"shooter_track_id": 1}])
+    out = ar.build_report(LOG, job, commit="x")["outcome_summary"]
+    assert out["by_outcome_source"] is None and out["by_shooter_attribution_method"] is None
+    assert out["shots_with_null_shooter"] == 0
+    assert "absent (field not emitted)" in ar.render_markdown(ar.build_report(LOG, job, commit="x"))
+
+
+def test_outcome_summary_without_artifacts(job):
+    out = ar.build_report(LOG, job, commit="x")["outcome_summary"]
+    assert out["events"] is None and out["shots_with_null_shooter"] is None
+
+
+def _mp4(path, frames):
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (64, 48))
+    for i in range(frames):
+        writer.write(np.full((48, 64, 3), i * 10 % 255, dtype=np.uint8))
+    writer.release()
+    assert path.is_file()
+
+
+def test_replay_mp4_frame_count_matches(job, tmp_path):
+    video = tmp_path / "replay.mp4"
+    _mp4(video, 6)  # frame_bounds [0, 5]
+    row = _status(ar.build_report(LOG, job, commit="x", replay_output=str(video)), "Downloaded")
+    assert row["status"] == ar.PASS and "6 frames" in row["evidence"]
+
+
+def test_replay_mp4_frame_count_mismatch_fails(job, tmp_path):
+    video = tmp_path / "replay.mp4"
+    _mp4(video, 4)
+    row = _status(ar.build_report(LOG, job, commit="x", replay_output=str(video)), "Downloaded")
+    assert row["status"] == ar.FAIL and "4 frames" in row["evidence"] and "imply 6" in row["evidence"]
+
+
+def test_replay_mp4_found_inside_directory(job, tmp_path):
+    out = tmp_path / "render"
+    out.mkdir()
+    _mp4(out / "debug.mp4", 6)
+    assert _status(ar.build_report(LOG, job, commit="x", replay_output=str(out)), "Downloaded")["status"] == ar.PASS
+
+
+def test_replay_corrupt_mp4_fails(job, tmp_path):
+    video = tmp_path / "replay.mp4"
+    video.write_bytes(b"not a video")
+    row = _status(ar.build_report(LOG, job, commit="x", replay_output=str(video)), "Downloaded")
+    assert row["status"] == ar.FAIL and "could not be opened" in row["evidence"]
+
+
+def test_replay_absent_stays_not_run(job):
+    assert _status(ar.build_report(LOG, job, commit="x"), "Downloaded")["status"] == ar.NOT_RUN
+
+
+def test_notes_embedded_and_redacted(job):
+    notes = "## Findings\nOCR key leaked sk-abcdefgh1234 mailed to me@example.com from /home/fede/x\n"
+    rep = ar.build_report(LOG, job, commit="x", notes=notes)
+    md = ar.render_markdown(rep)
+    assert "## Operational findings" in md and "## Findings" in md
+    for leaked in ("sk-abcdefgh1234", "me@example.com", "/home/fede/x"):
+        assert leaked not in md and leaked not in json.dumps(rep)
+    assert "<token>" in md and "<email>" in md
+
+
+def test_no_notes_invents_nothing(job):
+    rep = ar.build_report(LOG, job, commit="x")
+    assert rep["operational_notes"] is None
+    assert "No operational notes were provided" in ar.render_markdown(rep)
+
+
+def test_gpu_strings_per_log(job):
+    other = LOG.replace("NVIDIA A100-SXM4-80GB, 81153MiB", "NVIDIA A100 80GB PCIe, 81153MiB")
+    rep = ar.build_report(LOG, job, commit="x", also_logs={"second.log": other})
+    cfg = rep["gpu_and_configuration"]
+    assert cfg["gpu_strings_by_log"] == {
+        "primary": ["NVIDIA A100-SXM4-80GB, 81153MiB"], "second.log": ["NVIDIA A100 80GB PCIe, 81153MiB"]}
+    assert cfg["gpu_variants_differ_across_logs"] is True
+    assert "different GPU variants" in ar.render_markdown(rep)
+    same = ar.build_report(LOG, job, commit="x", also_logs={"same.log": LOG})
+    assert same["gpu_and_configuration"]["gpu_variants_differ_across_logs"] is False
+
+
+def test_diff_mode(job, tmp_path, capsys):
+    a = ar.build_report(LOG, job, commit="x")
+    _set_tracking(job, {"acceptance": {"tracking_identity": "accepted"}}, tracks=_track_rows(3, 0))
+    (_stats_dir(job) / "numbers.json").write_text("{}")
+    _set_results(job, numbers_file="numbers.json")
+    b = ar.build_report(LOG, job, commit="x")
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(a))
+    pb.write_text(json.dumps(b))
+    assert ar.main(["--diff", str(pa), str(pb)]) == 0
+    out = capsys.readouterr().out
+    assert "checklist: Jersey number OCR ran" in out and "FAIL" in out and "PASS" in out
+    assert "| tracking_identity | absent | \"accepted\" |" in out
+    assert "numbers_file" in out and "rows_with_stable_player_id" in out
+    assert ar.main(["--diff", str(pa), str(pa)]) == 0
+    assert "no differences" in capsys.readouterr().out
+
+
+def test_diff_mode_unreadable_still_exits_zero(tmp_path, capsys):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{nope")
+    assert ar.main(["--diff", str(bad), str(tmp_path / "missing.json")]) == 0
+    assert "diff skipped" in capsys.readouterr().out
+
+
+def test_cli_requires_log_and_job_without_diff():
+    with pytest.raises(SystemExit):
+        ar.main([])
+
+
+def test_cli_notes_and_also_log(job, tmp_path, capsys):
+    log = tmp_path / "run.log"
+    log.write_text(LOG)
+    notes = tmp_path / "notes.md"
+    notes.write_text("manual finding sk-abcdefgh1234\n")
+    assert ar.main(["--log", str(log), "--job", str(job), "--commit", "a", "--notes", str(notes),
+                    "--also-log", str(log)]) == 0
+    out = capsys.readouterr().out
+    assert "manual finding <token>" in out and "GPU string, run.log log" in out
