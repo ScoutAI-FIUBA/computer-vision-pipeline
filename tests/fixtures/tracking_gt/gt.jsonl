@@ -1,0 +1,22 @@
+{"record_type": "header", "annotation_version": 1, "clip": "gt-sample", "fps": 10.0, "width": 320, "height": 240, "start_frame": 0, "num_frames": 10}
+{"record_type": "box", "frame_index": 0, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 0, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 1, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 1, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 2, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 2, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 3, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 3, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 4, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "partial_occlusion", "notes": ""}
+{"record_type": "box", "frame_index": 4, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 5, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "partial_occlusion", "notes": ""}
+{"record_type": "box", "frame_index": 5, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 6, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 6, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 7, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 7, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 8, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 8, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 9, "gt_id": "player-01", "bbox": [40, 60, 80, 150], "visibility": "visible", "notes": ""}
+{"record_type": "box", "frame_index": 9, "gt_id": "player-02", "bbox": [200, 60, 240, 150], "visibility": "visible", "notes": ""}
+{"record_type": "ignore", "frame_index": 0, "bbox": [280, 0, 320, 30], "reason": "crowd"}

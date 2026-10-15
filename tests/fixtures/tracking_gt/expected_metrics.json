@@ -1,0 +1,69 @@
+{
+  "iou_threshold": 0.5,
+  "num_gt_boxes": 20,
+  "num_frames": 10,
+  "gt_ids": [
+    "player-01",
+    "player-02"
+  ],
+  "formulas": {
+    "mota": "1 - (fn + fp + idsw) / num_gt_boxes",
+    "idf1": "2*idtp / (2*idtp + idfp + idfn)",
+    "idfp": "num_pred_boxes - idtp",
+    "idfn": "num_gt_boxes - idtp"
+  },
+  "cases": {
+    "perfect": {
+      "prediction": "pred_perfect.jsonl",
+      "num_pred_boxes": 20,
+      "fn": 0,
+      "fp": 0,
+      "idsw": 0,
+      "idtp": 20,
+      "idfp": 0,
+      "idfn": 0,
+      "mota": 1.0,
+      "idf1": 1.0,
+      "description": "track 1 follows player-01 and track 2 follows player-02 on every frame"
+    },
+    "id_switch": {
+      "prediction": "pred_id_switch.jsonl",
+      "num_pred_boxes": 20,
+      "fn": 0,
+      "fp": 0,
+      "idsw": 1,
+      "idtp": 15,
+      "idfp": 5,
+      "idfn": 5,
+      "mota": 0.95,
+      "idf1": 0.75,
+      "description": "player-01 is tracked as 1 on frames 0-4 and as 3 on frames 5-9 (one switch); the best global assignment keeps 5 of its 10 frames (tie between 1 and 3, same value)"
+    },
+    "missed_track": {
+      "prediction": "pred_missed_track.jsonl",
+      "num_pred_boxes": 15,
+      "fn": 5,
+      "fp": 0,
+      "idsw": 0,
+      "idtp": 15,
+      "idfp": 0,
+      "idfn": 5,
+      "mota": 0.75,
+      "idf1": 0.857143,
+      "description": "player-02 is never tracked from frame 5 on (full loss, no recovery)"
+    },
+    "false_positive": {
+      "prediction": "pred_false_positive.jsonl",
+      "num_pred_boxes": 23,
+      "fn": 0,
+      "fp": 3,
+      "idsw": 0,
+      "idtp": 20,
+      "idfp": 3,
+      "idfn": 0,
+      "mota": 0.85,
+      "idf1": 0.930233,
+      "description": "track 9 appears on frames 3-5 over empty court, outside every ground-truth box and ignore region"
+    }
+  }
+}
