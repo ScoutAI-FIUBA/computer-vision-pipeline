@@ -35,6 +35,9 @@ REQUIRED_CLIP_FIELDS = (
     "clip", "source_video", "path", "scenario", "difficulty", "start_frame", "end_frame",
     "duration_seconds", "fps", "width", "height", "configuration", "source_commit", "review_status",
 )
+SEGMENT_WINDOW = 150
+SEGMENT_OVERLAP = 20
+POSSESSION_ENGINE = "v5"
 PENDING_FIELDS = (
     "scenario_present", "id_switch", "full_loss", "recovery", "stable_identity_involved",
 )
@@ -231,14 +234,22 @@ def get_source_commit(repo_root: Path) -> str:
         return "unknown"
 
 
-def build_suggested_run_command(clip_path: Path, run_dir: Path, frame_count: int) -> str:
-    """Copy-pasteable Modal command. Never executed by this script (it uses GPU credits)."""
+def build_job_id(clip: str, label: str) -> str:
+    # Deterministic; modal_app_v2._job_path only rejects empty ids and path separators, which CLIP_NAME_RE excludes.
+    return f"eval-{clip}-{label}"
+
+
+def build_suggested_run_command(clip_path: Path, job_id: str, frame_count: int) -> str:
+    """Copy-pasteable staged Modal command. Never executed by this script (it uses GPU credits)."""
     return " ".join([
-        "modal", "run", "modal_app_v2.py",
+        "modal", "run", "modal_app_v2.py", "--staged",
+        "--job-id", shlex.quote(job_id),
         "--video-path", shlex.quote(str(clip_path)),
-        "--output-dir", shlex.quote(str(run_dir)),
         "--frame-start", "0",
-        "--frame-end", str(frame_count),
+        # Modal's --frame-end is inclusive; the manifest's end_frame is exclusive.
+        "--frame-end", str(frame_count - 1),
+        "--segmented", "--segment-window", str(SEGMENT_WINDOW), "--segment-overlap", str(SEGMENT_OVERLAP),
+        "--possession-engine", POSSESSION_ENGINE,
     ])
 
 
@@ -353,6 +364,11 @@ def prepare_dataset(
         sheet_frames_idx = make_contact_sheet(
             clip_path, sheet_path, count=sheet_frames, frame_offset=window.start_frame
         )
+        job_ids = {label: build_job_id(window.clip, label) for label in run_labels}
+        commands = {
+            label: build_suggested_run_command(clip_path.resolve(), job_id, frames)
+            for label, job_id in job_ids.items()
+        }
         entries.append({
             "clip": window.clip,
             "source_video": str(info.path),
@@ -383,19 +399,19 @@ def prepare_dataset(
             "contact_sheet_frames": [window.start_frame + i for i in sheet_frames_idx],
             "notes": notes.get(window.clip, ""),
             "command_executed": False,
-            "suggested_run_command": build_suggested_run_command(
-                (output_dir / "clips" / f"{window.clip}.mp4").resolve(),
-                (output_dir / "runs" / run_labels[0] / window.clip / "annotated").resolve().parent,
-                frames,
-            ) if run_labels else None,
+            "modal_frame_end_inclusive": frames - 1,
+            "suggested_job_ids": job_ids,
+            "suggested_run_commands": commands,
+            "suggested_run_command": commands[run_labels[0]] if run_labels else None,
         })
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "run_labels": list(run_labels),
         "suggested_run_command_note": (
-            "NOT EXECUTED by this tool; running it costs GPU credits. Replace the run label in "
-            "--output-dir for other runs. target_fps/frame_stride are recorded intent: modal_app_v2.py "
-            "does not take them as flags."
+            "NOT EXECUTED by this tool; running it costs GPU credits. One staged command per run label "
+            "(suggested_run_commands); the job id is deterministic. Modal's --frame-end is inclusive "
+            "(modal_frame_end_inclusive) while end_frame is exclusive. target_fps/frame_stride are recorded "
+            "intent: modal_app_v2.py does not take them as flags."
         ),
         "clips": entries,
     }

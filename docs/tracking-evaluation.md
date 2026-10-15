@@ -40,9 +40,20 @@ runs/baseline/<clip>/annotated/, runs/candidate/<clip>/annotated/   separate, im
 ```
 
 `target_fps` / `frame_stride` (defaults 15 / 10, change with `--target-fps` / `--frame-stride`) are recorded
-configuration. Each clip also carries a `suggested_run_command` (`modal run modal_app_v2.py ...`). It is **not
-executed** by the tool and costs GPU credits; `modal_app_v2.py` does not take target_fps/frame_stride as flags, so
-check the command before use. Use the same command with `candidate` in `--output-dir` for the candidate run.
+configuration only: `modal_app_v2.py` has no such flags. Each clip also carries one **staged** Modal command per run
+label (`suggested_run_commands`; `suggested_run_command` is the first label's), for example:
+
+```
+modal run modal_app_v2.py --staged --job-id eval-game027-crossing-01-baseline \
+  --video-path /abs/eval/set01/clips/game027-crossing-01.mp4 --frame-start 0 --frame-end 299 \
+  --segmented --segment-window 150 --segment-overlap 20 --possession-engine v5
+```
+
+- Commands are printed and **never executed** (`command_executed: false`); they cost GPU credits.
+- Job ids are deterministic, `eval-<clip>-<label>` (`suggested_job_ids`); Modal only rejects empty ids and path
+  separators, which clip names cannot contain.
+- Modal's `--frame-end` is **inclusive** while the manifest's `end_frame` is exclusive, so the cut clip (N frames)
+  uses `--frame-end N-1`; both are stored (`frame_count`, `modal_frame_end_inclusive`).
 
 ## 2. Review JSONL contract
 

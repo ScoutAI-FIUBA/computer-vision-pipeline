@@ -164,14 +164,20 @@ def test_contact_sheet_from_synthetic_video(tmp_path, video):
     assert image.shape[1] == 4 * 32 and image.shape[0] == 2 * 24
 
 
-def test_suggested_run_command_is_marked_and_copy_pasteable(tmp_path, video):
+def test_suggested_run_command_is_staged_and_marked(tmp_path, video):
     manifest = run_prepare(video, tmp_path / "ds")
     entry = manifest["clips"][0]
     cmd = entry["suggested_run_command"]
-    assert cmd.startswith("modal run modal_app_v2.py")
+    assert cmd == entry["suggested_run_commands"]["baseline"]
+    assert cmd.startswith("modal run modal_app_v2.py --staged --job-id eval-a-baseline ")
     assert f"--video-path {(tmp_path / 'ds' / 'clips' / 'a.mp4').resolve()}" in cmd
-    assert "runs/baseline/a" in cmd
-    assert "--frame-end 60" in cmd
+    assert "--output-dir" not in cmd
+    # 60-frame clip: manifest end is exclusive, Modal's --frame-end is inclusive.
+    assert "--frame-start 0 --frame-end 59" in cmd
+    assert entry["frame_count"] == 60 and entry["modal_frame_end_inclusive"] == 59
+    assert "--segmented --segment-window 150 --segment-overlap 20 --possession-engine v5" in cmd
+    assert entry["suggested_job_ids"] == {"baseline": "eval-a-baseline", "candidate": "eval-a-candidate"}
+    assert "--job-id eval-a-candidate " in entry["suggested_run_commands"]["candidate"]
     assert entry["command_executed"] is False
     assert "NOT EXECUTED" in manifest["suggested_run_command_note"]
 
