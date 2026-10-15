@@ -502,3 +502,24 @@ def test_ambiguous_made_shot_without_four_projected_players_has_no_origin():
     assert shot["shooter_attribution_method"] == "ambiguous"
     assert shot["shot_origin_court_xy_m"] is None
     assert shot["shot_origin_projection_method"] is None
+
+
+def test_trajectory_made_shot_is_attributed_with_the_rim_pass_as_anchor():
+    tracks, raw = _vote_scene()
+    event = {k: v for k, v in _made_event().items() if k != "ball_in_basket_frame_index"}
+    event["rim_pass_frame_index"] = 20
+
+    shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["shooter_stable_player_id"] == "player-shooter"
+    assert shot["shooter_attribution_method"] == "action_box_vote"
+    assert shot["start_frame_source"] == "action_box_release"
+
+
+def test_basket_frame_wins_over_rim_pass_as_vote_anchor():
+    tracks, raw = _vote_scene()
+    event = {**_made_event(), "rim_pass_frame_index": 5000}
+
+    shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["shooter_attribution_method"] == "action_box_vote"

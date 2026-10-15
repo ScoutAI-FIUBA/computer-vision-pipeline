@@ -290,6 +290,14 @@ class ActionVote:
     release_timestamp_seconds: float | None
 
 
+def _made_anchor_frame_index(event: dict) -> int | None:
+    # A trajectory-made event has no basket detection; the rim pass is the frame the made shot is anchored to.
+    for key in ("ball_in_basket_frame_index", "rim_pass_frame_index"):
+        if event.get(key) is not None:
+            return event[key]
+    return None
+
+
 def _action_box_vote(
     event: dict,
     raw_rows_by_frame: dict[int, dict],
@@ -312,7 +320,7 @@ def _action_box_vote(
         prediction_xyxy,
     )
 
-    basket_frame = event.get("ball_in_basket_frame_index")
+    basket_frame = _made_anchor_frame_index(event)
     fps = _raw_prediction_fps(raw_rows_by_frame)
     if basket_frame is None or fps is None:
         return None
@@ -445,7 +453,7 @@ def build_projected_shots(
                 frame_rows,
                 shot_anchor_image_xy,
             )
-            if raw_rows_by_frame is not None and event.get("ball_in_basket_frame_index") is not None:
+            if raw_rows_by_frame is not None and _made_anchor_frame_index(event) is not None:
                 vote = _action_box_vote(event, raw_rows_by_frame, projected_by_frame)
                 if vote is not None:
                     shooter_row = vote.release_row

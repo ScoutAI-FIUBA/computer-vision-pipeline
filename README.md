@@ -541,6 +541,7 @@ Current environment-backed knobs:
 | `ROBOFLOW_API_URL` | `https://serverless.roboflow.com` | Hosted inference endpoint. |
 | `PLAYER_MODEL_ID` | `basketball-player-detection-3-ycjdo/16` | Player detector model. |
 | `SHOT_TARGET_FPS` | unset | Optional shot-pass FPS target. When unset, the shot pass reuses tracking downsampling. |
+| `SHOT_RIM_TRAJECTORY_OUTCOME` | `0` | Enables the heuristic rim-trajectory outcome described under "Shot events". |
 | `SAM2_MODEL_ID` | `facebook/sam2-hiera-small` | SAM2 checkpoint. |
 | `TEAM_EMBEDDER_BACKEND` | `siglip` | FashionSigLIP by default; `colour` or `none` remain supported overrides. |
 | `TEAM_EMBEDDER_MODEL_ID` | `Marqo/marqo-fashionSigLIP` | FashionSigLIP model id when the backend is `siglip`. |
@@ -689,6 +690,10 @@ What it does today:
 5. Mark the event as `unknown` at end-of-clip if the run ends before resolution.
 6. Write conservative player/team attribution in the additive `shot_evidence.jsonl`
    artifact without changing `shot_events.jsonl`.
+
+Shot type: `shot_type` is decided when the event is finalized (made, missed or unknown), by a confidence-weighted vote over the last burst of shot boxes. A burst is a run of shot-signal frames with gaps under 0.3 s (9 frames when a timestamp is missing); ties go to `jump_shot`. A single stray layup box among many jump-shot boxes no longer relabels the event, and a putback after an earlier jump burst is still a `layup_dunk`. Whether a frame opens a layup or jump candidate is unchanged.
+
+Rim-trajectory outcome (`SHOT_RIM_TRAJECTORY_OUTCOME=1`, default off): a heuristic that upgrades a `missed` (timeout or new shot) or `unknown` event to `made` when the ball is seen above the detected `rim`, then inside the rim zone, then leaves the zone below and centred, using TrackNet `detected` points and detector balls with confidence >= 0.6. It runs after the shot pass, rewrites `shot_events.jsonl` atomically, and adds `outcome_source` (`ball_in_basket`, `rim_trajectory` or `shot_detector`), `rim_pass_frame_index` and `rim_exit_frame_index`; the upgraded event has `resolution_reason: "rim_trajectory"` and keeps `ball_in_basket_frame_index` null. It never changes an event resolved by `ball_in_basket`, and any ambiguous trajectory keeps the existing outcome (prefer unknown over made). Shooter attribution anchors on `rim_pass_frame_index` for these events. The thresholds were checked on four local clips only and are not a validated accuracy claim. With the flag off, the written files are unchanged.
 
 Current limits:
 

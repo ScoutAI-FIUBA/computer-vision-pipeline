@@ -75,6 +75,7 @@ from pipeline.shot_events import (
     write_shot_raw_prediction_record,
     write_shot_signal_record,
 )
+from pipeline.shot_outcome import refine_shot_events_file
 from pipeline.team_evidence import TeamEvidenceSample, select_top_k_evidence, summarize_track_evidence, write_debug_artifacts
 from pipeline.team_embedder import TeamEmbeddingSample, build_team_embedder
 from pipeline.team_id import (
@@ -1059,6 +1060,16 @@ def _write_shot_events(
             write_shot_event_record(shot_events_file, final_shot_event)
 
 
+def _refine_shot_outcomes(output_dir: Path, config: PipelineConfig) -> None:
+    if not getattr(config, "shot_rim_trajectory_outcome", False):
+        return
+    refine_shot_events_file(
+        output_dir / SHOT_EVENTS_FILENAME,
+        output_dir / SHOT_RAW_PREDICTIONS_FILENAME,
+        output_dir / BALL_TRACKS_FILENAME,
+    )
+
+
 def _attach_ball_evidence(
     output_dir: Path, *, expected_frame_indices, team_ids_by_track_id: dict[int, int] | None = None,
     projected_shots: dict | None = None,
@@ -1309,6 +1320,7 @@ def run_stats_from_v2_observations(
         on_progress=shot_progress,
     ))
     shot_progress.complete(info.frame_count if info.frame_count > 0 else None)
+    phase("shot outcome refinement", lambda: _refine_shot_outcomes(output_dir, config))
     projected_shots_file, projected_shots_image_file = phase(
         "projected shot artifacts", lambda: _maybe_write_projected_shots(output_dir)
     )
@@ -2045,6 +2057,7 @@ def run_pipeline(
         step=shot_step,
         config=config,
     )
+    _refine_shot_outcomes(output_dir, config)
     if projected_track_records == 0 and projected_tracks_path.exists():
         projected_tracks_path.unlink()
     results.projected_shots_file, results.projected_shots_image_file = _maybe_write_projected_shots(output_dir)
