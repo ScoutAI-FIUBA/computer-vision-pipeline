@@ -15,10 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pipeline.config import PipelineConfig  # noqa: E402
 from pipeline.shot_events import (  # noqa: E402
+    ShotEventCandidate,
     flush_open_shot_event,
     shot_frame_signals,
     shot_signal_trace_record,
     update_shot_event_candidate,
+    vote_shot_type,
 )
 from pipeline.video import Segment, VideoInfo  # noqa: E402
 
@@ -1442,3 +1444,138 @@ def test_false_ball_in_basket_leaves_the_shot_open_until_a_real_basket_arrives()
 
     assert resolved is not None
     assert resolved["outcome"] == "made"
+
+
+def shot_box_frame(class_id: int, confidence: float, *extra: dict) -> dict:
+    return detection_frame(
+        {"class_id": class_id, "confidence": confidence, "x": 100, "y": 100, "width": 20, "height": 40},
+        *extra,
+    )
+
+
+def replay_shot_frames(rows: list[tuple[int, float, dict]], *, flush: bool = True) -> list[dict]:
+    candidate = None
+    next_event_id = 1
+    events: list[dict] = []
+    for frame_index, timestamp, result in rows:
+        candidate, resolved, next_event_id = update_shot_event_candidate(
+            candidate,
+            next_event_id=next_event_id,
+            frame_index=frame_index,
+            timestamp_seconds=timestamp,
+            signals=shot_frame_signals(result),
+        )
+        if resolved is not None:
+            events.append(resolved)
+    if flush:
+        flushed = flush_open_shot_event(candidate, frame_index=rows[-1][0], timestamp_seconds=rows[-1][1])
+        if flushed is not None:
+            events.append(flushed)
+    return events
+
+
+def test_isolated_low_confidence_layup_box_among_jump_boxes_stays_jump_shot():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["shot_type"] == "jump_shot"
+
+
+def test_later_layup_burst_after_a_separate_jump_burst_is_layup_dunk():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.8)) for i in range(5)]
+    rows += [(i, i * 0.1, shot_box_frame(6, 0.6)) for i in range(15, 20)]
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["shot_type"] == "layup_dunk"
+
+
+def test_single_mixed_burst_is_decided_by_summed_confidence():
+    layup_heavy = [(0, 0.0, shot_box_frame(5, 0.5)), (1, 0.1, shot_box_frame(6, 0.9)), (2, 0.2, shot_box_frame(5, 0.3))]
+    jump_heavy = [(0, 0.0, shot_box_frame(5, 0.9)), (1, 0.1, shot_box_frame(6, 0.6)), (2, 0.2, shot_box_frame(5, 0.4))]
+
+    assert replay_shot_frames(layup_heavy)[0]["shot_type"] == "layup_dunk"
+    assert replay_shot_frames(jump_heavy)[0]["shot_type"] == "jump_shot"
+
+
+def test_tied_vote_goes_to_jump_shot():
+    rows = [(0, 0.0, shot_box_frame(5, 0.5)), (1, 0.1, shot_box_frame(6, 0.5))]
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["shot_type"] == "jump_shot"
+
+
+def test_vote_falls_back_to_frame_gaps_without_timestamps():
+    candidate = ShotEventCandidate(
+        event_id=1,
+        shot_type="jump_shot",
+        start_frame_index=0,
+        start_timestamp_seconds=None,
+        start_image_xy=None,
+        start_shot_xyxy=None,
+        latest_shot_frame_index=40,
+        latest_shot_timestamp_seconds=None,
+        latest_shot_image_xy=None,
+        latest_shot_xyxy=None,
+        shot_frames=[(0, None, "jump_shot", 0.9), (2, None, "jump_shot", 0.9), (40, None, "layup_dunk", 0.3)],
+    )
+
+    assert vote_shot_type(candidate) == "layup_dunk"
+
+
+def test_made_event_uses_the_last_burst_vote():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.8)) for i in range(3)]
+    rows += [(i, i * 0.1, shot_box_frame(6, 0.6)) for i in range(10, 13)]
+    rows.append((13, 1.3, frame(1)))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "made"
+    assert event["shot_type"] == "layup_dunk"
+
+
+def test_made_event_with_basket_and_shot_box_in_same_frame_counts_that_box():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.8)) for i in range(3)]
+    rows.append((3, 0.3, shot_box_frame(6, 3.0, {"class_id": 1})))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "made"
+    assert event["shot_type"] == "layup_dunk"
+
+
+def test_missed_by_timeout_event_uses_the_vote_not_any_layup():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+    rows.append((100, 10.0, frame()))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "missed"
+    assert event["resolution_reason"] == "shot_timeout"
+    assert event["shot_type"] == "jump_shot"
+
+
+def test_new_shot_started_missed_event_uses_the_vote():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+    rows += [(15, 1.5, frame()), (20, 2.5, shot_box_frame(6, 0.9))]
+
+    first, second = replay_shot_frames(rows)
+
+    assert (first["outcome"], first["resolution_reason"]) == ("missed", "new_shot_started")
+    assert first["shot_type"] == "jump_shot"
+    assert second["shot_type"] == "layup_dunk"
+
+
+def test_unknown_event_at_end_of_clip_uses_the_vote():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "unknown"
+    assert event["shot_type"] == "jump_shot"

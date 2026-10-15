@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 BALL_IN_BASKET_CLASS_ID = 1
 JUMP_SHOT_CLASS_ID = 5
@@ -29,6 +29,11 @@ OPENING_CONFIRMATION_WINDOW_SECONDS = 0.3
 POST_MADE_SUPPRESSION_SECONDS = 2.0
 MISSED_SHOT_TIMEOUT_SECONDS = 5.0
 LOW_CONFIDENCE_BURST_THRESHOLD = 0.5
+# The event type is a confidence-weighted vote over the last burst of shot boxes. A single stray
+# box of the other class (a jump shot read once as a layup) must not relabel the whole event.
+SHOT_TYPE_BURST_GAP_SECONDS = 0.3
+# Used only when a timestamp is missing: 0.3 s at 30 fps.
+SHOT_TYPE_BURST_GAP_FRAMES_FALLBACK = 9
 
 
 @dataclass
@@ -47,6 +52,8 @@ class ShotEventCandidate:
     inactive_inference_count: int = 0
     ball_in_basket_frame_index: int | None = None
     ball_in_basket_timestamp_seconds: float | None = None
+    # (frame_index, timestamp_seconds, shot_type, confidence) for every frame with a shot signal.
+    shot_frames: list[tuple[int, float | None, str, float | None]] = field(default_factory=list)
 
 
 @dataclass
@@ -332,6 +339,45 @@ def shot_type_for_frame(signals: dict[str, object]) -> str | None:
     return None
 
 
+def _is_same_burst(
+    previous: tuple[int, float | None, str, float | None], current: tuple[int, float | None, str, float | None]
+) -> bool:
+    gap_seconds = elapsed_seconds(previous[1], current[1])
+    if gap_seconds is None:
+        return current[0] - previous[0] < SHOT_TYPE_BURST_GAP_FRAMES_FALLBACK
+    return gap_seconds < SHOT_TYPE_BURST_GAP_SECONDS
+
+
+def vote_shot_type(candidate: ShotEventCandidate) -> str:
+    """Confidence-weighted vote over the last burst of shot boxes; ties go to jump_shot."""
+    frames = sorted(candidate.shot_frames, key=lambda entry: entry[0])
+    if not frames:
+        return candidate.shot_type
+    burst = [frames[-1]]
+    for entry in reversed(frames[:-1]):
+        if not _is_same_burst(entry, burst[0]):
+            break
+        burst.insert(0, entry)
+    # A box without a confidence still counts, with the smallest weight that breaks no tie.
+    weights = {"jump_shot": 0.0, "layup_dunk": 0.0}
+    for _, _, shot_type, confidence in burst:
+        weights[shot_type] += confidence if confidence is not None else 1e-6
+    return "layup_dunk" if weights["layup_dunk"] > weights["jump_shot"] else "jump_shot"
+
+
+def _record_shot_frame(
+    candidate: ShotEventCandidate,
+    frame_index: int,
+    timestamp_seconds: float | None,
+    shot_type: str,
+    signals: dict[str, object],
+) -> None:
+    confidence = signals.get("shot_signal_confidence")
+    candidate.shot_frames.append(
+        (frame_index, timestamp_seconds, shot_type, None if confidence is None else float(confidence))
+    )
+
+
 def finalize_shot_event(
     candidate: ShotEventCandidate,
     *,
@@ -361,7 +407,7 @@ def finalize_shot_event(
         start_shot_xyxy = candidate.latest_shot_xyxy
     return {
         "event_id": candidate.event_id,
-        "shot_type": candidate.shot_type,
+        "shot_type": vote_shot_type(candidate),
         "outcome": outcome,
         "start_frame_index": start_frame_index,
         "end_frame_index": end_frame_index,
@@ -474,7 +520,7 @@ def update_shot_event_candidate(
             candidate.latest_shot_timestamp_seconds = timestamp_seconds
             candidate.latest_shot_image_xy = signals.get("shot_signal_center_xy")
             candidate.latest_shot_xyxy = signals.get("shot_signal_xyxy")
-            candidate.shot_type = shot_type or candidate.shot_type
+            _record_shot_frame(candidate, frame_index, timestamp_seconds, shot_type, signals)
         candidate.ball_in_basket_frame_index = frame_index
         candidate.ball_in_basket_timestamp_seconds = timestamp_seconds
         cooldown_until = (
@@ -507,7 +553,7 @@ def update_shot_event_candidate(
             candidate.latest_shot_timestamp_seconds = timestamp_seconds
             candidate.latest_shot_image_xy = signals.get("shot_signal_center_xy")
             candidate.latest_shot_xyxy = signals.get("shot_signal_xyxy")
-            candidate.shot_type = shot_type
+            _record_shot_frame(candidate, frame_index, timestamp_seconds, shot_type, signals)
             candidate.shot_signal_active = True
             return candidate, None, next_event_id
         if shot_gap_seconds is not None and shot_gap_seconds >= SAME_EVENT_WINDOW_SECONDS:
@@ -532,6 +578,7 @@ def update_shot_event_candidate(
                 latest_shot_image_xy=signals.get("shot_signal_center_xy"),
                 latest_shot_xyxy=signals.get("shot_signal_xyxy"),
             )
+            _record_shot_frame(replacement, frame_index, timestamp_seconds, shot_type, signals)
             return replacement, resolved, next_event_id + 1
 
     if shot_type is not None:
@@ -540,8 +587,7 @@ def update_shot_event_candidate(
         candidate.latest_shot_timestamp_seconds = timestamp_seconds
         candidate.latest_shot_image_xy = signals.get("shot_signal_center_xy")
         candidate.latest_shot_xyxy = signals.get("shot_signal_xyxy")
-        if shot_type == "layup_dunk":
-            candidate.shot_type = shot_type
+        _record_shot_frame(candidate, frame_index, timestamp_seconds, shot_type, signals)
         return candidate, None, next_event_id
 
     inactive_gap_seconds = elapsed_seconds(candidate.latest_shot_timestamp_seconds, timestamp_seconds)
