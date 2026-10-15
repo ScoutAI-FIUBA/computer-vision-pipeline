@@ -214,3 +214,98 @@ def test_cli_end_to_end_and_overwrite_refusal(tmp_path, video, capsys):
     assert ped.main(argv) == 1
     assert ped.main(["--output-dir", str(tmp_path / "ds2"), "--source", str(video),
                      "--window", "a:0:40:crossing:easy"]) == 1
+
+
+GEN = "g" * 64
+
+
+def make_job(root: Path, *, frames=120, bounds=(0, 119), complete=True, name="job-x", video_frames=120) -> Path:
+    job = root / name
+    gen_dir = job / "tracking" / "generations" / GEN
+    gen_dir.mkdir(parents=True)
+    (job / "stats" / "generations" / "s1").mkdir(parents=True)
+    (job / "job.json").write_text(json.dumps({
+        "job_id": "job-x", "state": "complete", "tracking_generation": GEN, "stats_generation": "s1",
+        "input_fingerprint": "sha256:abc",
+    }))
+    (job / "tracking" / "current.json").write_text(json.dumps({"generation": GEN, "stage": "tracking"}))
+    (job / "stats" / "generations" / "s1" / "results.json").write_text(
+        json.dumps({"config": {"possession_engine": "v5"}}))
+    (gen_dir / "manifest.json").write_text(json.dumps({
+        "complete": complete, "frame_bounds": list(bounds), "input_fingerprint": "sha256:abc"}))
+    (gen_dir / "tracking-manifest.json").write_text(json.dumps({
+        "complete": complete, "truncated": False, "video": {"frame_count": video_frames},
+        "config": {"sam31_segmented": True, "sam31_segment_window": 150, "sam31_segment_overlap": 20},
+    }))
+    with (gen_dir / "tracks.jsonl").open("w") as fh:
+        for frame in range(frames):
+            fh.write(json.dumps({"frame_index": frame, "raw_track_id": 1, "mask_ref": "masks/x.png"}) + "\n")
+    return job
+
+
+def prepared(tmp_path, video):
+    out = tmp_path / "ds"
+    run_prepare(video, out)  # clip a = source frames 10..70
+    return out
+
+
+def test_attach_run_slices_and_reindexes(tmp_path, video):
+    out = prepared(tmp_path, video)
+    job = make_job(tmp_path)
+    meta = ped.attach_runs(out, {"a": job}, repo_root=tmp_path)["a"]
+    rows = [json.loads(l) for l in (out / "runs/baseline/a/tracks.jsonl").read_text().splitlines()]
+    assert [r["frame_index"] for r in rows] == list(range(60))
+    assert rows[0]["raw_track_id"] == 1
+    saved = json.loads((out / "runs/baseline/a/run_metadata.json").read_text())
+    assert saved == meta
+    assert saved["frame_offset"] == 10 and saved["rows"] == 60 and saved["window"] == {"start_frame": 10, "end_frame": 70}
+    assert saved["source_job"] == "job-x" and "/" not in saved["source_job"]
+    assert (saved["tracking_generation"], saved["stats_generation"]) == (GEN, "s1")
+    assert saved["input_fingerprint"] == "sha256:abc" and saved["source_commit"] == "unknown"
+    assert saved["pipeline_config"]["possession_engine"] == "v5"
+    assert saved["pipeline_config"]["segment_window"] == 150
+    assert saved["pipeline_config"]["segment_seam_min_score"] == "unknown"
+    assert "FULL source clip" in saved["warning"]
+    assert str(tmp_path) not in json.dumps(saved)
+    status = json.loads((out / "runs/baseline/RUN_STATUS.json").read_text())
+    assert status["status"] == "attached" and status["attached"] == {"a": "job-x"}
+
+
+def test_attach_run_refuses_overwrite(tmp_path, video):
+    out = prepared(tmp_path, video)
+    job = make_job(tmp_path)
+    ped.attach_runs(out, {"a": job}, repo_root=tmp_path)
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        ped.attach_runs(out, {"a": job}, repo_root=tmp_path)
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(complete=False), "not complete"),
+    (dict(bounds=(0, 50)), "outside the tracked frames"),
+    (dict(bounds=(20, 119)), "outside the tracked frames"),
+    (dict(video_frames=999), "frame indices would not line up"),
+])
+def test_attach_run_rejects_bad_jobs_and_writes_nothing(tmp_path, video, kwargs, match):
+    out = prepared(tmp_path, video)
+    job = make_job(tmp_path, **kwargs)
+    with pytest.raises(ValueError, match=match):
+        ped.attach_runs(out, {"a": job}, repo_root=tmp_path)
+    assert not (out / "runs/baseline/a/tracks.jsonl").exists()
+
+
+def test_attach_run_unknown_clip_and_label(tmp_path, video):
+    out = prepared(tmp_path, video)
+    job = make_job(tmp_path)
+    with pytest.raises(ValueError, match="unknown clips"):
+        ped.attach_runs(out, {"zzz": job}, repo_root=tmp_path)
+    with pytest.raises(ValueError, match="not in this dataset"):
+        ped.attach_runs(out, {"a": job}, label="nope", repo_root=tmp_path)
+
+
+def test_cli_attach_run_to_existing_dataset(tmp_path, video, capsys):
+    out = prepared(tmp_path, video)
+    job = make_job(tmp_path)
+    assert ped.main(["--output-dir", str(out), "--attach-run", f"a={job}"]) == 0
+    assert "FULL source clip" in capsys.readouterr().out
+    assert ped.main(["--output-dir", str(out), "--attach-run", f"a={job}"]) == 1
+    assert ped.main(["--output-dir", str(out), "--attach-run", "a"]) == 1

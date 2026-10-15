@@ -269,6 +269,170 @@ def create_run_dirs(dataset_dir: Path, label: str, clips: list[str]) -> Path:
     return run_dir
 
 
+def _read_json(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read {path.name} in {path.parent.name}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name} in {path.parent.name} is not a JSON object")
+    return payload
+
+
+def _stats_context(job: Path, job_manifest: dict) -> tuple[str, str]:
+    """Best-effort (stats generation id, possession engine); 'unknown' when absent."""
+    generation = job_manifest.get("stats_generation")
+    if not generation and (job / "stats" / "current.json").is_file():
+        generation = _read_json(job / "stats" / "current.json").get("generation")
+    engine = "unknown"
+    results = job / "stats" / "generations" / str(generation) / "results.json"
+    if generation and results.is_file():
+        config = _read_json(results).get("config")
+        if isinstance(config, dict):
+            engine = config.get("possession_engine") or "unknown"
+    return generation or "unknown", engine
+
+
+def inspect_job(job: Path, entry: dict) -> dict:
+    """Validate a downloaded Modal job folder against a manifest clip; masks are never read."""
+    if not (job / "job.json").is_file():
+        raise ValueError(f"{job.name}: no job.json (expected a downloaded Modal job folder)")
+    job_manifest = _read_json(job / "job.json")
+    current = _read_json(job / "tracking" / "current.json")
+    generation = current.get("generation")
+    if not generation:
+        raise ValueError(f"{job.name}: tracking/current.json has no generation")
+    if job_manifest.get("tracking_generation") not in (None, generation):
+        raise ValueError(f"{job.name}: job.json and tracking/current.json disagree on the tracking generation")
+    gen_dir = job / "tracking" / "generations" / generation
+    manifest = _read_json(gen_dir / "manifest.json")
+    detail = _read_json(gen_dir / "tracking-manifest.json") if (gen_dir / "tracking-manifest.json").is_file() else {}
+    if manifest.get("complete") is not True or detail.get("complete", True) is not True:
+        raise ValueError(f"{job.name}: tracking generation {generation[:12]} is not complete")
+    if detail.get("truncated"):
+        raise ValueError(f"{job.name}: tracking generation {generation[:12]} is truncated")
+    bounds = manifest.get("frame_bounds")
+    if not (isinstance(bounds, list) and len(bounds) == 2 and all(isinstance(b, int) for b in bounds)):
+        raise ValueError(f"{job.name}: tracking manifest has no usable frame_bounds")
+    lo, hi = bounds  # inclusive
+    start, end = entry["start_frame"], entry["end_frame"]
+    if start < lo or end - 1 > hi:
+        raise ValueError(
+            f"{job.name}: window [{start}, {end}) is outside the tracked frames [{lo}, {hi}] (inclusive)"
+        )
+    video = detail.get("video") if isinstance(detail.get("video"), dict) else {}
+    if video.get("frame_count") not in (None, entry["source_frame_count"]):
+        raise ValueError(
+            f"{job.name}: job tracked a {video['frame_count']}-frame video but the source clip has "
+            f"{entry['source_frame_count']} frames; frame indices would not line up"
+        )
+    tracks = gen_dir / "tracks.jsonl"
+    if not tracks.is_file():
+        raise ValueError(f"{job.name}: tracking generation has no tracks.jsonl")
+    stats_generation, engine = _stats_context(job, job_manifest)
+    config = detail.get("config") if isinstance(detail.get("config"), dict) else {}
+    pipeline_config = {
+        key: config.get(src, "unknown") for key, src in (
+            ("prompt", "prompt"), ("segmented", "sam31_segmented"),
+            ("segment_window", "sam31_segment_window"), ("segment_overlap", "sam31_segment_overlap"),
+            ("segment_seam_min_score", "sam31_seam_min_score"),
+            ("segment_seam_ambiguity_margin", "sam31_seam_ambiguity_margin"),
+            ("sam31_max_num_objects", "sam31_max_num_objects"),
+        )
+    }
+    pipeline_config["possession_engine"] = engine
+    pipeline_config["tracked_frame_bounds_inclusive"] = [lo, hi]
+    return {
+        "tracks_path": tracks,
+        "job_id": job_manifest.get("job_id") or job.name,
+        "tracking_generation": generation,
+        "stats_generation": stats_generation,
+        "input_fingerprint": manifest.get("input_fingerprint") or job_manifest.get("input_fingerprint") or "unknown",
+        "pipeline_config": pipeline_config,
+    }
+
+
+def slice_tracks(tracks_path: Path, start: int, end: int, out_path: Path) -> tuple[int, int]:
+    """Write rows with start <= frame_index < end, re-indexed to the clip. Returns (rows, distinct frames)."""
+    rows, frames = 0, set()
+    with tracks_path.open(encoding="utf-8") as src, out_path.open("w", encoding="utf-8") as dst:
+        for number, line in enumerate(src, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                frame = row["frame_index"]
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise ValueError(f"{tracks_path.parent.name}/tracks.jsonl line {number}: bad row ({error})") from error
+            if not isinstance(frame, int) or isinstance(frame, bool):
+                raise ValueError(f"{tracks_path.parent.name}/tracks.jsonl line {number}: frame_index must be an int")
+            if start <= frame < end:
+                row["frame_index"] = frame - start
+                dst.write(json.dumps(row) + "\n")
+                rows += 1
+                frames.add(frame)
+    return rows, len(frames)
+
+
+def attach_runs(
+    dataset_dir: Path, attachments: dict[str, Path], *, label: str = "baseline", repo_root: Path,
+) -> dict[str, dict]:
+    """Attach existing downloaded job outputs as the `label` run (free; no pipeline execution)."""
+    manifest = _read_json(dataset_dir / MANIFEST_NAME)
+    entries = {e["clip"]: e for e in manifest.get("clips", [])}
+    if label not in manifest.get("run_labels", []):
+        raise ValueError(f"Run label '{label}' is not in this dataset ({manifest.get('run_labels')})")
+    unknown = set(attachments) - set(entries)
+    if unknown:
+        raise ValueError(f"--attach-run refers to unknown clips: {', '.join(sorted(unknown))}")
+    run_dir = dataset_dir / "runs" / label
+    plans = {}
+    for clip, job in attachments.items():  # validate everything before writing anything
+        target = run_dir / clip
+        for name in ("tracks.jsonl", "run_metadata.json"):
+            if (target / name).exists():
+                raise FileExistsError(f"Run output already exists, refusing to overwrite: {target / name}")
+        if not job.is_dir():
+            raise ValueError(f"{clip}: job folder not found: {job.name}")
+        plans[clip] = inspect_job(job, entries[clip])
+    commit = get_source_commit(repo_root)
+    results = {}
+    for clip, plan in plans.items():
+        entry, target = entries[clip], run_dir / clip
+        target.mkdir(parents=True, exist_ok=True)
+        rows, frames = slice_tracks(plan.pop("tracks_path"), entry["start_frame"], entry["end_frame"],
+                                    target / "tracks.jsonl")
+        metadata = {
+            "schema_version": SCHEMA_VERSION,
+            "clip": clip,
+            "label": label,
+            "kind": "attached_existing_run",
+            "source_job": attachments[clip].name,  # basename only; no local paths in committed provenance
+            **plan,
+            "source_commit": "unknown",  # job folders do not record the code revision
+            "tooling_commit": commit,
+            "window": {"start_frame": entry["start_frame"], "end_frame": entry["end_frame"]},
+            "frame_offset": entry["start_frame"],
+            "frame_index_note": "frame_index in tracks.jsonl = source frame - frame_offset; "
+                                "timestamp_seconds is unchanged (source-relative)",
+            "rows": rows,
+            "frames_with_rows": frames,
+            "clip_frame_count": entry["frame_count"],
+            "warning": (
+                "Tracks come from tracking the FULL source clip, so segment seams and identities differ from "
+                "a run on the cut window. This is a baseline for the window, not a window-specific rerun."
+            ),
+        }
+        (target / "run_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        results[clip] = metadata
+    status_path = run_dir / "RUN_STATUS.json"
+    status = _read_json(status_path) if status_path.is_file() else {"label": label, "clips": sorted(entries)}
+    status.setdefault("attached", {}).update({c: m["job_id"] for c, m in results.items()})
+    status["status"] = "attached" if set(status["attached"]) >= set(status.get("clips", [])) else "partially_attached"
+    status_path.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+    return results
+
+
 def build_review_template(manifest: dict) -> list[dict]:
     """One `clip_review` record per clip. Every semantic field is 'pending' for a human."""
     records = []
@@ -446,8 +610,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frame-stride", type=int, default=10)
     parser.add_argument("--sheet-frames", type=int, default=12, help="Frames per contact sheet.")
     parser.add_argument("--run-label", action="append", help="Run dir label (repeatable). Default: baseline, candidate.")
+    parser.add_argument(
+        "--attach-run", action="append", default=[], metavar="CLIP=JOB_DIR",
+        help="Attach an existing downloaded Modal job folder as the baseline run for CLIP (repeatable). "
+        "Without --window, attaches to the dataset already in --output-dir.",
+    )
+    parser.add_argument("--attach-label", default="baseline", help="Run label --attach-run writes to.")
     parser.add_argument("--validate", type=Path, metavar="MANIFEST", help="Validate a manifest and exit.")
     return parser
+
+
+def print_attached(dataset_dir: Path, label: str, attached: dict[str, dict]) -> None:
+    for clip, meta in attached.items():
+        print(f"Attached {meta['source_job']} as {label} run for {clip}: {meta['rows']} rows over "
+              f"{meta['frames_with_rows']} frames -> {dataset_dir / 'runs' / label / clip}")
+    print("warning: attached tracks come from the FULL source clip, not a rerun on the cut window.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -465,7 +642,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_dir is None:
         print("error: --output-dir is required", file=sys.stderr)
         return 2
+    repo_root = Path(__file__).resolve().parents[2]
     try:
+        attachments = {}
+        for item in args.attach_run:
+            clip, sep, job = item.partition("=")
+            if not sep or not job or clip in attachments:
+                raise ValueError(f"Invalid or repeated --attach-run '{item}': expected CLIP=JOB_DIR")
+            attachments[clip] = Path(job)
+        if attachments and not args.window:
+            attached = attach_runs(args.output_dir, attachments, label=args.attach_label, repo_root=repo_root)
+            print_attached(args.output_dir, args.attach_label, attached)
+            return 0
         notes = {}
         for item in args.note:
             name, sep, text = item.partition("=")
@@ -481,7 +669,11 @@ def main(argv: list[str] | None = None) -> int:
             run_labels=tuple(args.run_label or DEFAULT_RUN_LABELS),
             notes=notes,
             sheet_frames=args.sheet_frames,
-            repo_root=Path(__file__).resolve().parents[2],
+            repo_root=repo_root,
+        )
+        attached = (
+            attach_runs(args.output_dir, attachments, label=args.attach_label, repo_root=repo_root)
+            if attachments else {}
         )
     except (ValueError, FileExistsError) as error:
         print(f"error: {error}", file=sys.stderr)
@@ -496,6 +688,8 @@ def main(argv: list[str] | None = None) -> int:
     print("\nSuggested pipeline commands (NOT EXECUTED; these use GPU credits):")
     for entry in manifest["clips"]:
         print(f"  {entry['suggested_run_command']}")
+    if attached:
+        print_attached(args.output_dir, args.attach_label, attached)
     return 0
 
 
