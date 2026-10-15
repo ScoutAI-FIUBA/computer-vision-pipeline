@@ -35,6 +35,14 @@ _DERIVED_OBSERVATION_FIELDS = frozenset(
     {"stable_player_id", "reid_embedding", "reid_evidence", "team_id", "team_assignment"}
 )
 _RUNTIME_RECEIPT_TOKEN = object()
+# CONTRACT: RuntimeIdentityAuthority is all-or-nothing, with ONE bounded exception.
+# Rows whose reid_evidence.status == "invalid" (e.g. an empty cleaned mask) may be
+# excluded from identity (stable_player_id=None) if they are at most this fraction
+# of all rows; above it the whole clip is rejected and scrubbed as before. The real
+# case that motivated it was 1 of 7,778 rows (0.013%); 1% leaves ~75x headroom
+# while still rejecting clips where ReID evidence is broadly broken.
+IDENTITY_MAX_INVALID_ROW_FRACTION = 0.01
+IDENTITY_EXCLUDED_KEYS_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -615,12 +623,30 @@ class RunnerV2:
         elif structurally_valid and self.seams.team_embedder is not None and downstream_masks is not None:
             prepared_crops = _prepare_masked_crops(rows, frames, downstream_masks)
 
+        excluded_keys: list[str] = []
+        if structurally_valid and self.seams.identity_authority is not None and self.seams.reid is not None:
+            invalid_keys = [
+                str(row.get("observation_key", ""))
+                for row in rows
+                if isinstance(row.get("reid_evidence"), Mapping)
+                and row["reid_evidence"].get("status") == "invalid"
+            ]
+            if invalid_keys and len(invalid_keys) / len(rows) <= IDENTITY_MAX_INVALID_ROW_FRACTION:
+                excluded_keys = invalid_keys
+        excluded = frozenset(excluded_keys)
+        # Excluded rows never reach the resolver, so they cannot seed or bridge
+        # identities; the rest of their raw track still groups by _identity_group.
+        identity_rows = [row for row in rows if str(row.get("observation_key", "")) not in excluded]
+        for row in rows:
+            if str(row.get("observation_key", "")) in excluded:
+                row["stable_player_id"] = None
+
         if structurally_valid:
-            reasons.extend(_resolve_identity(rows, self.seams.identity))
+            reasons.extend(_resolve_identity(identity_rows, self.seams.identity))
             structurally_valid = not reasons
             if structurally_valid:
                 stage_receipts = stage_receipts._with(
-                    stable_identity=frozenset(str(row["observation_key"]) for row in rows),
+                    stable_identity=frozenset(str(row["observation_key"]) for row in identity_rows),
                 )
 
         if structurally_valid and self.seams.team_embedder is not None:
@@ -674,7 +700,7 @@ class RunnerV2:
         authority_decision: IdentityAuthorityDecision | None = None
         if structurally_valid and self.seams.identity_authority is not None:
             authority_rows = [
-                row for row in rows
+                row for row in identity_rows
                 if row.get("stable_player_id") not in conflicted_stable_ids
             ]
             authority_decision = self.seams.identity_authority(authority_rows, stage_receipts)
@@ -682,6 +708,8 @@ class RunnerV2:
                 raise TypeError("identity_authority must return IdentityAuthorityDecision")
             if authority_decision.accepted and not reasons:
                 acceptance_reasons = list(authority_decision.reasons) + team_conflicts
+                if excluded_keys:
+                    acceptance_reasons.append(f"identity_excluded_invalid_rows:{len(excluded_keys)}")
             else:
                 reasons.extend(authority_decision.reasons or ("identity_authority_rejected",))
                 reasons.extend(team_conflicts)
@@ -698,6 +726,9 @@ class RunnerV2:
             acceptance["tracking_identity"] = "rejected"
         elif authority_decision is not None:
             acceptance.update(dict(authority_decision.metadata))
+            if excluded_keys:
+                acceptance["identity_excluded_observations"] = len(excluded_keys)
+                acceptance["identity_excluded_observation_keys"] = excluded_keys[:IDENTITY_EXCLUDED_KEYS_LIMIT]
             acceptance["tracking_identity"] = "accepted"
         if not structurally_valid:
             acceptance_reasons = reasons
