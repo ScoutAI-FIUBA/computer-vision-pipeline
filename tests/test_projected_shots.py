@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -534,3 +535,72 @@ def test_unconfirmed_basket_event_takes_the_non_made_path_without_a_vote():
     assert shot["outcome"] == "unknown"
     assert shot["shooter_attribution_method"] != "action_box_vote"
     assert shot["start_frame_source"] != "action_box_release"
+
+
+def _number_scene() -> tuple[list[dict], list[dict]]:
+    event = [{"event_id": 9, "start_frame_index": 1, "start_image_xy": [10.0, 10.0]}]
+    tracks = [
+        _player(3, "player-007", [0, 0, 20, 20], [2.0, 3.0], 1),
+        _player(5, "player-008", [100, 100, 120, 120], [4.0, 5.0], 1),
+    ]
+    return event, tracks
+
+
+def test_shooter_and_snapshot_numbers_resolve_by_stable_player_id(tmp_path: Path):
+    from pipeline.projected_shots import _load_confirmed_numbers_by_stable_player_id
+
+    numbers_path = tmp_path / "numbers.json"
+    numbers_path.write_text(
+        json.dumps(
+            {
+                "players": [
+                    {"stable_player_id": "player-007", "number": "7", "status": "confirmed"},
+                    {"stable_player_id": "player-008", "number": "8", "status": "ambiguous"},
+                    {"stable_player_id": "player-009", "number": "9", "status": "unknown"},
+                    {"stable_player_id": "player-010", "number": "", "status": "confirmed"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    by_stable = _load_confirmed_numbers_by_stable_player_id(numbers_path)
+    assert by_stable == {"player-007": "7"}
+
+    event, tracks = _number_scene()
+    shot = build_projected_shots(event, tracks, confirmed_numbers_by_stable_player_id=by_stable)["shots"][0]
+
+    assert shot["shooter_confirmed_number"] == "7"
+    assert [row["confirmed_number"] for row in shot["projected_player_snapshot"]] == ["7", None]
+
+
+def test_numbers_fall_back_to_track_mapping_when_no_stable_entry():
+    event, tracks = _number_scene()
+    shot = build_projected_shots(
+        event,
+        tracks,
+        confirmed_numbers_by_track_id={3: "30", 5: "50"},
+        confirmed_numbers_by_stable_player_id={"player-008": "8"},
+    )["shots"][0]
+
+    assert shot["shooter_confirmed_number"] == "30"
+    assert [row["confirmed_number"] for row in shot["projected_player_snapshot"]] == ["30", "8"]
+
+
+def test_stable_number_wins_over_track_mapping():
+    event, tracks = _number_scene()
+    shot = build_projected_shots(
+        event,
+        tracks,
+        confirmed_numbers_by_track_id={3: "30"},
+        confirmed_numbers_by_stable_player_id={"player-007": "7"},
+    )["shots"][0]
+
+    assert shot["shooter_confirmed_number"] == "7"
+
+
+def test_numbers_are_none_without_any_mapping():
+    event, tracks = _number_scene()
+    shot = build_projected_shots(event, tracks)["shots"][0]
+
+    assert shot["shooter_confirmed_number"] is None
+    assert [row["confirmed_number"] for row in shot["projected_player_snapshot"]] == [None, None]

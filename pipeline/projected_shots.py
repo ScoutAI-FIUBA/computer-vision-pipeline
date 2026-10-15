@@ -92,6 +92,33 @@ def _load_confirmed_numbers_by_track_id(path: Path | None) -> dict[int, str]:
     return confirmed
 
 
+def _load_confirmed_numbers_by_stable_player_id(path: Path | None) -> dict[str, str]:
+    if path is None or not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    confirmed: dict[str, str] = {}
+    for player in payload.get("players", []):
+        if player.get("status") != "confirmed":
+            continue
+        if not player.get("stable_player_id") or player.get("number") in (None, "", "unknown"):
+            continue
+        confirmed[str(player["stable_player_id"])] = str(player["number"])
+    return confirmed
+
+
+def _confirmed_number(
+    row: dict,
+    *,
+    confirmed_numbers_by_track_id: dict[int, str],
+    confirmed_numbers_by_stable_player_id: dict[str, str],
+) -> str | None:
+    stable_player_id = row.get("stable_player_id")
+    if stable_player_id is not None and stable_player_id in confirmed_numbers_by_stable_player_id:
+        return confirmed_numbers_by_stable_player_id[stable_player_id]
+    track_id = row.get("track_id")
+    return None if track_id is None else confirmed_numbers_by_track_id.get(int(track_id))
+
+
 def _load_team_ids_by_track_id(path: Path | None) -> dict[int, int]:
     if path is None or not path.exists():
         return {}
@@ -185,13 +212,23 @@ def _nearest_projected_frame(frame_indexes: list[int], target_frame_index: int, 
     return best_frame_index
 
 
-def _snapshot_row(row: dict, *, team_ids_by_track_id: dict[int, int], confirmed_numbers_by_track_id: dict[int, str]) -> dict:
+def _snapshot_row(
+    row: dict,
+    *,
+    team_ids_by_track_id: dict[int, int],
+    confirmed_numbers_by_track_id: dict[int, str],
+    confirmed_numbers_by_stable_player_id: dict[str, str],
+) -> dict:
     track_id = None if row.get("track_id") is None else int(row["track_id"])
     return {
         "track_id": track_id,
         "stable_player_id": row.get("stable_player_id"),
         "team_id": None if track_id is None else team_ids_by_track_id.get(track_id),
-        "confirmed_number": None if track_id is None else confirmed_numbers_by_track_id.get(track_id),
+        "confirmed_number": _confirmed_number(
+            row,
+            confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+            confirmed_numbers_by_stable_player_id=confirmed_numbers_by_stable_player_id,
+        ),
         "track_state": row.get("track_state"),
         "image_foot_xy": [float(value) for value in row.get("image_foot_xy", [])[:2]],
         "court_xy_m": [float(value) for value in row.get("court_xy_m", [])[:2]],
@@ -414,16 +451,19 @@ def build_projected_shots(
     max_frame_gap: int = 6,
     team_ids_by_track_id: dict[int, int] | None = None,
     confirmed_numbers_by_track_id: dict[int, str] | None = None,
+    confirmed_numbers_by_stable_player_id: dict[str, str] | None = None,
     raw_prediction_rows: list[dict] | None = None,
 ) -> dict:
     """Build shot projections; track-keyed team/number fields are compatibility enrichment.
 
     ``stable_player_id`` is the canonical player identity. Raw track IDs remain in the
     artifact only as frame-local provenance because the existing team/number APIs are
-    track-keyed and do not provide stable-player keyed lookups yet.
+    track-keyed and do not provide stable-player keyed lookups yet. Confirmed numbers are
+    resolved from ``confirmed_numbers_by_stable_player_id`` first, then the track-keyed map.
     """
     team_ids_by_track_id = team_ids_by_track_id or {}
     confirmed_numbers_by_track_id = confirmed_numbers_by_track_id or {}
+    confirmed_numbers_by_stable_player_id = confirmed_numbers_by_stable_player_id or {}
     projected_by_frame = _group_projected_tracks_by_frame(projected_tracks)
     available_frame_indexes = sorted(projected_by_frame)
     raw_rows_by_frame = (
@@ -447,6 +487,7 @@ def build_projected_shots(
                     row,
                     team_ids_by_track_id=team_ids_by_track_id,
                     confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+                    confirmed_numbers_by_stable_player_id=confirmed_numbers_by_stable_player_id,
                 )
                 for row in sorted(frame_rows, key=lambda row: (row.get("track_id") is None, row.get("track_id")))
             ]
@@ -465,6 +506,7 @@ def build_projected_shots(
                             row,
                             team_ids_by_track_id=team_ids_by_track_id,
                             confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+                            confirmed_numbers_by_stable_player_id=confirmed_numbers_by_stable_player_id,
                         )
                         for row in sorted(
                             projected_by_frame.get(vote.release_frame, []),
@@ -524,8 +566,12 @@ def build_projected_shots(
                 "shooter_stable_player_id": shooter_stable_player_id,
                 "shooter_team_id": None if shooter_track_id is None else team_ids_by_track_id.get(shooter_track_id),
                 "shooter_confirmed_number": None
-                if shooter_track_id is None
-                else confirmed_numbers_by_track_id.get(shooter_track_id),
+                if shooter_row is None
+                else _confirmed_number(
+                    shooter_row,
+                    confirmed_numbers_by_track_id=confirmed_numbers_by_track_id,
+                    confirmed_numbers_by_stable_player_id=confirmed_numbers_by_stable_player_id,
+                ),
                 "shooter_attribution_method": attribution_method,
                 "projected_player_snapshot": snapshot_rows,
             }
@@ -613,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         max_frame_gap=args.max_frame_gap,
         team_ids_by_track_id=_load_team_ids_by_track_id(args.teams),
         confirmed_numbers_by_track_id=_load_confirmed_numbers_by_track_id(args.numbers),
+        confirmed_numbers_by_stable_player_id=_load_confirmed_numbers_by_stable_player_id(args.numbers),
     )
     output_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     if args.output_image is not None:

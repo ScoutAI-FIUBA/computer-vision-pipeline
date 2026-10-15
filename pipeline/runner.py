@@ -59,7 +59,11 @@ from pipeline.possession_v3 import (
     PossessionResolver, derive_ball_primitives, derive_ball_transitions, classify_transition,
     normalize_ball_rows, score_candidates, score_candidates_v4, debounce_reverted_switches, V3_CONTRACT_VERSION, _point,
 )
-from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
+from pipeline.projected_shots import (
+    _load_confirmed_numbers_by_stable_player_id,
+    build_projected_shots,
+    write_projected_shots_image,
+)
 from pipeline.reid import Embedder, build_embedder
 from pipeline.results import (
     RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter, write_v3_artifacts,
@@ -915,6 +919,7 @@ def _maybe_write_projected_shots(output_dir: Path) -> tuple[str | None, str | No
         projected_tracks,
         team_ids_by_track_id=_load_team_ids_by_track_id(output_dir / TEAMS_FILENAME),
         confirmed_numbers_by_track_id=_load_confirmed_numbers_by_track_id(output_dir / NUMBERS_FILENAME),
+        confirmed_numbers_by_stable_player_id=_load_confirmed_numbers_by_stable_player_id(output_dir / NUMBERS_FILENAME),
         raw_prediction_rows=(
             _load_jsonl_rows(output_dir / SHOT_RAW_PREDICTIONS_FILENAME)
             if (output_dir / SHOT_RAW_PREDICTIONS_FILENAME).exists()
