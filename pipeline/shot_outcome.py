@@ -5,16 +5,21 @@ trajectory around the detected rim can still show the ball coming from above, cr
 zone and leaving below it. Only that pattern upgrades an event; anything ambiguous keeps the
 existing outcome (prefer unknown over made).
 
+A "made" event resolved only by a ball-in-basket detection is downgraded to unknown (not missed:
+no evidence is not proof of a miss) when no ball was seen near the rim around that detection.
+
 Event fields added here (only when the refinement runs):
     outcome_source: "ball_in_basket" | "rim_trajectory" | "shot_detector" (missed/unknown).
     rim_pass_frame_index / rim_exit_frame_index: the first in-zone ball point and the exit point,
         None unless the outcome was upgraded. ball_in_basket_frame_index is never faked.
+    ball_near_rim_evidence: only on ball_in_basket events whose rim is known around the detection.
 """
 
 from __future__ import annotations
 
 import bisect
 import json
+import math
 import os
 from pathlib import Path
 
@@ -48,6 +53,13 @@ RELEVANT_MAX_ABS_U = 2.0
 RELEVANT_MAX_ABS_V = 3.0
 ABOVE_TO_ZONE_MAX_FRAMES = 30
 ZONE_TO_EXIT_MAX_FRAMES = 45
+# The detector's ball-in-basket class also fires on a bare rim/net. A basket detection only stands as
+# "made" when a ball was seen this close to the rim (Euclidean, in rim widths) shortly before it.
+BASKET_BALL_MAX_RIM_WIDTHS = 2.0
+# Frames, not seconds: the clips run at 60 fps and a longer after-window reaches a ball at the net
+# that is the effect of the detection, not evidence for it.
+BASKET_BALL_WINDOW_BEFORE_FRAMES = 60
+BASKET_BALL_WINDOW_AFTER_FRAMES = 10
 UPGRADABLE_REASONS = {"shot_timeout", "new_shot_started", "end_of_clip"}
 
 
@@ -141,18 +153,28 @@ def find_rim_pass(
     return None
 
 
+def nearest_ball_rim_distance(
+    all_normalized: list[tuple[int, float, float]], window_start: int, window_end: int
+) -> float | None:
+    """Smallest ball-to-rim distance in rim widths among the points inside the frame window."""
+    distances = [math.hypot(u, v) for frame, u, v in all_normalized if window_start <= frame <= window_end]
+    return min(distances) if distances else None
+
+
 def refine_shot_events(events: list[dict], raw_rows: list[dict], ball_rows: list[dict]) -> list[dict]:
     rims = _rim_boxes_by_frame(raw_rows)
     rim_frames = sorted(rims)
     points = _ball_points(raw_rows, ball_rows)
-    window_frames = round(WINDOW_AFTER_LAST_SHOT_SECONDS * _frames_per_second(raw_rows))
-    normalized: list[tuple[int, float, float]] = []
+    fps = _frames_per_second(raw_rows)
+    window_frames = round(WINDOW_AFTER_LAST_SHOT_SECONDS * fps)
+    all_normalized: list[tuple[int, float, float]] = []
     for frame, x, y in points:
         rim = _rim_for_frame(rims, rim_frames, frame)
         if rim is not None:
-            u, v = (x - rim[0]) / rim[2], (y - rim[1]) / rim[2]
-            if abs(u) <= RELEVANT_MAX_ABS_U and abs(v) <= RELEVANT_MAX_ABS_V:
-                normalized.append((frame, u, v))
+            all_normalized.append((frame, (x - rim[0]) / rim[2], (y - rim[1]) / rim[2]))
+    normalized = [
+        point for point in all_normalized if abs(point[1]) <= RELEVANT_MAX_ABS_U and abs(point[2]) <= RELEVANT_MAX_ABS_V
+    ]
 
     refined = []
     for event in events:
@@ -175,6 +197,20 @@ def refine_shot_events(events: list[dict], raw_rows: list[dict], ball_rows: list
                     rim_pass_frame_index=rim_pass[0],
                     rim_exit_frame_index=rim_pass[1],
                 )
+        if (
+            event["outcome_source"] == "ball_in_basket"
+            and event.get("outcome") == "made"
+            and event.get("ball_in_basket_frame_index") is not None
+        ):
+            basket_frame = int(event["ball_in_basket_frame_index"])
+            window_start, window_end = basket_frame - BASKET_BALL_WINDOW_BEFORE_FRAMES, basket_frame + BASKET_BALL_WINDOW_AFTER_FRAMES
+            # Without any rim box there is no evidence either way, so the event is left alone.
+            if any(_rim_for_frame(rims, rim_frames, frame) is not None for frame in range(window_start, window_end + 1)):
+                distance = nearest_ball_rim_distance(all_normalized, window_start, window_end)
+                near = distance is not None and distance <= BASKET_BALL_MAX_RIM_WIDTHS
+                event["ball_near_rim_evidence"] = near
+                if not near:
+                    event.update(outcome="unknown", resolution_reason="ball_in_basket_unconfirmed")
         refined.append(event)
     return refined
 

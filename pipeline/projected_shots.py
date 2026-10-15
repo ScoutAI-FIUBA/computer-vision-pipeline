@@ -292,6 +292,8 @@ class ActionVote:
 
 def _made_anchor_frame_index(event: dict) -> int | None:
     # A trajectory-made event has no basket detection; the rim pass is the frame the made shot is anchored to.
+    if event.get("outcome") != "made":
+        return None
     for key in ("ball_in_basket_frame_index", "rim_pass_frame_index"):
         if event.get(key) is not None:
             return event[key]

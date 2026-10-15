@@ -189,16 +189,104 @@ def test_no_rim_means_no_rule():
     assert refine_one(MADE_PATH, rim_frames=[])["outcome"] == "missed"
 
 
-def test_ball_in_basket_events_are_never_overridden_or_modified():
-    resolved = event(outcome="made", resolution_reason="ball_in_basket", ball_in_basket_frame_index=44)
+def basket_event(**overrides) -> dict:
+    return event(outcome="made", resolution_reason="ball_in_basket", ball_in_basket_frame_index=100, **overrides)
 
-    refined = refine_shot_events([resolved], raw_rows(range(0, 201)), balls(MADE_PATH))[0]
+
+def refine_basket(ball_path, *, rim_frames=range(0, 201), raw=None, **event_overrides) -> dict:
+    rows = raw if raw is not None else raw_rows(rim_frames)
+    return refine_shot_events([basket_event(**event_overrides)], rows, balls(ball_path))[0]
+
+
+def test_ball_in_basket_events_with_a_ball_near_the_rim_stay_made():
+    refined = refine_basket([(90, 0.3, -1.0), (96, 0.0, -0.2)])
 
     assert refined["outcome"] == "made"
     assert refined["resolution_reason"] == "ball_in_basket"
     assert refined["outcome_source"] == "ball_in_basket"
-    assert refined["ball_in_basket_frame_index"] == 44
+    assert refined["ball_in_basket_frame_index"] == 100
     assert refined["rim_pass_frame_index"] is None
+    assert refined["ball_near_rim_evidence"] is True
+
+
+def test_basket_detection_with_the_ball_far_from_the_rim_becomes_unknown():
+    original = basket_event()
+
+    refined = refine_basket([(frame, 8.0, 0.0) for frame in range(40, 111, 5)])
+
+    assert refined["outcome"] == "unknown"
+    assert refined["resolution_reason"] == "ball_in_basket_unconfirmed"
+    assert refined["outcome_source"] == "ball_in_basket"
+    assert refined["ball_near_rim_evidence"] is False
+    for key in ("event_id", "shot_type", "start_frame_index", "end_frame_index", "resolved_frame_index", "ball_in_basket_frame_index"):
+        assert refined[key] == original[key]
+
+
+def test_basket_detection_without_any_ball_becomes_unknown():
+    assert refine_basket([])["outcome"] == "unknown"
+
+
+def test_basket_detection_without_rim_boxes_is_left_alone():
+    refined = refine_basket([(frame, 8.0, 0.0) for frame in range(40, 111, 5)], rim_frames=[])
+
+    assert refined["outcome"] == "made"
+    assert refined["resolution_reason"] == "ball_in_basket"
+    assert "ball_near_rim_evidence" not in refined
+
+
+def test_rim_box_only_far_outside_the_window_is_not_a_rim_for_the_window():
+    refined = refine_basket([(frame, 8.0, 0.0) for frame in range(40, 111, 5)], rim_frames=[0, 1, 2])
+
+    assert refined["outcome"] == "made"
+
+
+def test_tracknet_only_and_detector_only_balls_both_give_evidence():
+    near = (95, 0.5, 0.0)
+    assert refine_basket([near])["ball_near_rim_evidence"] is True
+
+    ball_box = {"class_id": 0, "class": "ball", "confidence": 0.8, "x": RIM_X + 0.5 * RIM_W, "y": RIM_Y, "width": 10, "height": 10}
+    rows = raw_rows(range(0, 201))
+    rows[95]["predictions"].append(ball_box)
+    detector_only = refine_shot_events([basket_event()], rows, [])[0]
+    assert detector_only["outcome"] == "made"
+    assert detector_only["ball_near_rim_evidence"] is True
+
+
+def test_weak_detector_ball_and_lost_tracknet_rows_give_no_evidence():
+    ball_box = {"class_id": 0, "class": "ball", "confidence": 0.4, "x": RIM_X, "y": RIM_Y, "width": 10, "height": 10}
+    rows = raw_rows(range(0, 201))
+    rows[95]["predictions"].append(ball_box)
+    lost = {**tracknet_row(96, 0.0, 0.0), "track_state": "lost"}
+
+    assert refine_shot_events([basket_event()], rows, [lost])[0]["outcome"] == "unknown"
+
+
+def test_ball_distance_threshold_boundary():
+    # Euclidean in rim widths: (1.2, 1.6) is exactly 2.0 away.
+    assert refine_basket([(95, 1.2, 1.6)])["outcome"] == "made"
+    assert refine_basket([(95, 1.2, 1.7)])["outcome"] == "unknown"
+
+
+def test_frame_window_boundary():
+    near = (0.0, 0.0)
+    assert refine_basket([(40, *near)])["outcome"] == "made"
+    assert refine_basket([(39, *near)])["outcome"] == "unknown"
+    assert refine_basket([(110, *near)])["outcome"] == "made"
+    assert refine_basket([(111, *near)])["outcome"] == "unknown"
+
+
+def test_trajectory_upgraded_events_are_not_second_guessed():
+    refined = refine_one(MADE_PATH)
+
+    assert refined["resolution_reason"] == "rim_trajectory"
+    assert "ball_near_rim_evidence" not in refined
+
+
+def test_missed_and_unknown_events_are_never_touched_by_the_basket_check():
+    for outcome in ("missed", "unknown"):
+        refined = refine_one([], outcome=outcome, resolution_reason="end_of_clip", ball_in_basket_frame_index=100)
+        assert refined["outcome"] == outcome
+        assert "ball_near_rim_evidence" not in refined
 
 
 def test_input_events_are_not_mutated():

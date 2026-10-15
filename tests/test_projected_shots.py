@@ -523,3 +523,14 @@ def test_basket_frame_wins_over_rim_pass_as_vote_anchor():
     shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
 
     assert shot["shooter_attribution_method"] == "action_box_vote"
+
+
+def test_unconfirmed_basket_event_takes_the_non_made_path_without_a_vote():
+    tracks, raw = _vote_scene()
+    event = {**_made_event(), "outcome": "unknown", "resolution_reason": "ball_in_basket_unconfirmed"}
+
+    shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["outcome"] == "unknown"
+    assert shot["shooter_attribution_method"] != "action_box_vote"
+    assert shot["start_frame_source"] != "action_box_release"
