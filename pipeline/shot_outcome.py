@@ -26,14 +26,14 @@ from pathlib import Path
 from pipeline.shot_events import (
     BALL_CLASS_NAMES,
     BALL_CLASS_ID,
+    RIM_CLASS_ID,
+    RIM_CLASS_NAMES,
     comparable_prediction_confidence,
     prediction_center_xy,
     prediction_matches,
     prediction_xyxy,
 )
 
-RIM_CLASS_ID = 9
-RIM_CLASS_NAMES = {"rim"}
 RIM_FALLBACK_FRAMES = 30
 BALL_BOX_MIN_CONFIDENCE = 0.6
 # The window starts at the event's first shot frame and ends this long after its last one.

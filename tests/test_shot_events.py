@@ -44,6 +44,7 @@ def test_shot_frame_signals_match_verified_notebook_class_ids():
         "shot_signal_confidence": None,
         "shot_signal_xyxy": None,
         "shot_signal_center_xy": None,
+        "ball_rim_distance": None,
     }
 
 
@@ -1710,3 +1711,160 @@ def test_unknown_event_at_end_of_clip_uses_the_vote():
 
     assert event["outcome"] == "unknown"
     assert event["shot_type"] == "jump_shot"
+
+
+# Ball-to-rim filter for events opened through the suppressed-burst release.
+RIM_BOX = {"class_id": 9, "class": "rim", "confidence": 0.9, "x": 500, "y": 300, "width": 40, "height": 30}
+
+
+def _ball_box(x: float, y: float, confidence: float = 0.8) -> dict:
+    return {"class_id": 0, "class": "ball", "confidence": confidence, "x": x, "y": y, "width": 10, "height": 10}
+
+
+def _near_ball() -> list[dict]:
+    # 20 px from the rim centre = 0.5 rim widths.
+    return [RIM_BOX, _ball_box(520, 300)]
+
+
+def _far_ball() -> list[dict]:
+    # 200 px from the rim centre = 5 rim widths.
+    return [RIM_BOX, _ball_box(700, 300)]
+
+
+def _with(result: dict, extra: list[dict]) -> dict:
+    return {"predictions": result["predictions"] + extra}
+
+
+def _released_steps(extra_by_frame: dict[int, list[dict]] | None = None) -> list[tuple[int, float, dict]]:
+    extra_by_frame = extra_by_frame or {}
+    steps = [
+        (100, 3.0, _shot_box(0.45)),
+        (110, 3.3, _shot_box(0.7)),
+        (111, 3.33, _shot_box(0.7)),
+        (112, 3.37, _shot_box(0.7)),
+    ]
+    return [(f, t, _with(r, extra_by_frame.get(f, []))) for f, t, r in steps]
+
+
+def test_shot_frame_signals_report_ball_rim_distance_in_rim_widths():
+    signals = shot_frame_signals(detection_frame(*_near_ball()))
+
+    assert signals["ball_rim_distance"] == pytest.approx(0.5)
+    assert shot_frame_signals(frame(5))["ball_rim_distance"] is None
+    assert shot_frame_signals(detection_frame(RIM_BOX, _ball_box(520, 300, 0.5)))["ball_rim_distance"] is None
+    assert shot_frame_signals(detection_frame(_ball_box(520, 300)))["ball_rim_distance"] is None
+
+
+def test_shot_signal_trace_record_works_for_released_candidate():
+    candidate, _, _ = _run_steps(_released_steps({111: _far_ball()}))
+
+    record = shot_signal_trace_record(
+        frame_index=112,
+        timestamp_seconds=3.37,
+        signals=shot_frame_signals(_shot_box(0.7)),
+        candidate=candidate,
+        resolved_event=None,
+    )
+    assert record["event_state"] == "active"
+    assert record["event_id"] == 1
+
+
+def test_released_far_from_rim_is_dropped_on_new_shot_started_and_ids_are_not_renumbered():
+    far = {f: _far_ball() for f in (110, 111, 112, 120)}
+    candidate, events, next_event_id = _run_steps(
+        _released_steps(far) + [(120, 3.7, frame()), (200, 6.7, _shot_box(0.7))]
+    )
+
+    assert events == []
+    assert candidate.event_id == 2
+    assert not candidate.released
+    assert next_event_id == 3
+
+
+def test_released_far_from_rim_is_dropped_on_shot_timeout():
+    far = {f: _far_ball() for f in (110, 111, 112)}
+    _, events, _ = _run_steps(_released_steps(far) + [(400, 9.0, frame())])
+
+    assert events == []
+
+
+def test_released_far_from_rim_is_dropped_at_end_of_clip_once_the_window_elapsed():
+    far = {f: _far_ball() for f in (110, 111, 112)}
+    candidate, _, _ = _run_steps(_released_steps(far))
+
+    assert flush_open_shot_event(candidate, frame_index=200, timestamp_seconds=3.37 + 1.5) is None
+
+
+def test_released_close_to_rim_is_kept():
+    extra = {110: _far_ball(), 111: _far_ball(), 112: _near_ball()}
+    _, events, _ = _run_steps(_released_steps(extra) + [(400, 9.0, frame())])
+
+    assert [event["outcome"] for event in events] == ["missed"]
+
+
+def test_released_close_ball_in_the_run_before_release_counts():
+    extra = {110: _near_ball(), 111: _far_ball(), 112: _far_ball()}
+    _, events, _ = _run_steps(_released_steps(extra) + [(400, 9.0, frame())])
+
+    assert len(events) == 1
+
+
+def test_released_made_by_ball_in_basket_is_kept_even_if_the_ball_is_far():
+    far = {f: _far_ball() for f in (110, 111, 112, 130)}
+    _, events, _ = _run_steps(_released_steps(far) + [(130, 3.8, _with(frame(1), _far_ball()))])
+
+    assert [event["outcome"] for event in events] == ["made"]
+
+
+def test_released_without_rim_or_without_ball_in_the_same_frame_fails_open():
+    # Ball in one frame and rim in another never pair up.
+    extra = {110: [RIM_BOX], 111: [_ball_box(700, 300)], 112: [_ball_box(700, 300)]}
+    candidate, _, _ = _run_steps(_released_steps(extra))
+
+    assert candidate.min_ball_rim_distance is None
+    assert flush_open_shot_event(candidate, frame_index=200, timestamp_seconds=10.0) is not None
+    _, events, _ = _run_steps(_released_steps(extra) + [(400, 9.0, frame())])
+    assert len(events) == 1
+
+
+def test_released_far_from_rim_is_kept_when_the_clip_ends_before_the_window_elapsed():
+    far = {f: _far_ball() for f in (110, 111, 112)}
+    candidate, _, _ = _run_steps(_released_steps(far))
+
+    event = flush_open_shot_event(candidate, frame_index=150, timestamp_seconds=3.37 + 1.4)
+    assert event is not None
+    assert event["outcome"] == "unknown"
+
+
+def test_non_released_candidate_far_from_rim_is_not_dropped():
+    steps = [
+        (110, 3.3, _with(_shot_box(0.7), _far_ball())),
+        (111, 3.33, _with(_shot_box(0.7), _far_ball())),
+        (112, 3.37, _with(_shot_box(0.7), _far_ball())),
+        (400, 9.0, frame()),
+    ]
+    candidate, events, _ = _run_steps(steps)
+
+    assert [event["outcome"] for event in events] == ["missed"]
+    assert events[0]["resolution_reason"] == "shot_timeout"
+
+
+def test_ball_rim_window_includes_one_and_a_half_seconds_after_the_latest_shot_box_but_not_later():
+    base = _released_steps({f: _far_ball() for f in (110, 111, 112)})
+
+    on_boundary, _, _ = _run_steps(base + [(150, 3.37 + 1.5, _with(frame(), _near_ball()))])
+    assert on_boundary.min_ball_rim_distance == pytest.approx(0.5)
+
+    after, _, _ = _run_steps(base + [(151, 3.37 + 1.51, _with(frame(), _near_ball()))])
+    assert after.min_ball_rim_distance > 1.25
+
+
+def test_ball_rim_window_follows_the_latest_shot_box_not_the_run_start():
+    # Rim reached 1.9 s after the run start but 1.4 s after its last shot box.
+    steps = _released_steps({f: _far_ball() for f in (110, 111)}) + [
+        (150, 4.9, _shot_box(0.7)),
+        (190, 6.3, _with(frame(), _near_ball())),
+    ]
+    candidate, _, _ = _run_steps(steps)
+
+    assert candidate.min_ball_rim_distance == pytest.approx(0.5)
