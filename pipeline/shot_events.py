@@ -29,6 +29,9 @@ OPENING_CONFIRMATION_WINDOW_SECONDS = 0.3
 POST_MADE_SUPPRESSION_SECONDS = 2.0
 MISSED_SHOT_TIMEOUT_SECONDS = 5.0
 LOW_CONFIDENCE_BURST_THRESHOLD = 0.5
+# A weak first box must not swallow the confident boxes that follow it (a real shot often starts
+# with one weak box); two consecutive confident boxes rule out a lone confident false positive.
+SUPPRESSED_BURST_RELEASE_CONFIDENT_FRAMES = 2
 # The event type is a confidence-weighted vote over the last burst of shot boxes. A single stray
 # box of the other class (a jump shot read once as a layup) must not relabel the whole event.
 SHOT_TYPE_BURST_GAP_SECONDS = 0.3
@@ -67,6 +70,9 @@ class SuppressedShotBurst:
     latest_shot_frame_index: int
     latest_shot_timestamp_seconds: float | None
     shot_signal_active: bool = True
+    # Current run of consecutive confident shot frames, kept so a release loses nothing:
+    # (frame_index, timestamp_seconds, shot_type, confidence, center_xy, xyxy).
+    confident_run: list[tuple] = field(default_factory=list)
 
 
 def shot_signal_trace_record(
@@ -470,14 +476,48 @@ def update_shot_event_candidate(
     if isinstance(candidate, SuppressedShotBurst):
         if not has_shot_signal:
             candidate.shot_signal_active = False
+            candidate.confident_run = []
             return candidate, None, next_event_id
         shot_gap_seconds = elapsed_seconds(candidate.latest_shot_timestamp_seconds, timestamp_seconds)
         if candidate.shot_signal_active or (shot_gap_seconds is not None and shot_gap_seconds < SAME_EVENT_WINDOW_SECONDS):
-            candidate.shot_signal_active = True
-            candidate.latest_shot_frame_index = frame_index
-            candidate.latest_shot_timestamp_seconds = timestamp_seconds
-            return candidate, None, next_event_id
-        candidate = None
+            confidence = signals.get("shot_signal_confidence")
+            if confidence is not None and float(confidence) < LOW_CONFIDENCE_BURST_THRESHOLD:
+                candidate.confident_run = []
+            else:
+                candidate.confident_run.append(
+                    (
+                        frame_index,
+                        timestamp_seconds,
+                        shot_type,
+                        None if confidence is None else float(confidence),
+                        signals.get("shot_signal_center_xy"),
+                        signals.get("shot_signal_xyxy"),
+                    )
+                )
+            if len(candidate.confident_run) < SUPPRESSED_BURST_RELEASE_CONFIDENT_FRAMES:
+                candidate.shot_signal_active = True
+                candidate.latest_shot_frame_index = frame_index
+                candidate.latest_shot_timestamp_seconds = timestamp_seconds
+                return candidate, None, next_event_id
+            # Release: open the candidate as if it had started at the run's first frame; the
+            # current frame is then handled below like any later frame of a live candidate.
+            first, *rest = candidate.confident_run
+            candidate = ShotEventCandidate(
+                event_id=next_event_id,
+                shot_type=first[2],
+                start_frame_index=first[0],
+                start_timestamp_seconds=first[1],
+                start_image_xy=first[4],
+                start_shot_xyxy=first[5],
+                latest_shot_frame_index=first[0],
+                latest_shot_timestamp_seconds=first[1],
+                latest_shot_image_xy=first[4],
+                latest_shot_xyxy=first[5],
+                shot_frames=[(entry[0], entry[1], entry[2], entry[3]) for entry in [first, *rest[:-1]]],
+            )
+            next_event_id += 1
+        else:
+            candidate = None
 
     if should_suppress_shot_burst(candidate, signals):
         return (
