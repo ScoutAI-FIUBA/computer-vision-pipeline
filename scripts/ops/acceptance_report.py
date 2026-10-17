@@ -4,7 +4,8 @@
 Usage:
     python scripts/ops/acceptance_report.py --log run.log --job outputs/<id>-job/<id> \
         [--commit SHA] [--replay-output DIR|FILE.mp4] [--notes FILE.md] \
-        [--also-log RUN2.log ...] [--json] [--output FILE]
+        [--also-log RUN2.log ...] [--gpu-rate-usd-per-hour RATE] [--video-seconds S] \
+        [--volume-listing-before FILE --volume-listing-after FILE] [--json] [--output FILE]
     python scripts/ops/acceptance_report.py --diff A.json B.json
 
 Every figure comes from the log or the downloaded job folder. Anything the
@@ -192,6 +193,9 @@ def parse_log(text: str) -> dict[str, Any]:
         round(last_ts - first_ts, 3) if first_ts is not None and last_ts > first_ts else None
     )
     out["final_json"] = _find_final_json(clean_text)
+    timing = parse_timing_lines(lines)
+    out["timing_stages"] = timing["stages"]
+    out["timing_jobs"] = timing["jobs"]
     return out
 
 
@@ -465,8 +469,370 @@ def inspect_job(job_dir: Path) -> dict[str, Any]:
     return info
 
 
+# ------------------------------------------------------- performance and cost
+STAGES = ("tracking", "stats", "possession")
+METRICS_FILE = "stage_metrics.json"
+API_KEYS = (
+    "roboflow_shot_detection_frames", "roboflow_court_detection_frames",
+    "roboflow_number_detector_frames", "roboflow_ocr_crops",
+)
+_TIMING_STAGE = re.compile(
+    r"\[v2-timing\]\s+stage=(\S+)\s+started=(\S+)\s+finished=(\S+)\s+elapsed=(-?[0-9.]+)s?\s+"
+    r"timeout_margin=(-?[0-9.]+)s?\s+gpu=(.*)$"
+)
+_TIMING_JOB = re.compile(r"\[v2-timing\]\s+job\s+id=(\S+)\s+total_wall_seconds=(-?[0-9.]+)")
+_SIZE_UNITS = {
+    "b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
+    "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
+}
+_HUMAN_SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)\s*[│|]?\s*$", re.I)
+_BOX = str.maketrans({c: " " for c in "│┃┆┇┊┋║┌┐└┘├┤┬┴┼─━═╭╮╯╰┏┓┗┛"})
+REASON_NO_METRICS = "run predates stage metrics"
+REASON_NO_RATE = "pass the rate from the Modal plan"
+DISCLAIMER = (
+    "Estimates, not the invoice; the Modal dashboard is the source of truth. The lower figure is GPU "
+    "time only (sum of container-side stage elapsed): container CPU/memory and cold start are excluded. "
+    "The upper figure uses client-side wall time, which adds cold start, model load and transfer."
+)
+
+
+def _num(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _nm(reason: str, **extra: Any) -> dict[str, Any]:
+    return {"status": NOT_MEASURED, "reason": reason, **extra}
+
+
+def parse_timing_lines(lines: list[str]) -> dict[str, Any]:
+    stages: list[dict[str, Any]] = []
+    jobs: list[dict[str, Any]] = []
+    for line in lines:
+        if m := _TIMING_STAGE.search(line):
+            gpu = m.group(6).strip()
+            stages.append({
+                "stage": m.group(1), "started": m.group(2), "finished": m.group(3),
+                "elapsed_seconds": float(m.group(4)), "timeout_margin_seconds": float(m.group(5)),
+                "gpu": None if gpu.lower() in ("none", "") else gpu,
+            })
+        elif m := _TIMING_JOB.search(line):
+            jobs.append({"job_id": None if m.group(1) == "none" else m.group(1),
+                         "total_wall_seconds": float(m.group(2))})
+    return {"stages": stages, "jobs": jobs}
+
+
+def read_stage_metrics(job_dir: Path, job: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per stage: current generation id, its metrics (or None) and how many generations have metrics."""
+    out: dict[str, dict[str, Any]] = {}
+    for stage in STAGES:
+        stage_dir = job_dir / stage
+        gens_root = stage_dir / "generations"
+        published = sorted(p for p in gens_root.iterdir() if p.is_dir()) if gens_root.is_dir() else []
+        current = _read_json(stage_dir / "current.json")
+        current_id = (current.get("generation") if isinstance(current, dict) else None) or job.get(f"{stage}_generation")
+        found: dict[str, dict[str, Any]] = {}
+        invalid = 0
+        for gen in published:
+            path = gen / METRICS_FILE
+            if not path.is_file():
+                continue
+            doc = _read_json(path)
+            if isinstance(doc, dict) and _num(doc.get("elapsed_seconds")) is not None:
+                found[gen.name] = doc
+            else:
+                invalid += 1
+        out[stage] = {
+            "generation": current_id,
+            "published": [p.name for p in published],
+            "bytes_by_generation": {p.name: _dir_bytes(p) for p in published},
+            "metrics": found.get(current_id) if current_id else None,
+            "generations_with_metrics": len(found),
+            "invalid_metrics_files": invalid,
+        }
+    return out
+
+
+def _gpu_from_metrics(doc: dict[str, Any]) -> dict[str, Any] | None:
+    gpu = doc.get("gpu")
+    if not isinstance(gpu, dict):
+        return None
+    return {"name": gpu.get("name"), "memory_mib": gpu.get("memory_mib")}
+
+
+def parse_volume_listing(text: str) -> dict[str, Any]:
+    """Total file bytes from a JSON {path: bytes} or a `modal volume ls` text copy; fail soft."""
+    result: dict[str, Any] = {"total_bytes": None, "files": 0, "approximate": False,
+                              "unparsed_lines": 0, "format": None}
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            doc = json.loads(stripped)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict):
+            sizes = [int(v) for v in doc.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            result.update(format="json", files=len(sizes), total_bytes=sum(sizes))
+            return result
+    total = files = unparsed = 0
+    approx = False
+    for raw in _clean_lines(text):
+        line = raw.translate(_BOX).strip()
+        if not line or set(line) <= set("-=+ "):
+            continue
+        parts = line.split()
+        if re.search(r"\bdir(ectory)?\b", line, re.I) and not _HUMAN_SIZE.search(line):
+            continue
+        if len(parts) < 2:
+            unparsed += 1
+            continue
+        if m := _HUMAN_SIZE.search(line):
+            unit = m.group(2).lower()
+            total += int(float(m.group(1)) * _SIZE_UNITS[unit])
+            approx = approx or unit != "b"
+            files += 1
+        elif re.fullmatch(r"\d+", parts[-1]):
+            total += int(parts[-1])
+            files += 1
+        else:
+            unparsed += 1
+    result.update(format="text", files=files, approximate=approx, unparsed_lines=unparsed,
+                  total_bytes=total if files else None)
+    return result
+
+
+def _read_listing(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    try:
+        return parse_volume_listing(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return {"total_bytes": None, "files": 0, "approximate": False, "unparsed_lines": 0,
+                "format": None, "error": "listing file could not be read"}
+
+
+def _video_seconds(tm: dict[str, Any], bounds: Any, override: float | None) -> dict[str, Any]:
+    if override is not None:
+        return {"seconds": override, "source": "--video-seconds"}
+    fps = _num((tm.get("video") or {}).get("fps"))
+    if not fps or fps <= 0:
+        return {"seconds": None, "source": "tracking manifest has no fps; pass --video-seconds"}
+    if isinstance(bounds, (list, tuple)) and len(bounds) == 2 and all(isinstance(b, int) for b in bounds):
+        return {"seconds": round((bounds[1] - bounds[0] + 1) / fps, 3),
+                "source": f"tracking frame_bounds {list(bounds)} (inclusive) / video fps {fps:g}"}
+    frames = _num((tm.get("video") or {}).get("frame_count"))
+    if frames:
+        return {"seconds": round(frames / fps, 3), "source": f"tracking manifest frame_count {frames:g} / video fps {fps:g}"}
+    return {"seconds": None, "source": "tracking manifest has no frame bounds; pass --video-seconds"}
+
+
+def build_performance(
+    log: dict[str, Any], job_dir: Path, jobinfo: dict[str, Any], *,
+    gpu_rate: float | None = None, video_seconds: float | None = None,
+    volume_included_gib: float | None = None, volume_rate: float | None = None,
+    listing_before: str | None = None, listing_after: str | None = None,
+) -> dict[str, Any]:
+    job = jobinfo["job"]
+    tm = jobinfo["tracking_manifest"] or {}
+    raw = read_stage_metrics(job_dir, job)
+    log_stage = {t["stage"]: t for t in log["timing_stages"]}  # last line per stage wins
+    stages: dict[str, dict[str, Any]] = {}
+    without: list[str] = []
+    for stage in STAGES:
+        r = raw[stage]
+        doc, lt = r["metrics"], log_stage.get(stage)
+        if doc is None and lt is None:
+            if r["published"]:
+                without.append(stage)
+            continue
+        entry: dict[str, Any] = {"generation": r["generation"]}
+        if doc is not None:
+            timeout = _num(doc.get("function_timeout_seconds"))
+            entry.update(
+                source=METRICS_FILE, started_at=doc.get("started_at"), finished_at=doc.get("finished_at"),
+                elapsed_seconds=_num(doc["elapsed_seconds"]),
+                phases={k: v for k, v in (doc.get("phases") or {}).items() if _num(v) is not None},
+                gpu=_gpu_from_metrics(doc), function_timeout_seconds=timeout,
+                timeout_margin_seconds=_num(doc.get("timeout_margin_seconds")),
+                container=doc.get("container") if isinstance(doc.get("container"), dict) else None,
+                frames=doc.get("frames") if isinstance(doc.get("frames"), dict) else None,
+                api_calls={k: (doc.get("api_calls") or {}).get(k) for k in API_KEYS},
+                attempt=doc.get("attempt"),
+            )
+            if lt is not None:
+                diff = abs(lt["elapsed_seconds"] - entry["elapsed_seconds"])
+                entry["log_crosscheck"] = {
+                    "log_elapsed_seconds": lt["elapsed_seconds"], "difference_seconds": round(diff, 3),
+                    "agrees": diff <= 1.0,
+                }
+        else:
+            entry.update(
+                source="log [v2-timing]", started_at=lt["started"], finished_at=lt["finished"],
+                elapsed_seconds=lt["elapsed_seconds"], phases={},
+                gpu={"name": lt["gpu"], "memory_mib": None} if lt["gpu"] else None,
+                function_timeout_seconds=None, timeout_margin_seconds=lt["timeout_margin_seconds"],
+                container=None, frames=None, api_calls={k: None for k in API_KEYS}, attempt=None,
+            )
+        margin, timeout = entry["timeout_margin_seconds"], entry["function_timeout_seconds"]
+        if timeout is None and margin is not None:
+            timeout = entry["elapsed_seconds"] + margin  # log lines carry no timeout; derived
+            entry["function_timeout_derived"] = True
+        entry["function_timeout_seconds"] = timeout
+        entry["timeout_used_percent"] = (
+            round(100 * (timeout - margin) / timeout, 2) if timeout and margin is not None else None
+        )
+        stages[stage] = entry
+
+    measured = [s for s in STAGES if s in stages]
+    if stages:
+        sources = {e["source"] for e in stages.values()}
+        sm: dict[str, Any] = {"status": "MEASURED", "sources": sorted(sources)}
+        if without:
+            sm["stages_without_metrics"] = without
+            sm["reason_for_missing"] = (
+                "published generation has no stage_metrics.json (stage reused an earlier generation, "
+                "or " + REASON_NO_METRICS + ")"
+            )
+    else:
+        sm = _nm(REASON_NO_METRICS if not any(r["generations_with_metrics"] for r in raw.values())
+                 else "no metrics for the current generations",
+                 source=f"{METRICS_FILE} per generation or [v2-timing] log lines")
+    invalid = sum(r["invalid_metrics_files"] for r in raw.values())
+    if invalid:
+        sm["invalid_metrics_files"] = invalid
+
+    published = [s for s in STAGES if raw[s]["published"]]
+    elapsed_sum = round(sum(stages[s]["elapsed_seconds"] for s in measured), 3) if measured else None
+    complete = bool(measured) and all(s in stages for s in published)
+    jobs = log["timing_jobs"]
+    pick = [j for j in jobs if j["job_id"] == job.get("job_id")] or jobs
+    wall = pick[-1]["total_wall_seconds"] if pick else None
+    overhead = round(wall - elapsed_sum, 3) if wall is not None and elapsed_sum is not None and complete else None
+
+    margins = [(s, stages[s]["timeout_margin_seconds"]) for s in measured if stages[s]["timeout_margin_seconds"] is not None]
+    timeout_info = None
+    if margins:
+        tight, tight_margin = min(margins, key=lambda x: x[1])
+        pcts = [(stages[s]["timeout_used_percent"], s) for s in measured if stages[s]["timeout_used_percent"] is not None]
+        timeout_info = {
+            "smallest_margin_seconds": tight_margin, "smallest_margin_stage": tight,
+            "percent_of_timeout_used_at_smallest_margin": stages[tight]["timeout_used_percent"],
+            "max_percent_of_timeout_used": max(pcts)[0] if pcts else None,
+        }
+
+    gpu_names = sorted({e["gpu"]["name"] for e in stages.values() if e["gpu"] and e["gpu"].get("name")})
+    gpu_mem = sorted({e["gpu"]["memory_mib"] for e in stages.values() if e["gpu"] and e["gpu"].get("memory_mib")})
+    gpu = {"names": gpu_names, "memory_mib": gpu_mem,
+           "from": "stage metrics / timing lines" if gpu_names else None}
+    if not gpu_names and log["gpus"]:
+        gpu = {"names": sorted({g["name"] for g in log["gpus"]}),
+               "memory_mib": sorted({g["memory_mib"] for g in log["gpus"] if "memory_mib" in g}),
+               "from": "CUDA line in the log"}
+
+    totals: dict[str, Any] = {}
+    for key in API_KEYS:
+        vals = {s: stages[s]["api_calls"].get(key) for s in measured}
+        known = [v for v in vals.values() if isinstance(v, int) and not isinstance(v, bool)]
+        unknown = [s for s, v in vals.items() if v is None]
+        totals[key] = {"total": sum(known) if known else None, "unknown_in_stages": unknown,
+                       "partial": bool(known) and bool(unknown)}
+
+    attempts = job.get("attempts") if isinstance(job.get("attempts"), dict) else {}
+    errors = job.get("errors") if isinstance(job.get("errors"), list) else []
+    retries = {
+        "attempts_by_stage": attempts or None,
+        "retried_stages": sorted(s for s, n in attempts.items() if isinstance(n, int) and n > 1),
+        "recorded_error_count": len(errors),
+        "recorded_errors": [str(e)[:300] for e in errors[:10]],
+        "note": "a stage that reused an existing generation records no new metrics",
+    }
+
+    gen_info = {s: {"count": len(raw[s]["published"]),
+                    "bytes": sum(raw[s]["bytes_by_generation"].values()),
+                    "bytes_by_generation": raw[s]["bytes_by_generation"]} for s in STAGES if raw[s]["published"]}
+    published_bytes = sum(g["bytes"] for g in gen_info.values())
+    generations = {"by_stage": gen_info, "total_count": sum(g["count"] for g in gen_info.values()),
+                   "total_bytes": published_bytes, "download_bytes": jobinfo["download_bytes"]}
+
+    # volume growth
+    before, after = _read_listing(listing_before), _read_listing(listing_after)
+    if before is None or after is None:
+        growth: dict[str, Any] = _nm(
+            "give --volume-listing-before and --volume-listing-after (copies of `modal volume ls v2-job-data <job>`)",
+            published_bytes_as_downloaded=published_bytes)
+    elif before["total_bytes"] is None or after["total_bytes"] is None:
+        growth = _nm("a listing had no parseable sizes (accepted: JSON {path: bytes} or `modal volume ls` text with sizes)",
+                     published_bytes_as_downloaded=published_bytes, before=before, after=after)
+    else:
+        growth = {"status": "MEASURED", "growth_bytes": after["total_bytes"] - before["total_bytes"],
+                  "before_bytes": before["total_bytes"], "after_bytes": after["total_bytes"],
+                  "approximate": before["approximate"] or after["approximate"],
+                  "published_bytes_as_downloaded": published_bytes}
+
+    # costs
+    vid = _video_seconds(tm, tm.get("frame_bounds") or (jobinfo["generations"]["tracking"]["verification"] or {}).get("frame_bounds"), video_seconds)
+    if gpu_rate is None:
+        cost: dict[str, Any] = _nm(REASON_NO_RATE)
+    elif elapsed_sum is None:
+        cost = _nm(f"no stage timings: {REASON_NO_METRICS}", rate_usd_per_hour=gpu_rate)
+    else:
+        lower = elapsed_sum / 3600 * gpu_rate
+        upper = wall / 3600 * gpu_rate if wall is not None else None
+        cost = {"status": "MEASURED", "rate_usd_per_hour": gpu_rate,
+                "estimated_usd_gpu_stage_time": round(lower, 6),
+                "estimated_usd_upper_bound_wall_time": round(upper, 6) if upper is not None else None,
+                "upper_bound_note": None if upper is not None else "no client-side wall time in the log",
+                "stages_complete": complete, "disclaimer": DISCLAIMER}
+        if not complete:
+            cost["partial_note"] = "some published stages have no timings; the figures cover only: " + ", ".join(measured)
+    per_min: dict[str, Any]
+    if cost["status"] != "MEASURED":
+        per_min = _nm("needs the cost estimate: " + cost["reason"])
+    elif not vid["seconds"]:
+        per_min = _nm("video duration unknown: " + vid["source"])
+    else:
+        minutes = vid["seconds"] / 60
+        per_min = {"status": "MEASURED",
+                   "usd_per_video_minute_gpu_stage_time": round(cost["estimated_usd_gpu_stage_time"] / minutes, 6),
+                   "usd_per_video_minute_upper_bound": (
+                       round(cost["estimated_usd_upper_bound_wall_time"] / minutes, 6)
+                       if cost["estimated_usd_upper_bound_wall_time"] is not None else None)}
+    cost["video_seconds"] = vid["seconds"]
+    cost["video_seconds_source"] = vid["source"]
+    cost["per_video_minute"] = per_min
+
+    if volume_rate is None:
+        vcost: dict[str, Any] = _nm("pass --volume-rate-usd-per-gib-month from the Modal plan"
+                                    + ("" if volume_included_gib is not None else " (and --volume-included-gib if the plan includes storage)"))
+    else:
+        basis = growth["growth_bytes"] if growth["status"] == "MEASURED" else published_bytes
+        gib = max(basis, 0) / 1024**3
+        included = volume_included_gib or 0.0
+        billable = max(gib - included, 0.0)
+        vcost = {"status": "MEASURED", "gib": round(gib, 6), "included_gib": included,
+                 "billable_gib": round(billable, 6), "rate_usd_per_gib_month": volume_rate,
+                 "usd_per_month": round(billable * volume_rate, 6),
+                 "basis": "volume growth" if growth["status"] == "MEASURED" else "published bytes as downloaded (growth not measured)",
+                 "note": "included amount is not shared with other jobs here; compare with the whole Volume on the dashboard"}
+
+    return {
+        "stage_metrics": sm, "stages": stages, "elapsed_sum_seconds": elapsed_sum,
+        "elapsed_sum_complete": complete,
+        "total_wall_seconds": wall,
+        "overhead_seconds": overhead,
+        "overhead_note": "wall minus sum of stage elapsed: cold start, model load and transfer overhead",
+        "timeout": timeout_info, "gpu": gpu,
+        "api_calls": {"totals": totals, "note": "null counts stay unknown, they are never reported as 0"},
+        "retries": retries, "generations": generations,
+        "volume_growth": growth, "volume_cost": vcost, "cost": cost,
+    }
+
+
 # ----------------------------------------------------------------- checklist
-def build_checklist(log: dict[str, Any], jobinfo: dict[str, Any], replay: dict[str, Any]) -> list[dict[str, str]]:
+def build_checklist(
+    log: dict[str, Any], jobinfo: dict[str, Any], replay: dict[str, Any], perf: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
     job = jobinfo["job"]
     gens = jobinfo["generations"]
     tm = jobinfo["tracking_manifest"] or {}
@@ -624,10 +990,40 @@ def build_checklist(log: dict[str, Any], jobinfo: dict[str, Any], replay: dict[s
         add("Downloaded artifacts render with debug_v2.py using an explicit generation", NOT_RUN,
             "no --replay-output provided")
 
-    add("GPU time, timeout margin, Volume growth, and download size are recorded", NOT_MEASURED,
-        f"download size measured: {jobinfo['download_bytes']} bytes. NOT in the inputs: GPU runtime "
-        "(Modal billing / dashboard usage export), timeout margin (function timeout vs. Modal "
-        "function-call duration), Volume growth (`modal volume ls` before/after)")
+    perf = perf or {}
+    ops_item = "GPU time, timeout margin, Volume growth, and download size are recorded"
+    stages_perf = perf.get("stages") or {}
+    missing = []
+    if perf.get("elapsed_sum_seconds") is None:
+        missing.append(f"GPU/stage time ({REASON_NO_METRICS}; no stage_metrics.json or [v2-timing] lines)")
+    elif not perf.get("elapsed_sum_complete"):
+        missing.append("GPU/stage time for stages: " + ", ".join(perf["stage_metrics"].get("stages_without_metrics", [])))
+    if not perf.get("timeout"):
+        missing.append("timeout margin")
+    if jobinfo["download_bytes"] is None:
+        missing.append("download size")
+    if (perf.get("volume_growth") or {}).get("status") != "MEASURED":
+        missing.append("Volume growth (no usable --volume-listing-before/--volume-listing-after)")
+    if missing:
+        add(ops_item, NOT_MEASURED,
+            "missing: " + "; ".join(missing) + f". Present: download size {jobinfo['download_bytes']} bytes")
+    else:
+        add(ops_item, PASS,
+            f"stage elapsed sum {perf['elapsed_sum_seconds']} s, smallest timeout margin "
+            f"{perf['timeout']['smallest_margin_seconds']} s, Volume growth "
+            f"{perf['volume_growth']['growth_bytes']} bytes, download {jobinfo['download_bytes']} bytes")
+
+    sm = perf.get("stage_metrics") or {}
+    if sm.get("status") == "MEASURED" and not sm.get("stages_without_metrics"):
+        add("Operational metrics recorded by the pipeline", PASS,
+            f"{len(stages_perf)} stage(s) with metrics from {', '.join(sm['sources'])}: {', '.join(stages_perf)}")
+    elif sm.get("status") == "MEASURED":
+        add("Operational metrics recorded by the pipeline", NOT_MEASURED,
+            f"metrics for {', '.join(stages_perf)}; missing for {', '.join(sm['stages_without_metrics'])} "
+            f"({sm['reason_for_missing']})")
+    else:
+        add("Operational metrics recorded by the pipeline", NOT_MEASURED,
+            f"{sm.get('reason', REASON_NO_METRICS)}; expected {sm.get('source', METRICS_FILE)}")
 
     verifs = [gens[s]["verification"] for s in ("tracking", "stats") if gens[s]["verification"]]
     bad = sum(len(v["mismatched"]) + len(v["missing"]) for v in verifs)
@@ -703,6 +1099,24 @@ def _replay_info(path: str | None, bounds: Any = None) -> dict[str, Any]:
     return info
 
 
+def _not_measured(perf: dict[str, Any], durations: dict[str, Any]) -> dict[str, str]:
+    out = {"gpu_runtime_billing": "Modal usage/billing export for the app run (the dashboard is the source of truth)"}
+    if perf["cost"]["status"] != "MEASURED":
+        out["cost"] = perf["cost"]["reason"]
+    if perf["cost"]["per_video_minute"]["status"] != "MEASURED":
+        out["cost_per_video_minute"] = perf["cost"]["per_video_minute"]["reason"]
+    if not perf["timeout"]:
+        out["timeout_margin"] = perf["stage_metrics"].get("reason", "no stage with a recorded margin")
+    if perf["volume_growth"]["status"] != "MEASURED":
+        out["volume_growth"] = perf["volume_growth"]["reason"]
+    if perf["total_wall_seconds"] is None:
+        out["total_job_duration"] = durations["total_job_source"]
+    totals = perf["api_calls"]["totals"]
+    if not any(t["total"] is not None for t in totals.values()):
+        out["model_api_calls"] = "api_calls in stage_metrics.json (unknown, not zero); otherwise Roboflow dashboard counters"
+    return out
+
+
 def build_report(
     log_text: str,
     job_dir: Path,
@@ -710,9 +1124,20 @@ def build_report(
     replay_output: str | None = None,
     notes: str | None = None,
     also_logs: dict[str, str] | None = None,
+    gpu_rate_usd_per_hour: float | None = None,
+    video_seconds: float | None = None,
+    volume_included_gib: float | None = None,
+    volume_rate_usd_per_gib_month: float | None = None,
+    volume_listing_before: str | None = None,
+    volume_listing_after: str | None = None,
 ) -> dict[str, Any]:
     log = parse_log(log_text)
     jobinfo = inspect_job(job_dir)
+    perf = build_performance(
+        log, job_dir, jobinfo, gpu_rate=gpu_rate_usd_per_hour, video_seconds=video_seconds,
+        volume_included_gib=volume_included_gib, volume_rate=volume_rate_usd_per_gib_month,
+        listing_before=volume_listing_before, listing_after=volume_listing_after,
+    )
     job = jobinfo["job"]
     tm = jobinfo["tracking_manifest"] or {}
     video = tm.get("video") or (jobinfo["stats_results"] or {}).get("video") or {}
@@ -736,8 +1161,12 @@ def build_report(
             "difference between first and last timestamped SAM3 session log lines; "
             "covers the SAM3 segments only, not model load, TrackNet or artifact writing"
         ),
-        "total_job_seconds": NOT_MEASURED,
-        "total_job_source": "Modal function-call duration (dashboard / `modal app` logs); the CLI log has no wall-clock stamps outside SAM3",
+        "total_job_seconds": perf["total_wall_seconds"] if perf["total_wall_seconds"] is not None else NOT_MEASURED,
+        "total_job_source": (
+            "client-side [v2-timing] job line (includes cold start and model load)"
+            if perf["total_wall_seconds"] is not None else
+            "no [v2-timing] job line in the log; Modal function-call duration (dashboard / `modal app` logs) has it"
+        ),
         "tracknet_and_shot_phases": log["phase_complete"],
         "benchmark_in_tracking_manifest": tm.get("benchmark") or None,
     }
@@ -821,15 +1250,8 @@ def build_report(
         "outcome_summary": jobinfo["outcomes"],
         "operational_notes": notes,
         "warnings": log["warnings"],
-        "not_measured": {
-            "gpu_runtime_billing": "Modal usage/billing export for the app run (not printed in `modal run` logs)",
-            "cost": "GPU seconds x Modal GPU rate; needs billed GPU runtime",
-            "cost_per_video_minute": "cost / clip duration; needs cost",
-            "timeout_margin": "configured function timeout minus Modal function-call duration",
-            "volume_growth": "`modal volume ls`/size before and after the run",
-            "model_api_calls": "Roboflow dashboard / API usage counters",
-            "total_job_duration": durations["total_job_source"],
-        },
+        "performance": perf,
+        "not_measured": _not_measured(perf, durations),
         "replay_output": replay,
         "log_stats": {
             "stats_complete": log["stats_complete"],
@@ -842,7 +1264,7 @@ def build_report(
             "sizes above bound what a cleanup would reclaim."
         ),
     }
-    report["checklist"] = build_checklist(log, jobinfo, replay)
+    report["checklist"] = build_checklist(log, jobinfo, replay, perf)
 
     counts: dict[str, int] = {}
     redact_text(log_text, counts)  # count what the raw log would have leaked
@@ -858,6 +1280,113 @@ def build_report(
 
 
 # ------------------------------------------------------------------ markdown
+def _u(value: Any) -> str:
+    return "unknown" if value is None else str(value)
+
+
+def _usd(value: Any) -> str:
+    return NOT_MEASURED if value is None else f"{value:.4f} USD"
+
+
+def render_performance(p: dict[str, Any]) -> list[str]:
+    L: list[str] = []
+    a = L.append
+    a("## Performance and cost")
+    sm = p["stage_metrics"]
+    if sm["status"] == "MEASURED":
+        a(f"- Stage metrics: measured from {', '.join(sm['sources'])}")
+        if sm.get("stages_without_metrics"):
+            a(f"- Stages with a published generation but no metrics: {', '.join(sm['stages_without_metrics'])} ({sm['reason_for_missing']})")
+    else:
+        a(f"- Stage metrics: {NOT_MEASURED} ({sm['reason']}; expected {sm['source']})")
+    if sm.get("invalid_metrics_files"):
+        a(f"- Unreadable stage_metrics.json files ignored: {sm['invalid_metrics_files']}")
+    for stage, e in p["stages"].items():
+        a(f"- {stage} `{_u(e['generation'])}` ({e['source']}): elapsed {e['elapsed_seconds']} s, "
+          f"timeout margin {_u(e['timeout_margin_seconds'])} s of {_u(e['function_timeout_seconds'])} s"
+          f"{' (derived)' if e.get('function_timeout_derived') else ''}, "
+          f"{_u(e['timeout_used_percent'])}% of timeout used, attempt {_u(e['attempt'])}")
+        if e["phases"]:
+            a("  - phases: " + ", ".join(f"{k} {v}" for k, v in e["phases"].items()))
+        if e["frames"]:
+            a(f"  - frames requested {_u(e['frames'].get('requested'))}, processed {_u(e['frames'].get('processed'))}")
+        if e["container"]:
+            a(f"  - container cpu {_u(e['container'].get('cpu'))}, memory {_u(e['container'].get('memory_mib'))} MiB")
+        if e.get("log_crosscheck"):
+            c = e["log_crosscheck"]
+            a(f"  - log cross-check: [v2-timing] elapsed {c['log_elapsed_seconds']} s, "
+              f"{'agrees' if c['agrees'] else 'DIFFERS'} (delta {c['difference_seconds']} s)")
+    if p["elapsed_sum_seconds"] is None:
+        a(f"- Sum of stage elapsed (container-side): {NOT_MEASURED}")
+    else:
+        a(f"- Sum of stage elapsed (container-side): {p['elapsed_sum_seconds']} s"
+          f"{'' if p['elapsed_sum_complete'] else ' (partial: some published stages have no timings)'}")
+    a(f"- Client-side total wall time: {_fmt(p['total_wall_seconds'])}{' s' if p['total_wall_seconds'] is not None else ''}")
+    if p["overhead_seconds"] is not None:
+        a(f"- Difference wall - stage sum: {p['overhead_seconds']} s ({p['overhead_note']})")
+    else:
+        a(f"- Difference wall - stage sum: {NOT_MEASURED} (needs the wall time and complete stage timings)")
+    t = p["timeout"]
+    if t:
+        a(f"- Smallest timeout margin: {t['smallest_margin_seconds']} s in stage {t['smallest_margin_stage']} "
+          f"({_u(t['percent_of_timeout_used_at_smallest_margin'])}% of its timeout used; highest use across stages "
+          f"{_u(t['max_percent_of_timeout_used'])}%)")
+    else:
+        a(f"- Smallest timeout margin: {NOT_MEASURED} ({sm.get('reason', 'no margin recorded')})")
+    g = p["gpu"]
+    a(f"- GPU: {', '.join(g['names']) or NOT_MEASURED}"
+      f"{', memory ' + ', '.join(map(str, g['memory_mib'])) + ' MiB' if g['memory_mib'] else ''}"
+      f"{' (from ' + g['from'] + ')' if g['from'] else ''}")
+    totals = p["api_calls"]["totals"]
+    if p["stages"]:
+        for key, tot in totals.items():
+            extra = f" (unknown in: {', '.join(tot['unknown_in_stages'])}{'; total is a lower bound' if tot['partial'] else ''})" if tot["unknown_in_stages"] else ""
+            a(f"- API/model calls, {key}: total {_u(tot['total'])}{extra}")
+        for stage, e in p["stages"].items():
+            a(f"  - {stage}: " + ", ".join(f"{k.replace('roboflow_', '')}={_u(v)}" for k, v in e["api_calls"].items()))
+    else:
+        a(f"- API/model calls: {NOT_MEASURED} (no stage metrics)")
+    r = p["retries"]
+    a(f"- Attempts: `{json.dumps(r['attempts_by_stage'], sort_keys=True)}`; retried stages: {', '.join(r['retried_stages']) or 'none'}; "
+      f"recorded errors: {r['recorded_error_count']}" + (f" `{r['recorded_errors']}`" if r["recorded_errors"] else "")
+      + f" ({r['note']})")
+    gi = p["generations"]
+    for stage, info in gi["by_stage"].items():
+        a(f"- Published generations, {stage}: {info['count']} totalling {info['bytes']} bytes")
+    a(f"- Published generations total: {gi['total_count']} / {gi['total_bytes']} bytes; downloaded job folder {_fmt(gi['download_bytes'])} bytes")
+    vg = p["volume_growth"]
+    if vg["status"] == "MEASURED":
+        a(f"- Volume growth: {vg['growth_bytes']} bytes (before {vg['before_bytes']}, after {vg['after_bytes']}"
+          f"{'; sizes rounded by human units, approximate' if vg['approximate'] else ''})")
+    else:
+        a(f"- Volume growth: {NOT_MEASURED} ({vg['reason']}); published bytes (as downloaded): {vg['published_bytes_as_downloaded']}")
+    c = p["cost"]
+    a(f"- Estimated GPU cost: " + (NOT_MEASURED + f" ({c['reason']})" if c["status"] != "MEASURED" else
+      f"{_usd(c['estimated_usd_gpu_stage_time'])} at {c['rate_usd_per_hour']} USD/hour (stage time); "
+      f"upper bound with wall time {_usd(c['estimated_usd_upper_bound_wall_time'])}"
+      + (f" ({c['upper_bound_note']})" if c.get("upper_bound_note") else "")))
+    if c.get("partial_note"):
+        a(f"  - {c['partial_note']}")
+    a(f"- Video duration: {_fmt(c['video_seconds'])}{' s' if c['video_seconds'] is not None else ''} (source: {c['video_seconds_source']})")
+    pm = c["per_video_minute"]
+    if pm["status"] == "MEASURED":
+        a(f"- Cost per video minute: {_usd(pm['usd_per_video_minute_gpu_stage_time'])} (stage time); upper bound {_usd(pm['usd_per_video_minute_upper_bound'])}")
+    else:
+        a(f"- Cost per video minute: {NOT_MEASURED} ({pm['reason']})")
+    vc = p["volume_cost"]
+    if vc["status"] == "MEASURED":
+        a(f"- Volume storage cost: {_usd(vc['usd_per_month'])}/month for {vc['gib']} GiB, {vc['included_gib']} GiB included "
+          f"(basis: {vc['basis']})")
+    else:
+        a(f"- Volume storage cost: {NOT_MEASURED} ({vc['reason']})")
+    if c["status"] == "MEASURED":
+        a(f"- Note: {c['disclaimer']}")
+    else:
+        a(f"- Note: {DISCLAIMER}")
+    a("")
+    return L
+
+
 def _fmt(value: Any) -> str:
     return NOT_MEASURED if value is None else str(value)
 
@@ -910,8 +1439,10 @@ def render_markdown(report: dict[str, Any], max_files: int = 40) -> str:
     a(f"- SAM3 tracking log span: {_fmt(d['sam3_tracking_log_span_seconds'])} s ({d['sam3_tracking_log_span_note']})")
     for name, ph in d["tracknet_and_shot_phases"].items():
         a(f"- {name} phase: {ph['processed_frames']}/{ph['total_frames']} frames ({ph['percent']}%) (no duration in log)")
-    a(f"- Total job duration: {NOT_MEASURED} (source: {d['total_job_source']})")
+    total = d["total_job_seconds"]
+    a(f"- Total job duration: {total}{' s' if total != NOT_MEASURED else ''} (source: {d['total_job_source']})")
     a("")
+    L.extend(render_performance(report["performance"]))
     a("## Artifacts and hash verification")
     ok = report["hash_verification_ok"]
     a(f"- Overall hash verification: {'PASS' if ok else 'FAIL or NOT_MEASURED'}")
@@ -994,6 +1525,25 @@ def render_markdown(report: dict[str, Any], max_files: int = 40) -> str:
 
 
 # ---------------------------------------------------------------------- diff
+def _perf_numbers(p: Any) -> dict[str, Any]:
+    p = p if isinstance(p, dict) else {}
+    cost = p.get("cost") or {}
+    pm = cost.get("per_video_minute") or {}
+    out = {
+        "perf.elapsed_sum_seconds": p.get("elapsed_sum_seconds"),
+        "perf.total_wall_seconds": p.get("total_wall_seconds"),
+        "perf.smallest_timeout_margin_seconds": (p.get("timeout") or {}).get("smallest_margin_seconds"),
+        "perf.cost_usd_stage_time": cost.get("estimated_usd_gpu_stage_time"),
+        "perf.cost_usd_upper_bound": cost.get("estimated_usd_upper_bound_wall_time"),
+        "perf.cost_usd_per_video_minute": pm.get("usd_per_video_minute_gpu_stage_time"),
+        "perf.volume_growth_bytes": (p.get("volume_growth") or {}).get("growth_bytes"),
+        "perf.published_bytes": (p.get("generations") or {}).get("total_bytes"),
+    }
+    for stage, e in (p.get("stages") or {}).items():
+        out[f"perf.elapsed_seconds.{stage}"] = e.get("elapsed_seconds")
+    return out
+
+
 def _key_numbers(r: dict[str, Any]) -> dict[str, Any]:
     ident, nums, out = r.get("tracking_identity") or {}, r.get("numbers") or {}, r.get("outcome_summary") or {}
     return {
@@ -1011,6 +1561,7 @@ def _key_numbers(r: dict[str, Any]) -> dict[str, Any]:
         "by_outcome_source": out.get("by_outcome_source"),
         "by_shooter_attribution_method": out.get("by_shooter_attribution_method"),
         "shots_with_null_shooter": out.get("shots_with_null_shooter"),
+        **_perf_numbers(r.get("performance")),
         "gpu_strings": ((r.get("gpu_and_configuration") or {}).get("gpu_strings_by_log") or {}).get("primary"),
     }
 
@@ -1023,7 +1574,7 @@ def diff_reports(a: dict[str, Any], b: dict[str, Any]) -> str:
     sa, sb = status(a), status(b)
     rows = [(f"checklist: {k}", sa.get(k), sb.get(k)) for k in sorted(set(sa) | set(sb)) if sa.get(k) != sb.get(k)]
     ka, kb = _key_numbers(a), _key_numbers(b)
-    rows += [(k, ka[k], kb[k]) for k in ka if ka[k] != kb[k]]
+    rows += [(k, ka.get(k), kb.get(k)) for k in dict.fromkeys([*ka, *kb]) if ka.get(k) != kb.get(k)]
     lines = ["| field | A | B |", "|---|---|---|"]
     lines += [f"| {k} | {cell(x)} | {cell(y)} |" for k, x, y in rows]
     if not rows:
@@ -1041,6 +1592,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--also-log", action="append", default=[], help="extra run log of the same job, only its GPU strings are listed (repeatable)")
     parser.add_argument("--commit", help="commit SHA of the deployed code (default: git rev-parse HEAD)")
     parser.add_argument("--replay-output", help="debug_v2.py render output (dir or .mp4), if the replay was run")
+    parser.add_argument("--gpu-rate-usd-per-hour", type=float, help="GPU rate from the Modal plan; no default, cost is NOT_MEASURED without it")
+    parser.add_argument("--video-seconds", type=float, help="video duration in seconds (default: derived from the tracking manifest frame bounds and fps)")
+    parser.add_argument("--volume-included-gib", type=float, help="GiB of Volume storage included in the plan (default: none)")
+    parser.add_argument("--volume-rate-usd-per-gib-month", type=float, help="Volume storage rate; needed for the storage cost")
+    parser.add_argument("--volume-listing-before", help="listing of the job on the Volume before the run (JSON {path: bytes} or `modal volume ls` text)")
+    parser.add_argument("--volume-listing-after", help="same listing after the run")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of Markdown")
     parser.add_argument("--output", help="write to this file instead of stdout")
     parser.add_argument("--max-files", type=int, default=40, help="max artifact rows per generation in Markdown")
@@ -1080,6 +1637,10 @@ def main(argv: list[str] | None = None) -> int:
         log_path.read_text(encoding="utf-8", errors="replace"),
         job_dir, commit=args.commit, replay_output=args.replay_output,
         notes=notes, also_logs=also_logs,
+        gpu_rate_usd_per_hour=args.gpu_rate_usd_per_hour, video_seconds=args.video_seconds,
+        volume_included_gib=args.volume_included_gib,
+        volume_rate_usd_per_gib_month=args.volume_rate_usd_per_gib_month,
+        volume_listing_before=args.volume_listing_before, volume_listing_after=args.volume_listing_after,
     )
     text = json.dumps(report, indent=2, sort_keys=True) if args.json else render_markdown(report, args.max_files)
     text = redact_text(text) + "\n"

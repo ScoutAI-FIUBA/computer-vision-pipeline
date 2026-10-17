@@ -489,3 +489,271 @@ def test_cli_notes_and_also_log(job, tmp_path, capsys):
                     "--also-log", str(log)]) == 0
     out = capsys.readouterr().out
     assert "manual finding <token>" in out and "GPU string, run.log log" in out
+
+
+# ------------------------------------------------- performance and cost
+def _metrics(stage, elapsed, margin, timeout=3600, api=None, **extra):
+    doc = {
+        "schema": "v2-stage-metrics-1", "stage": stage,
+        "started_at": "2026-10-12T03:00:00Z", "finished_at": "2026-10-12T03:05:00Z",
+        "elapsed_seconds": elapsed, "phases": {"load_model_seconds": 10.5, "inference_seconds": elapsed - 10.5},
+        "gpu": {"name": "NVIDIA A100-SXM4-80GB", "memory_mib": 81153},
+        "function_timeout_seconds": timeout, "timeout_margin_seconds": margin,
+        "container": {"cpu": 4, "memory_mib": 32768},
+        "frames": {"requested": 6, "processed": 6},
+        "api_calls": api or {k: None for k in ar.API_KEYS}, "attempt": 1,
+    }
+    doc.update(extra)
+    return doc
+
+
+def _put_metrics(job, stage, gen, doc):
+    (job / stage / "generations" / gen / "stage_metrics.json").write_text(json.dumps(doc))
+
+
+TIMING = (
+    "[v2-timing] stage=tracking started=2026-10-12T03:00:00Z finished=2026-10-12T03:02:00Z "
+    "elapsed=120.0 timeout_margin=3480.0 gpu=NVIDIA A100-SXM4-80GB\n"
+    "[v2-timing] stage=stats started=2026-10-12T03:02:10Z finished=2026-10-12T03:03:10Z "
+    "elapsed=60.5 timeout_margin=3539.5 gpu=none\n"
+    "[v2-timing] job id=job-x total_wall_seconds=250.0\n"
+)
+
+
+@pytest.fixture
+def mjob(job):
+    _put_metrics(job, "tracking", TRACK_GEN, _metrics("tracking", 120.0, 3480.0))
+    _put_metrics(job, "stats", STATS_GEN, _metrics(
+        "stats", 60.0, 540.0, timeout=600,
+        api={"roboflow_shot_detection_frames": 6, "roboflow_court_detection_frames": None,
+             "roboflow_number_detector_frames": 0, "roboflow_ocr_crops": None}))
+    return job
+
+
+def test_parse_timing_lines():
+    log = ar.parse_log(LOG + TIMING)
+    assert [t["stage"] for t in log["timing_stages"]] == ["tracking", "stats"]
+    t = log["timing_stages"][0]
+    assert t["elapsed_seconds"] == 120.0 and t["timeout_margin_seconds"] == 3480.0
+    assert t["gpu"] == "NVIDIA A100-SXM4-80GB" and log["timing_stages"][1]["gpu"] is None
+    assert log["timing_jobs"] == [{"job_id": "job-x", "total_wall_seconds": 250.0}]
+    assert ar.parse_log("[v2-timing] job id=none total_wall_seconds=3.5\n")["timing_jobs"][0]["job_id"] is None
+    assert ar.parse_log(LOG)["timing_stages"] == []
+
+
+def test_stage_metrics_parsed_and_arithmetic(mjob):
+    p = ar.build_report(LOG + TIMING, mjob, commit="x")["performance"]
+    assert p["stage_metrics"]["status"] == "MEASURED"
+    assert p["stages"]["tracking"]["source"] == "stage_metrics.json"
+    assert p["stages"]["tracking"]["phases"]["load_model_seconds"] == 10.5
+    assert p["elapsed_sum_seconds"] == 180.0 and p["elapsed_sum_complete"] is True
+    assert p["total_wall_seconds"] == 250.0 and p["overhead_seconds"] == 70.0
+    assert p["stages"]["stats"]["timeout_used_percent"] == 10.0
+    t = p["timeout"]
+    assert t["smallest_margin_seconds"] == 540.0 and t["smallest_margin_stage"] == "stats"
+    assert t["percent_of_timeout_used_at_smallest_margin"] == 10.0
+    assert p["gpu"]["names"] == ["NVIDIA A100-SXM4-80GB"] and p["gpu"]["memory_mib"] == [81153]
+    assert p["stages"]["tracking"]["log_crosscheck"]["agrees"] is True
+    assert p["stages"]["stats"]["log_crosscheck"] == {
+        "log_elapsed_seconds": 60.5, "difference_seconds": 0.5, "agrees": True}  # within 1 s
+    assert p["generations"]["total_count"] == 2 and p["generations"]["by_stage"]["tracking"]["count"] == 1
+
+
+def test_null_api_calls_stay_unknown(mjob):
+    p = ar.build_report(LOG, mjob, commit="x")["performance"]
+    totals = p["api_calls"]["totals"]
+    assert totals["roboflow_ocr_crops"]["total"] is None
+    assert totals["roboflow_shot_detection_frames"] == {"total": 6, "unknown_in_stages": ["tracking"], "partial": True}
+    assert totals["roboflow_number_detector_frames"]["total"] == 0
+    md = ar.render_markdown(ar.build_report(LOG, mjob, commit="x"))
+    assert "roboflow_ocr_crops: total unknown" in md
+
+
+def test_current_generation_metrics_win(mjob):
+    other = "o" * 64
+    gdir = mjob / "stats" / "generations" / other
+    gdir.mkdir()
+    (gdir / "stage_metrics.json").write_text(json.dumps(_metrics("stats", 999.0, 1.0)))
+    p = ar.build_report(LOG, mjob, commit="x")["performance"]
+    assert p["stages"]["stats"]["elapsed_seconds"] == 60.0
+    assert p["generations"]["by_stage"]["stats"]["count"] == 2
+
+
+def test_old_run_is_not_measured_with_reason(job):
+    rep = ar.build_report(LOG, job, commit="x")
+    p = rep["performance"]
+    assert p["stage_metrics"] == {
+        "status": ar.NOT_MEASURED, "reason": "run predates stage metrics",
+        "source": "stage_metrics.json per generation or [v2-timing] log lines"}
+    assert p["elapsed_sum_seconds"] is None and p["timeout"] is None
+    assert p["cost"]["status"] == ar.NOT_MEASURED
+    assert _status(rep, "Operational metrics")["status"] == ar.NOT_MEASURED
+    assert "run predates stage metrics" in _status(rep, "Operational metrics")["evidence"]
+    md = ar.render_markdown(rep)
+    assert "## Performance and cost" in md and "run predates stage metrics" in md
+    assert "311.31 s" in md  # hash-check duration still shown
+
+
+def test_log_lines_are_fallback(job):
+    p = ar.build_report(LOG + TIMING, job, commit="x")["performance"]
+    assert p["stages"]["tracking"]["source"] == "log [v2-timing]"
+    assert p["elapsed_sum_seconds"] == 180.5 and p["overhead_seconds"] == pytest.approx(69.5)
+    assert p["stages"]["stats"]["function_timeout_derived"] is True
+    assert p["stages"]["stats"]["gpu"] is None
+
+
+def test_cost_not_measured_without_rate(mjob):
+    c = ar.build_report(LOG + TIMING, mjob, commit="x")["performance"]["cost"]
+    assert c["status"] == ar.NOT_MEASURED and c["reason"] == "pass the rate from the Modal plan"
+    assert c["per_video_minute"]["status"] == ar.NOT_MEASURED
+
+
+def test_cost_arithmetic_with_rate_and_video_seconds(mjob):
+    rep = ar.build_report(LOG + TIMING, mjob, commit="x", gpu_rate_usd_per_hour=3.6, video_seconds=120.0)
+    c = rep["performance"]["cost"]
+    assert c["estimated_usd_gpu_stage_time"] == pytest.approx(180 / 3600 * 3.6)  # 0.18
+    assert c["estimated_usd_upper_bound_wall_time"] == pytest.approx(250 / 3600 * 3.6)  # 0.25
+    pm = c["per_video_minute"]
+    assert pm["usd_per_video_minute_gpu_stage_time"] == pytest.approx(0.09)
+    assert pm["usd_per_video_minute_upper_bound"] == pytest.approx(0.125)
+    assert c["video_seconds_source"] == "--video-seconds"
+    md = ar.render_markdown(rep)
+    assert "not the invoice" in md and "cold start" in md
+
+
+def test_video_seconds_derived_from_manifest(mjob):
+    c = ar.build_report(LOG, mjob, commit="x", gpu_rate_usd_per_hour=3.6)["performance"]["cost"]
+    assert c["video_seconds"] == pytest.approx(6 / 30.0)  # frame_bounds [0, 5] at 30 fps
+    assert "frame_bounds" in c["video_seconds_source"]
+    assert c["estimated_usd_upper_bound_wall_time"] is None  # no wall line in this log
+
+
+def test_video_seconds_not_measured_without_fps(mjob):
+    tm_path = mjob / "tracking" / "generations" / TRACK_GEN / "tracking-manifest.json"
+    tm_path.write_text(json.dumps({"observation_count": 12}))
+    c = ar.build_report(LOG, mjob, commit="x", gpu_rate_usd_per_hour=3.6)["performance"]["cost"]
+    assert c["video_seconds"] is None and c["per_video_minute"]["status"] == ar.NOT_MEASURED
+
+
+def test_rate_without_timings_stays_not_measured(job):
+    c = ar.build_report(LOG, job, commit="x", gpu_rate_usd_per_hour=2.5)["performance"]["cost"]
+    assert c["status"] == ar.NOT_MEASURED and "run predates stage metrics" in c["reason"]
+    assert "estimated_usd_gpu_stage_time" not in c
+
+
+def test_volume_listing_parsing():
+    assert ar.parse_volume_listing('{"a/x": 100, "a/y": 250}')["total_bytes"] == 350
+    text = (
+        "┃ Filename        ┃ Type ┃ Created/Modified ┃ Size     ┃\n"
+        "│ job/tracking    │ dir  │ 2026-10-12       │          │\n"
+        "│ job/job.json    │ file │ 2026-10-12       │ 1.5 KiB  │\n"
+        "│ job/a.mp4       │ file │ 2026-10-12       │ 2 MiB    │\n"
+    )
+    r = ar.parse_volume_listing(text)
+    assert r["total_bytes"] == 1536 + 2 * 1024**2 and r["approximate"] is True and r["files"] == 2
+    plain = ar.parse_volume_listing("job/a 1000\njob/b 24\nnot a size here\n")
+    assert plain["total_bytes"] == 1024 and plain["unparsed_lines"] == 1
+    assert ar.parse_volume_listing("garbage\n")["total_bytes"] is None
+
+
+def test_volume_growth_from_two_listings(mjob, tmp_path):
+    before, after = tmp_path / "b.json", tmp_path / "a.txt"
+    before.write_text(json.dumps({"job/inputs/x.mp4": 1000}))
+    after.write_text("job/inputs/x.mp4 1000\njob/tracking/g/tracks.jsonl 5000\n")
+    rep = ar.build_report(LOG, mjob, commit="x", volume_listing_before=str(before), volume_listing_after=str(after))
+    g = rep["performance"]["volume_growth"]
+    assert g["status"] == "MEASURED" and g["growth_bytes"] == 5000
+    assert "Volume growth: 5000 bytes" in ar.render_markdown(rep)
+    nog = ar.build_report(LOG, mjob, commit="x", volume_listing_before=str(tmp_path / "missing"),
+                          volume_listing_after=str(after))["performance"]["volume_growth"]
+    assert nog["status"] == ar.NOT_MEASURED and "published_bytes_as_downloaded" in nog
+
+
+def test_volume_growth_not_measured_without_listings(mjob):
+    g = ar.build_report(LOG, mjob, commit="x")["performance"]["volume_growth"]
+    assert g["status"] == ar.NOT_MEASURED and g["published_bytes_as_downloaded"] > 0
+
+
+def test_volume_storage_cost(mjob, tmp_path):
+    p = ar.build_report(LOG, mjob, commit="x")["performance"]
+    assert p["volume_cost"]["status"] == ar.NOT_MEASURED and "rate" in p["volume_cost"]["reason"]
+    before, after = tmp_path / "b.json", tmp_path / "a.json"
+    before.write_text("{}")
+    after.write_text(json.dumps({"f": 2 * 1024**3}))
+    kw = dict(volume_listing_before=str(before), volume_listing_after=str(after), volume_rate_usd_per_gib_month=0.5)
+    vc = ar.build_report(LOG, mjob, commit="x", volume_included_gib=0.5, **kw)["performance"]["volume_cost"]
+    assert vc["billable_gib"] == pytest.approx(1.5) and vc["usd_per_month"] == pytest.approx(0.75)
+    vc = ar.build_report(LOG, mjob, commit="x", volume_included_gib=5, **kw)["performance"]["volume_cost"]
+    assert vc["usd_per_month"] == 0
+
+
+def test_retries_and_errors_reported(mjob):
+    data = json.loads((mjob / "job.json").read_text())
+    data["attempts"] = {"tracking": 2, "stats": 1}
+    data["errors"] = ["tracking failed at /home/fede/x"]
+    (mjob / "job.json").write_text(json.dumps(data))
+    rep = ar.build_report(LOG, mjob, commit="x")
+    r = rep["performance"]["retries"]
+    assert r["retried_stages"] == ["tracking"] and r["recorded_error_count"] == 1
+    assert "/home/fede" not in json.dumps(rep) and "<home>" in json.dumps(rep["performance"])
+
+
+def test_reused_stage_without_metrics_is_listed(mjob):
+    (mjob / "stats" / "generations" / STATS_GEN / "stage_metrics.json").unlink()
+    rep = ar.build_report(LOG, mjob, commit="x")
+    sm = rep["performance"]["stage_metrics"]
+    assert sm["status"] == "MEASURED" and sm["stages_without_metrics"] == ["stats"]
+    assert rep["performance"]["elapsed_sum_complete"] is False
+    assert _status(rep, "Operational metrics")["status"] == ar.NOT_MEASURED
+    assert "stats" in _status(rep, "Operational metrics")["evidence"]
+
+
+def test_checklist_ops_row_statuses(mjob, tmp_path):
+    row = lambda rep: _status(rep, "GPU time, timeout")
+    rep = ar.build_report(LOG, mjob, commit="x")
+    assert row(rep)["status"] == ar.NOT_MEASURED and "Volume growth" in row(rep)["evidence"]
+    assert "GPU/stage time" not in row(rep)["evidence"] and "download size" not in row(rep)["evidence"].split("Present")[0]
+    assert _status(rep, "Operational metrics")["status"] == ar.PASS
+    before, after = tmp_path / "b.json", tmp_path / "a.json"
+    before.write_text("{}")
+    after.write_text('{"f": 10}')
+    rep = ar.build_report(LOG, mjob, commit="x", volume_listing_before=str(before), volume_listing_after=str(after))
+    assert row(rep)["status"] == ar.PASS
+
+
+def test_ops_row_lists_all_missing_for_old_run(job):
+    ev = _status(ar.build_report(LOG, job, commit="x"), "GPU time, timeout")
+    assert ev["status"] == ar.NOT_MEASURED
+    assert "run predates stage metrics" in ev["evidence"] and "timeout margin" in ev["evidence"]
+    assert "Volume growth" in ev["evidence"]
+
+
+def test_new_text_is_redacted(mjob, tmp_path):
+    data = json.loads((mjob / "job.json").read_text())
+    data["errors"] = ["boom me@example.com https://modal.com/apps/ws/main/ap-9 /home/fede/z"]
+    (mjob / "job.json").write_text(json.dumps(data))
+    log = tmp_path / "run.log"
+    log.write_text(LOG + TIMING)
+    out = tmp_path / "out.md"
+    assert ar.main(["--log", str(log), "--job", str(mjob), "--commit", "x", "--gpu-rate-usd-per-hour", "2.5",
+                    "--output", str(out)]) == 0
+    text = out.read_text()
+    for leaked in ("me@example.com", "modal.com", "/home/fede"):
+        assert leaked not in text
+    assert "<email>" in text and "Cost per video minute" in text
+
+
+def test_diff_includes_performance_fields(mjob, job, tmp_path, capsys):
+    a = ar.build_report(LOG + TIMING, mjob, commit="x", gpu_rate_usd_per_hour=3.6, video_seconds=120.0)
+    _put_metrics(mjob, "stats", STATS_GEN, _metrics("stats", 90.0, 510.0, timeout=600))
+    b = ar.build_report(LOG + TIMING, mjob, commit="x", gpu_rate_usd_per_hour=3.6, video_seconds=120.0)
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(a))
+    pb.write_text(json.dumps(b))
+    assert ar.main(["--diff", str(pa), str(pb)]) == 0
+    out = capsys.readouterr().out
+    assert "perf.elapsed_seconds.stats | 60.0 | 90.0" in out
+    assert "perf.smallest_timeout_margin_seconds | 540.0 | 510.0" in out
+    assert "perf.cost_usd_stage_time" in out and "perf.elapsed_sum_seconds" in out
+    assert ar.main(["--diff", str(pa), str(pa)]) == 0
+    assert "no differences" in capsys.readouterr().out

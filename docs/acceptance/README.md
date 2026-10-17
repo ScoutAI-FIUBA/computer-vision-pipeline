@@ -65,17 +65,82 @@ issue's acceptance criteria with PASS / FAIL / NOT_RUN / NOT_MEASURED and eviden
 - **`--diff A.json B.json`**: table of changed checklist statuses and key numbers
   (identity status, stable-id rows, numbers_file, outcome counts, generation ids).
 
+## Performance and cost
+
+The "Performance and cost" section reads what the pipeline records per stage
+generation: `stage_metrics.json` (schema `v2-stage-metrics-1`) inside
+`tracking/`, `stats/` and `possession/generations/<id>/`, and the `[v2-timing]` lines of
+the `modal run` log (`stage=... elapsed=... timeout_margin=... gpu=...` and
+`job id=... total_wall_seconds=...`). When several generations exist only the one in
+`current.json` is used; the log lines are the fallback and a cross-check. It reports:
+
+- per-stage elapsed and phases, sum of stage elapsed (container-side), client-side total
+  wall seconds and their difference (cold start, model load, transfer overhead);
+- smallest timeout margin across stages and the percentage of the function timeout used;
+- GPU name and memory, model/API call counts per stage and totals (a `null` count is
+  printed as `unknown`, never as 0; a total with unknown stages is a lower bound);
+- attempts and recorded errors from `job.json` (a stage that reused a generation has no
+  new metrics and is listed as such);
+- number and bytes of published generations per stage, and the downloaded job size.
+
+Runs recorded before the pipeline wrote these files show `NOT_MEASURED (run predates
+stage metrics)`; nothing is invented.
+
+Cost options (all estimates, not the invoice; the Modal dashboard is the source of truth):
+
+| Option | Meaning |
+|---|---|
+| `--gpu-rate-usd-per-hour R` | No default. Without it cost is `NOT_MEASURED` (pass the rate from the Modal plan). |
+| `--video-seconds S` | Video duration. Default: tracking `frame_bounds` (inclusive) / video fps from the tracking manifest, else `NOT_MEASURED`. |
+| `--volume-rate-usd-per-gib-month R` | Needed for the storage cost; otherwise `NOT_MEASURED`. |
+| `--volume-included-gib N` | Storage included in the plan (default none = 0). Cost is for this job's bytes beyond it, 0 when within it. |
+| `--volume-listing-before/after FILE` | Volume listings to compute growth, see below. |
+
+Estimated cost = (sum of stage elapsed seconds / 3600) x rate. This lower figure is GPU
+time only: container CPU/memory and cold start are excluded. The upper bound uses the
+client-side wall seconds instead. Cost per video minute = cost / (video seconds / 60).
+
+Volume growth: save the job listing before and after the run and pass both files. Accepted
+formats: a JSON object `{"path": bytes, ...}`, or a plain text copy of
+`modal volume ls v2-job-data <job>` output (table borders are ignored; rows typed `dir`
+are skipped; a size is either a human size such as `1.5 MiB`, which makes the result
+approximate, or a plain integer of bytes). Only file rows are summed, so list the
+directories that hold the files. Unreadable or size-less files make growth
+`NOT_MEASURED`; without listings the generation bytes are shown as "published bytes
+(as downloaded)".
+
+Worked example with made-up numbers (an example only, not a measurement). The plan rate
+for an A100-80GB is 2.50 USD/hour here:
+
+```
+tracking 120.0 s + stats 60.5 s -> sum of stage elapsed 180.5 s
+client-side total wall           250.0 s  (difference 69.5 s: cold start, model load, transfer)
+video 120 s (2 min)
+cost (GPU stage time) = 180.5 / 3600 * 2.50 = 0.1253 USD
+upper bound (wall)    = 250.0 / 3600 * 2.50 = 0.1736 USD
+cost per video minute = 0.0627 USD (lower) .. 0.0868 USD (upper)
+```
+
+```bash
+python scripts/ops/acceptance_report.py --log run.log --job <job dir> \
+  --gpu-rate-usd-per-hour 2.50 --video-seconds 120 \
+  --volume-listing-before before.txt --volume-listing-after after.txt
+```
+
+`--diff` also compares per-stage elapsed, total elapsed and wall time, smallest timeout
+margin, estimated cost, volume growth and published bytes. The JSON report carries all
+of this in the `performance` object.
+
 ## What the logs do NOT contain
 
-These are always reported as NOT_MEASURED, with their source:
+These stay NOT_MEASURED unless the inputs above provide them, with their source:
 
 | Item | Where it comes from |
 |---|---|
-| GPU runtime / billing, cost, cost per video minute | Modal usage export or dashboard |
-| Timeout margin | configured function timeout minus Modal function-call duration |
-| Total job duration | Modal function-call duration (the CLI log only has stamps for SAM3) |
-| Volume growth | `modal volume ls` before and after the run |
-| Model/API call counts | Roboflow dashboard |
+| Billed GPU runtime / invoice | Modal usage export or dashboard |
+| Volume growth | `--volume-listing-before/after` (`modal volume ls` before and after the run) |
+| Cost | `stage_metrics.json` or `[v2-timing]` plus `--gpu-rate-usd-per-hour` |
+| Model/API call counts | `api_calls` in `stage_metrics.json`, else Roboflow dashboard |
 | Modal image version | `modal app list` / deploy output |
 
 Steps never exercised by the provided run stay NOT_RUN: SAM3.1 smoke test (unless
