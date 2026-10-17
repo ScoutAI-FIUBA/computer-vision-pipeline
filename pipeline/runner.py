@@ -854,8 +854,11 @@ def _project_v2_rows(
     info,
     config: PipelineConfig,
     emit: Callable[[str], None],
+    counters: dict[str, int] | None = None,
 ) -> int:
     """Project authoritative V2 rows without creating a second player pipeline."""
+    if counters is not None:
+        counters["court_detection_frames"] = 0
     if not config.court_model_id or not rows:
         return 0
     grouped: dict[int, list[dict]] = {}
@@ -871,6 +874,8 @@ def _project_v2_rows(
                 if frame is None:
                     continue
                 try:
+                    if counters is not None:
+                        counters["court_detection_frames"] += 1
                     keypoints = parse_court_keypoints(
                         detector.detect(frame),
                         min_confidence=config.court_keypoint_confidence,
@@ -1219,6 +1224,17 @@ def _emit_file_batch_progress(
         emit(f"{label}: {processed}/{total} files")
 
 
+_STATS_PHASE_METRIC_KEYS = {
+    "court projection": "court_projection_seconds",
+    "TrackNet": "tracknet_seconds",
+    "shot detection": "shot_detection_seconds",
+    "possession": "possession_seconds",
+    "possession V3": "possession_seconds",
+    "V2 jersey numbers": "number_evidence_seconds",
+    "artifact writing": "artifact_write_seconds",
+}
+
+
 def run_stats_from_v2_observations(
     video_path: Path,
     config: PipelineConfig,
@@ -1230,16 +1246,21 @@ def run_stats_from_v2_observations(
     masks_by_observation=None,
     clean_masks_by_observation=None,
     number_detector=None,
+    metrics=None,
 ) -> PipelineResults:
     """Run stats stages from authoritative V2 player rows without player tracking."""
     emit = on_progress or (lambda message: print(f"[v2-stats] {message}", flush=True))
 
     def phase(name: str, operation):
+        started = time.perf_counter()
         try:
-            return operation()
+            result = operation()
         except Exception as error:
             emit(f"{name} failed: {type(error).__name__}: {error}")
             raise
+        if metrics is not None and name in _STATS_PHASE_METRIC_KEYS:
+            metrics.add_phase(_STATS_PHASE_METRIC_KEYS[name], time.perf_counter() - started)
+        return result
 
     video_path = Path(video_path)
     output_dir = Path(output_dir)
@@ -1261,10 +1282,12 @@ def run_stats_from_v2_observations(
     phase("TrackNet/player artifact writing", write_tracks)
 
     projected_tracks_path = output_dir / PROJECTED_TRACKS_FILENAME
+    court_counters: dict[str, int] = {}
     projected_track_records = phase(
         "court projection",
         lambda: _project_v2_rows(
-            video_path, projected_tracks_path, rows, info=info, config=config, emit=emit
+            video_path, projected_tracks_path, rows, info=info, config=config, emit=emit,
+            **({"counters": court_counters} if metrics is not None else {}),
         ),
     )
 
@@ -1320,9 +1343,15 @@ def run_stats_from_v2_observations(
 
     emit("shot evidence start")
     shot_progress = _BoundedProgress(emit, "shot detection")
+    shot_frames: list[int] = []
+
+    def track_shot_progress(processed: int, total: int | None) -> None:
+        shot_progress(processed, total)
+        shot_frames[:] = [processed]
+
     phase("shot detection", lambda: _write_shot_events(
         video_path, output_dir / SHOT_EVENTS_FILENAME, info=info, step=1, config=config,
-        on_progress=shot_progress,
+        on_progress=track_shot_progress if metrics is not None else shot_progress,
     ))
     shot_progress.complete(info.frame_count if info.frame_count > 0 else None)
     phase("shot outcome refinement", lambda: _refine_shot_outcomes(output_dir, config))
@@ -1347,13 +1376,25 @@ def run_stats_from_v2_observations(
     ))
     _remove_artifacts(output_dir)
     numbers_available = False
+    number_counters: dict[str, int] = {"number_detector_frames": 0, "ocr_crops": 0}
     if getattr(config, "number_evidence_enabled", True) and number_predictor is not None:
         numbers_available = phase("V2 jersey numbers", lambda: run_v2_number_evidence(
             video_path, rows, config, output_dir, predictor=number_predictor,
             masks_by_observation=masks_by_observation,
             clean_masks_by_observation=clean_masks_by_observation,
             detector=number_detector,
+            **({"counters": number_counters} if metrics is not None else {}),
         ))
+    if metrics is not None:
+        # None stays "unknown": a replaced helper that never reported must not look like zero calls.
+        metrics.set_api_calls(
+            roboflow_shot_detection_frames=shot_frames[0] if shot_frames else None,
+            roboflow_court_detection_frames=court_counters.get("court_detection_frames"),
+            roboflow_number_detector_frames=number_counters["number_detector_frames"],
+            # The dummy predictor makes no hosted call.
+            roboflow_ocr_crops=(number_counters["ocr_crops"]
+                                if config.number_predictor_backend == "roboflow-hosted" else 0),
+        )
     results = PipelineResults(
         schema_version=RESULTS_SCHEMA_VERSION,
         video={"filename": video_path.name, "fps": info.fps, "frame_count": info.frame_count,
@@ -1415,7 +1456,7 @@ def run_stats_from_v2_generation(
     video_path: Path, config: PipelineConfig, generation_root: Path, output_dir: Path,
     manifest: dict, *, masks_by_observation=None, clean_masks_by_observation=None,
     number_predictor=None, number_detector=None, validated: bool = False,
-    tracking_payload: Mapping[str, Any] | None = None,
+    tracking_payload: Mapping[str, Any] | None = None, metrics=None,
 ) -> PipelineResults:
     """Validate and consume one immutable tracking generation without re-tracking."""
     emit = lambda message: print(f"[v2-stats] {message}", flush=True)
@@ -1438,7 +1479,9 @@ def run_stats_from_v2_generation(
             masks_by_observation=masks_by_observation,
             clean_masks_by_observation=clean_masks_by_observation,
             number_predictor=number_predictor, number_detector=number_detector,
+            **({"metrics": metrics} if metrics is not None else {}),
         )
+    load_started = time.perf_counter()
     package_manifest_path = generation / "tracking-manifest.json"
     package_manifest = json.loads(package_manifest_path.read_text(encoding="utf-8"))
     package_artifacts = package_manifest.get("artifacts", {})
@@ -1545,11 +1588,14 @@ def run_stats_from_v2_generation(
     masks_by_observation = load_masks("masks")
     clean_masks_by_observation = load_masks("clean_masks")
     emit("stats start")
+    if metrics is not None:
+        metrics.add_phase("tracking_load_seconds", time.perf_counter() - load_started)
     return run_stats_from_v2_observations(
         video_path, config, output_dir, observations,
         masks_by_observation=masks_by_observation,
         clean_masks_by_observation=clean_masks_by_observation,
         number_predictor=number_predictor, number_detector=number_detector,
+        **({"metrics": metrics} if metrics is not None else {}),
     )
 
 

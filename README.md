@@ -105,6 +105,13 @@ Matching completed generations are reused without recomputation. A live lease
 rejects duplicate workers; an expired lease can be reclaimed. Failures are recorded
 in `job.json`; retry the failed stage rather than rerunning completed stages.
 
+Each newly computed tracking, stats, or possession generation also contains
+`stage_metrics.json` (schema `v2-stage-metrics-1`): container-side stage and phase
+durations, GPU, timeout margin, frame and hosted-API counts, and the attempt number;
+`null` means not measured. The same stage prints a `[v2-timing] stage=...` log line, and
+`modal run` ends with `[v2-timing] job id=... total_wall_seconds=...`, a client-side
+time that includes cold start and model load. Reused generations record nothing.
+
 Download a job and replay a selected tracking generation without inference:
 
 ```bash

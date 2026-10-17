@@ -147,8 +147,11 @@ def run_v2_number_evidence(
     masks_by_observation=None,
     clean_masks_by_observation=None,
     detector=None,
+    counters: dict[str, int] | None = None,
 ) -> bool:
     """Use legacy detector number boxes, associated to authoritative V2 players."""
+    if counters is not None:
+        counters.update({"number_detector_frames": 0, "ocr_crops": 0})
     sampled = _sampled_rows(rows, max(1, int(config.frame_stride)))
     if not sampled:
         _remove_artifacts(output_dir)
@@ -173,6 +176,8 @@ def run_v2_number_evidence(
             if not ok:
                 continue
             player_rows = by_frame[frame_index]
+            if detector is not None and counters is not None:
+                counters["number_detector_frames"] += 1
             number_rows = _detector_rows(
                 detector.detect(frame), width=frame.shape[1], height=frame.shape[0]
             ) if detector is not None else []
@@ -214,6 +219,8 @@ def run_v2_number_evidence(
                 if not number_rows:
                     fallback_evidence = sample.confidence_hints.get("evidence", {})
                     evidence.update(fallback_evidence)
+                if counters is not None:
+                    counters["ocr_crops"] += 1
                 prediction = predictor.predict(sample)
                 number, accepted = normalize_number_prediction(
                     prediction, threshold=config.number_predictor_score_threshold
