@@ -99,7 +99,7 @@ def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict
         got = detected[d_index] if d_index is not None else None
         row: dict[str, Any] = {"expected": want, "found": _describe(got) if got else None}
         if got is not None:
-            row["outcome_ok"] = got.get("outcome") == want.get("outcome")
+            row["outcome_ok"] = (got.get("outcome") == want["outcome"]) if "outcome" in want else None
             if "jersey_number" in want:
                 number = got.get("shooter_confirmed_number")
                 row["number_ok"] = (number == want["jersey_number"]) if number is not None else None
@@ -148,7 +148,7 @@ _OUTCOMES = {"made": "convertido", "missed": "fallado", "unknown": "sin resolver
 
 
 def _fmt_expected(want: dict[str, Any]) -> str:
-    parts = [_OUTCOMES.get(want.get("outcome"), str(want.get("outcome")))]
+    parts = [_OUTCOMES.get(want.get("outcome"), str(want.get("outcome"))) if "outcome" in want else "resultado no indicado"]
     if want.get("jersey_number") is not None:
         parts.append(f"camiseta {want['jersey_number']}")
     if want.get("approx_time_seconds") is not None:
@@ -184,13 +184,14 @@ def render(results: list[dict[str, Any]], rate: float | None) -> str:
             lines.append(f"| {r['clip']} | — | — | — | — | — | — | {r.get('shots_needing_review', '—')} |")
             continue
         rows = r["rows"]
-        outcome = sum(1 for x in rows if x.get("outcome_ok"))
+        judged = [x for x in rows if x.get("outcome_ok") is not None]
+        outcome = sum(1 for x in judged if x["outcome_ok"])
         with_number = [x for x in rows if x.get("number_ok") is not None]
         number = sum(1 for x in with_number if x["number_ok"])
         number_text = f"{number}/{len(with_number)}" if with_number else "n/d"
         lines.append(
             f"| {r['clip']} | {r['truth_shots']} | {r['matched']} | {r['missed_by_system']} | "
-            f"{len(r['spurious'])} | {outcome}/{r['matched']} | {number_text} | {r['shots_needing_review']} |"
+            f"{len(r['spurious'])} | {f'{outcome}/{len(judged)}' if judged else 'n/d'} | {number_text} | {r['shots_needing_review']} |"
         )
     for r in results:
         lines += ["", f"## {r['clip']}", ""]
@@ -207,7 +208,7 @@ def render(results: list[dict[str, Any]], rate: float | None) -> str:
         summary = r.get("job_summary") or {}
         cost, per_minute = _cost(summary, rate)
         if summary:
-            lines.append(f"- Duración del video: {summary.get('duration_seconds', 'n/d')} s; GPU: {(summary.get('gpu') or {}).get('name', 'n/d')}; costo estimado: {cost} ({per_minute} por minuto de video).")
+            lines.append(f"- Duración del video: {round(summary['duration_seconds'], 1) if isinstance(summary.get('duration_seconds'), (int, float)) else 'n/d'} s; GPU: {(summary.get('gpu') or {}).get('name', 'n/d')}; costo estimado: {cost} ({per_minute} por minuto de video).")
         if r["status"] == "sin_verdad_terreno":
             lines.append("- Sin verdad de terreno: tiros detectados listados, sin evaluar.")
             for d in r["detections"]:

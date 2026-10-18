@@ -64,3 +64,10 @@ def test_report_is_rendered_in_spanish_with_readable_rows(tmp_path):
     result = vr.evaluate_clip("brown", folder, {"description": "Un triple.", "shots": [{"outcome": "made", "jersey_number": "7"}]})
     text = vr.render([result], None)
     assert "convertido, camiseta 7" in text and "Límites" in text and "{'" not in text
+
+
+def test_truth_without_an_outcome_does_not_judge_the_outcome(tmp_path):
+    folder = _write(tmp_path / "a", [_shot(6.6, number="30")])
+    result = vr.evaluate_clip("a", folder, {"shots": [{"jersey_number": "30"}]})
+    assert result["rows"][0]["outcome_ok"] is None and result["rows"][0]["number_ok"] is True
+    assert "n/d" in vr.render([result], None)
