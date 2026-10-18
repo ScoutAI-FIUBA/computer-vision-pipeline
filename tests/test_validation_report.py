@@ -71,3 +71,10 @@ def test_truth_without_an_outcome_does_not_judge_the_outcome(tmp_path):
     result = vr.evaluate_clip("a", folder, {"shots": [{"jersey_number": "30"}]})
     assert result["rows"][0]["outcome_ok"] is None and result["rows"][0]["number_ok"] is True
     assert "n/d" in vr.render([result], None)
+
+
+def test_review_note_is_shown(tmp_path):
+    folder = _write(tmp_path / "a", [_shot(6.6, number="8")])
+    result = vr.evaluate_clip("d", folder, {"review_note": "Tirador verificado a mano.", "shots": [{"outcome": "made", "jersey_number": "9"}]})
+    assert result["rows"][0]["number_ok"] is False
+    assert "Nota de revisión: Tirador verificado a mano." in vr.render([result], None)

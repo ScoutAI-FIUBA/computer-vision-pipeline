@@ -78,6 +78,7 @@ def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict
         "clip": name,
         "status": "evaluado" if truth is not None else "sin_verdad_terreno",
         "description": (truth or {}).get("description"),
+        "review_note": (truth or {}).get("review_note"),
         "shots_detected": len(detected),
         "players_tracked": len(players) if summary_doc else None,
         "players_with_confirmed_number": len(confirmed) if summary_doc else (
@@ -210,6 +211,9 @@ def render(results: list[dict[str, Any]], rate: float | None) -> str:
             continue
         if r.get("description"):
             lines.append(f"Verdad de terreno: {r['description']}")
+            lines.append("")
+        if r.get("review_note"):
+            lines.append(f"Nota de revisión: {r['review_note']}")
             lines.append("")
         lines.append(
             f"- Jugadores seguidos: {r['players_tracked'] if r['players_tracked'] is not None else 'n/d'}; "
