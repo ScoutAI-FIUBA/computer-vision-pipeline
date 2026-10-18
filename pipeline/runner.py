@@ -53,6 +53,7 @@ from pipeline.number_evidence import (
 )
 from pipeline.number_predictor import build_number_predictor, normalize_number_prediction
 from pipeline.v2_numbers import _remove_artifacts, run_v2_number_evidence
+from pipeline.player_summary import build_player_summary, write_player_summary
 from pipeline.possession import resolve_possession_events
 from pipeline.possession_transitions import mark_terminal_loss_rows, resolve_possession_transitions
 from pipeline.possession_v3 import (
@@ -855,6 +856,7 @@ def _project_v2_rows(
     config: PipelineConfig,
     emit: Callable[[str], None],
     counters: dict[str, int] | None = None,
+    on_frame: Callable[[int, int], None] | None = None,
 ) -> int:
     """Project authoritative V2 rows without creating a second player pipeline."""
     if counters is not None:
@@ -869,7 +871,9 @@ def _project_v2_rows(
         frames = _read_video_frames(video_path, grouped)
         written = 0
         with output_path.open("w", encoding="utf-8") as handle:
-            for frame_index in sorted(grouped):
+            for done, frame_index in enumerate(sorted(grouped), start=1):
+                if on_frame is not None:
+                    on_frame(done, len(grouped))
                 frame = frames.get(frame_index)
                 if frame is None:
                     continue
@@ -1235,6 +1239,25 @@ _STATS_PHASE_METRIC_KEYS = {
 }
 
 
+def _stage_notifier(on_stage):
+    """Wrap the progress hook so a failing observer can never fail the job."""
+    def notify(name: str, fraction: float | None = None) -> None:
+        if on_stage is None:
+            return
+        try:
+            on_stage(name, fraction)
+        except Exception:
+            pass
+    return notify
+
+
+def _fraction_notifier(notify, name: str):
+    def update(processed: int, total: int | None) -> None:
+        if total and total > 0:
+            notify(name, min(1.0, processed / total))
+    return update
+
+
 def run_stats_from_v2_observations(
     video_path: Path,
     config: PipelineConfig,
@@ -1247,9 +1270,11 @@ def run_stats_from_v2_observations(
     clean_masks_by_observation=None,
     number_detector=None,
     metrics=None,
+    on_stage: Callable[[str, float | None], None] | None = None,
 ) -> PipelineResults:
     """Run stats stages from authoritative V2 player rows without player tracking."""
     emit = on_progress or (lambda message: print(f"[v2-stats] {message}", flush=True))
+    notify = _stage_notifier(on_stage)
 
     def phase(name: str, operation):
         started = time.perf_counter()
@@ -1283,13 +1308,16 @@ def run_stats_from_v2_observations(
 
     projected_tracks_path = output_dir / PROJECTED_TRACKS_FILENAME
     court_counters: dict[str, int] = {}
+    notify("court_projection", 0.0)
     projected_track_records = phase(
         "court projection",
         lambda: _project_v2_rows(
             video_path, projected_tracks_path, rows, info=info, config=config, emit=emit,
             **({"counters": court_counters} if metrics is not None else {}),
+            **({"on_frame": _fraction_notifier(notify, "court_projection")} if on_stage is not None else {}),
         ),
     )
+    notify("court_projection", 1.0)
 
     team_by_track_id: dict[int, int] = {}
     team_values: dict[int, set[int]] = {}
@@ -1315,16 +1343,25 @@ def run_stats_from_v2_observations(
             raise error
         emit("TrackNet start")
         tracknet_progress = _BoundedProgress(emit, "TrackNet")
+        notify("ball_tracking", 0.0)
+        tracknet_callback = tracknet_progress
+        if on_stage is not None:
+            tracknet_fraction = _fraction_notifier(notify, "ball_tracking")
+
+            def tracknet_callback(processed: int, total: int | None) -> None:
+                tracknet_progress(processed, total)
+                tracknet_fraction(processed, total)
 
         def collect_tracknet():
             _collect_tracknet_rows(
                 video_path, info=info, config=config,
                 detector=build_tracknet_detector(config.tracknet_checkpoint),
                 tracker=None, player_step=1, output_path=ball_path,
-                on_progress=tracknet_progress,
+                on_progress=tracknet_callback,
             )
 
         phase("TrackNet", collect_tracknet)
+        notify("ball_tracking", 1.0)
         tracknet_progress.complete(info.frame_count if info.frame_count > 0 else None)
         ball_rows = phase("TrackNet artifact filtering", lambda: [
             row for row in load_ball_track_rows(ball_path) if row["frame_index"] in frame_indices
@@ -1344,24 +1381,25 @@ def run_stats_from_v2_observations(
     emit("shot evidence start")
     shot_progress = _BoundedProgress(emit, "shot detection")
     shot_frames: list[int] = []
+    shot_fraction = _fraction_notifier(notify, "shot_detection")
 
     def track_shot_progress(processed: int, total: int | None) -> None:
         shot_progress(processed, total)
-        shot_frames[:] = [processed]
+        if metrics is not None:
+            shot_frames[:] = [processed]
+        if on_stage is not None:
+            shot_fraction(processed, total)
 
+    notify("shot_detection", 0.0)
     phase("shot detection", lambda: _write_shot_events(
         video_path, output_dir / SHOT_EVENTS_FILENAME, info=info, step=1, config=config,
-        on_progress=track_shot_progress if metrics is not None else shot_progress,
+        on_progress=track_shot_progress if (metrics is not None or on_stage is not None) else shot_progress,
     ))
+    notify("shot_detection", 1.0)
     shot_progress.complete(info.frame_count if info.frame_count > 0 else None)
     phase("shot outcome refinement", lambda: _refine_shot_outcomes(output_dir, config))
-    projected_shots_file, projected_shots_image_file = phase(
-        "projected shot artifacts", lambda: _maybe_write_projected_shots(output_dir)
-    )
-    phase("shot evidence", lambda: _attach_ball_evidence(
-        output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id
-    ))
     emit("possession start")
+    notify("possession", 0.0)
     possession_path, transitions_path = phase("possession", lambda: _write_possession_artifacts(
         output_dir, rows, ball_rows, fps=info.fps, frame_step=1,
         team_ids_by_track_id=team_by_track_id,
@@ -1374,17 +1412,40 @@ def run_stats_from_v2_observations(
         frame_width=info.width,
         frame_height=info.height,
     ))
+    notify("possession", 1.0)
     _remove_artifacts(output_dir)
     numbers_available = False
     number_counters: dict[str, int] = {"number_detector_frames": 0, "ocr_crops": 0}
     if getattr(config, "number_evidence_enabled", True) and number_predictor is not None:
+        notify("jersey_numbers", 0.0)
         numbers_available = phase("V2 jersey numbers", lambda: run_v2_number_evidence(
             video_path, rows, config, output_dir, predictor=number_predictor,
             masks_by_observation=masks_by_observation,
             clean_masks_by_observation=clean_masks_by_observation,
             detector=number_detector,
             **({"counters": number_counters} if metrics is not None else {}),
+            **({"on_progress": _fraction_notifier(notify, "jersey_numbers")} if on_stage is not None else {}),
         ))
+        notify("jersey_numbers", 1.0)
+    # After numbers so shooter_confirmed_number can be resolved; shot evidence reads the result.
+    projected_shots_file, projected_shots_image_file = phase(
+        "projected shot artifacts", lambda: _maybe_write_projected_shots(output_dir)
+    )
+    phase("shot evidence", lambda: _attach_ball_evidence(
+        output_dir, expected_frame_indices=frame_indices, team_ids_by_track_id=team_by_track_id
+    ))
+    player_summary_files = None
+    if projected_track_records:
+        def write_summary():
+            numbers_path = output_dir / NUMBERS_FILENAME
+            summary, paths = build_player_summary(
+                _load_jsonl_rows(projected_tracks_path),
+                numbers=json.loads(numbers_path.read_text(encoding="utf-8")) if numbers_available and numbers_path.exists() else None,
+                ball_rows=ball_rows, fps=info.fps, frame_count=info.frame_count,
+            )
+            return write_player_summary(output_dir, summary, paths)
+
+        player_summary_files = phase("player summary", write_summary)
     if metrics is not None:
         # None stays "unknown": a replaced helper that never reported must not look like zero calls.
         metrics.set_api_calls(
@@ -1444,6 +1505,8 @@ def run_stats_from_v2_observations(
                  "projected_shots": PROJECTED_SHOTS_FILENAME,
                  "projected_shots_image": PROJECTED_SHOTS_IMAGE_FILENAME,
              }} if projected_track_records else {}),
+             **({"player_summary": {"summary": player_summary_files[0], "paths": player_summary_files[1],
+                                    "schema_version": 1}} if player_summary_files else {}),
          },
     )
     emit("artifact writing start")
@@ -1456,7 +1519,7 @@ def run_stats_from_v2_generation(
     video_path: Path, config: PipelineConfig, generation_root: Path, output_dir: Path,
     manifest: dict, *, masks_by_observation=None, clean_masks_by_observation=None,
     number_predictor=None, number_detector=None, validated: bool = False,
-    tracking_payload: Mapping[str, Any] | None = None, metrics=None,
+    tracking_payload: Mapping[str, Any] | None = None, metrics=None, on_stage=None,
 ) -> PipelineResults:
     """Validate and consume one immutable tracking generation without re-tracking."""
     emit = lambda message: print(f"[v2-stats] {message}", flush=True)
@@ -1480,6 +1543,7 @@ def run_stats_from_v2_generation(
             clean_masks_by_observation=clean_masks_by_observation,
             number_predictor=number_predictor, number_detector=number_detector,
             **({"metrics": metrics} if metrics is not None else {}),
+            **({"on_stage": on_stage} if on_stage is not None else {}),
         )
     load_started = time.perf_counter()
     package_manifest_path = generation / "tracking-manifest.json"
@@ -1596,6 +1660,7 @@ def run_stats_from_v2_generation(
         clean_masks_by_observation=clean_masks_by_observation,
         number_predictor=number_predictor, number_detector=number_detector,
         **({"metrics": metrics} if metrics is not None else {}),
+        **({"on_stage": on_stage} if on_stage is not None else {}),
     )
 
 
