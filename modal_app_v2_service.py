@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import modal
@@ -38,13 +39,21 @@ APP_NAME = "scoutai-pipeline-v2-service"
 V2_APP = "scoutai-pipeline-v2"
 V2_CLASS = "PipelineV2"
 
-# v2 exposes no progress signal, so while the GPU job runs we emit a time-based
-# estimate that creeps toward a ceiling — enough to keep the UI bar moving. The
-# DONE callback fills the rest once results are uploaded. Replace this with real
-# progress once v2 emits it upstream.
+# Real progress comes from the Modal Dict that PipelineV2 writes (keyed by job id).
+# If the Dict is unreachable we fall back to a time-based creep toward a ceiling so
+# the UI bar still moves; the DONE callback fills the rest.
+PROGRESS_DICT_NAME = "scoutai-v2-progress"
 PROGRESS_HEARTBEAT_SECONDS = 12
 PROGRESS_STEP = 8
 PROGRESS_CEILING = 85
+PROGRESS_MIN = 2
+PROGRESS_MAX_RUNNING = 99
+UPLOAD_BAND = (96, 99)
+
+# Hard limits on the GPU call, across every ladder attempt. The Modal function
+# timeout (3600) stays above the deadline so we can report FAILED ourselves.
+JOB_DEADLINE_SECONDS = 3300
+STALL_SECONDS = 15 * 60
 
 DEFAULT_PROMPT = "basketball player on the court"
 # By default we process the WHOLE clip: v2's bounded window (60-130) only tracks
@@ -73,11 +82,27 @@ SEGMENT_WINDOW_LADDER = (96, 48, 24)
 # upload.
 STATS_PREFIX = "stats/"
 
-# v2 returns artifacts inline (it cannot upload to R2 itself, by design), so the
-# whole output set crosses the wire into this wrapper. Only the small stats files
-# are uploaded, but the GPU side still packs everything, so raise the cap above
-# v2's 64 MB default to leave headroom for a window with many masks.
-MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+# v2 returns artifacts inline (it cannot upload to R2 itself, by design), so we ask
+# it for only the files the backend reads and cap each one; the GPU side then never
+# packs masks or videos.
+RETURN_ARTIFACT_PATHS = [
+    "stats/projected_shots.json",
+    "stats/teams.json",
+    "stats/numbers.json",
+    "stats/results.json",
+    "stats/shot_events.jsonl",
+    "stats/player_summary.json",
+    "stats/player_paths.jsonl",
+    "stats/possession_events.jsonl",
+    "stats/possession_transitions.jsonl",
+    "stats/projected_tracks.jsonl",
+]
+RETURN_ARTIFACT_MAX_FILE_BYTES = 30 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+DEFAULT_POSSESSION_ENGINE = "v5"
+
+# Test seam for the deadline and stall clocks.
+_clock = time.monotonic
 
 app = modal.App(APP_NAME)
 
@@ -107,6 +132,7 @@ def _report_status(
     summary: dict | None = None,
     error_message: str | None = None,
     progress_percent: int | None = None,
+    progress_phase: str | None = None,
 ) -> None:
     """Tell the backend how a job is going. Never raises.
 
@@ -133,6 +159,8 @@ def _report_status(
         body["error_message"] = error_message[:1000]
     if progress_percent is not None:
         body["progress_percent"] = progress_percent
+    if progress_phase is not None:
+        body["progress_phase"] = progress_phase[:40]
 
     try:
         import urllib.error
@@ -230,22 +258,163 @@ def _is_object_cap_error(exc: Exception) -> bool:
     return "active objects" in message and "maximum" in message
 
 
-def _await_with_progress(call, job_id: str | None):
-    """Block on the GPU job, emitting a time-based progress estimate meanwhile.
+class JobAbortedError(RuntimeError):
+    """The GPU call was cancelled by the deadline or the stall watchdog."""
 
-    v2 reports no real progress, and `.get()` blocks, so we poll with a timeout
-    and nudge the bar up a step on each tick until the job returns. If the job
-    raised, `.get()` re-raises it here (not a TimeoutError), and the caller turns
-    it into a FAILED callback.
+
+class _JobProgress:
+    """Progress state for a whole job, shared by every ladder attempt.
+
+    The percent never goes down: a retried window or a restarted call (new
+    run_id) holds the last value and reports phase 'restarted' until the new run
+    gets past it.
     """
 
-    percent = 0
-    while True:
+    def __init__(self) -> None:
+        self.started = _clock()
+        self.percent = 0
+        self.phase: str | None = None
+        self.run_id: str | None = None
+        self.creep = 0
+        self.last_phase = None
+
+    def advance(self, percent: int, phase: str | None) -> tuple[int, str | None]:
+        if percent > self.percent:
+            self.percent = percent
+            self.phase = phase
+        return self.percent, self.phase
+
+    def apply_payload(self, payload: dict) -> tuple[int, str | None]:
+        run_id = payload.get("run_id")
+        phase = payload.get("phase")
         try:
-            return call.get(timeout=PROGRESS_HEARTBEAT_SECONDS)
-        except TimeoutError:
-            percent = min(PROGRESS_CEILING, percent + PROGRESS_STEP)
-            _report_status(job_id, "RUNNING", progress_percent=percent)
+            percent = int(float(payload.get("percent") or 0))
+        except (TypeError, ValueError):
+            percent = 0
+        percent = max(PROGRESS_MIN, min(PROGRESS_MAX_RUNNING, percent))
+        if run_id != self.run_id:
+            restarted = self.run_id is not None
+            self.run_id = run_id
+            if restarted:
+                self.phase = "restarted"
+        if percent > self.percent:
+            self.percent, self.phase = percent, phase
+        elif self.phase == "restarted":
+            pass
+        elif percent == self.percent and phase:
+            self.phase = phase
+        if phase:
+            self.last_phase = phase
+        return self.percent, self.phase
+
+
+def _open_progress_dict():
+    return modal.Dict.from_name(PROGRESS_DICT_NAME, create_if_missing=True)
+
+
+def _await_with_progress(call, job_id: str | None, state: _JobProgress | None = None):
+    """Block on the GPU job, reporting the pipeline's real progress meanwhile.
+
+    `.get()` blocks, so we poll with a timeout and read the pipeline's progress
+    from a Modal Dict on each tick. If the job raised, `.get()` re-raises it here
+    (not a TimeoutError) and the caller turns it into a FAILED callback. The call
+    is cancelled when the job deadline passes or the Dict stops changing.
+    """
+
+    state = state or _JobProgress()
+    progress_dict = None
+    dict_ok = True
+    try:
+        progress_dict = _open_progress_dict()
+    except Exception as error:  # noqa: BLE001 - progress is best-effort
+        print(f"[job {job_id}] progress dict unavailable, using estimate: {error!r}")
+        dict_ok = False
+
+    last_signature = None
+    last_change = _clock()
+    try:
+        while True:
+            try:
+                return call.get(timeout=PROGRESS_HEARTBEAT_SECONDS)
+            except TimeoutError:
+                pass
+
+            now = _clock()
+            if now - state.started > JOB_DEADLINE_SECONDS:
+                call.cancel()
+                raise JobAbortedError(
+                    f"deadline exceeded after {JOB_DEADLINE_SECONDS}s "
+                    f"(last phase: {state.last_phase or 'unknown'})"
+                )
+
+            payload = None
+            if dict_ok:
+                try:
+                    payload = progress_dict[job_id] if job_id else None
+                except KeyError:
+                    payload = None
+                except Exception as error:  # noqa: BLE001
+                    print(f"[job {job_id}] progress dict read failed, using estimate: {error!r}")
+                    dict_ok = False
+
+            if dict_ok:
+                signature = (
+                    (payload.get("run_id"), payload.get("percent"), payload.get("phase"),
+                     payload.get("updated_at"))
+                    if isinstance(payload, dict) else None
+                )
+                if signature != last_signature:
+                    last_signature, last_change = signature, now
+                elif now - last_change > STALL_SECONDS:
+                    call.cancel()
+                    raise JobAbortedError(
+                        f"stalled: no progress for {STALL_SECONDS // 60} minutes "
+                        f"(last phase: {state.last_phase or 'unknown'})"
+                    )
+                if isinstance(payload, dict):
+                    percent, phase = state.apply_payload(payload)
+                else:
+                    percent, phase = state.advance(PROGRESS_MIN, state.phase)
+            else:
+                state.creep = min(PROGRESS_CEILING, state.creep + PROGRESS_STEP)
+                percent, phase = state.advance(max(PROGRESS_MIN, state.creep), state.phase)
+            _report_status(
+                job_id, "RUNNING", progress_percent=percent, progress_phase=phase
+            )
+    finally:
+        if dict_ok and progress_dict is not None and job_id:
+            try:
+                progress_dict.pop(job_id)
+            except Exception:  # noqa: BLE001 - key may not exist; cleanup is best-effort
+                pass
+
+
+def _is_returnable(relative_path: str) -> bool:
+    """Whether a returned artifact is on the allowlist (exact or directory prefix)."""
+
+    return any(
+        relative_path == entry or (entry.endswith("/") and relative_path.startswith(entry))
+        for entry in RETURN_ARTIFACT_PATHS
+    )
+
+
+def _build_summary(result: dict, *, engine: str, window: int, attempts: int) -> dict:
+    """The DONE summary: the pipeline's own facts, each optional."""
+
+    video = result.get("video") or {}
+    frames = result.get("frames")
+    return {
+        "engine": "v2",
+        "acceptance": result.get("acceptance"),
+        "possession_engine": engine,
+        "segment_window": window,
+        "attempts": attempts,
+        "frames": frames,
+        "fps": video.get("fps"),
+        "duration_seconds": video.get("duration_seconds"),
+        "gpu": result.get("gpu"),
+        "timings": result.get("timings"),
+    }
 
 
 @app.function(image=image, secrets=[r2_secret, callback_secret], timeout=3600)
@@ -257,6 +426,7 @@ def run_backed_job(payload: dict) -> dict:
     """
 
     job_id = payload.get("job_id")
+    state = _JobProgress()
     r2_key = payload.get("r2_key")
     output_prefix = payload.get("output_prefix")
 
@@ -269,7 +439,8 @@ def run_backed_job(payload: dict) -> dict:
 
             # RUNNING only once the video is local, so it means "processing", not
             # "queued behind a download".
-            _report_status(job_id, "RUNNING", progress_percent=0)
+            percent, phase = state.advance(PROGRESS_MIN, "download")
+            _report_status(job_id, "RUNNING", progress_percent=percent, progress_phase=phase)
 
             frame_start, frame_end = _frame_bounds(payload, video_path)
             pipeline_v2 = modal.Cls.from_name(V2_APP, V2_CLASS)
@@ -277,7 +448,11 @@ def run_backed_job(payload: dict) -> dict:
             windows = _segment_windows(payload)
 
             result = None
+            engine = payload.get("possession_engine") or DEFAULT_POSSESSION_ENGINE
+            window = None
+            attempts = 0
             for attempt, window in enumerate(windows):
+                attempts = attempt + 1
                 overlap = _segment_overlap(payload, window)
                 call = pipeline_v2().process.spawn(
                     video_bytes=video_bytes,
@@ -285,16 +460,19 @@ def run_backed_job(payload: dict) -> dict:
                     frame_start=frame_start,
                     frame_end=frame_end,
                     return_artifacts=True,
-                    possession_engine=payload.get("possession_engine"),
+                    possession_engine=engine,
                     # Segmented so a whole-clip run stays under SAM 3.1's
                     # 16-object-per-session limit and keeps team/identity resolution.
                     segmented=payload.get("segmented", DEFAULT_SEGMENTED),
                     segment_window=window,
                     segment_overlap=overlap,
                     max_artifact_bytes=MAX_ARTIFACT_BYTES,
+                    return_artifact_paths=RETURN_ARTIFACT_PATHS,
+                    return_artifact_max_file_bytes=RETURN_ARTIFACT_MAX_FILE_BYTES,
+                    progress_key=job_id,
                 )
                 try:
-                    result = _await_with_progress(call, job_id)
+                    result = _await_with_progress(call, job_id, state)
                     break
                 except Exception as exc:  # noqa: BLE001 - only the cap error is retriable
                     if _is_object_cap_error(exc) and attempt < len(windows) - 1:
@@ -302,21 +480,28 @@ def run_backed_job(payload: dict) -> dict:
                             f"[job {job_id}] segment window {window} tripped the 16-object "
                             f"cap; retrying with a smaller window"
                         )
-                        _report_status(job_id, "RUNNING", progress_percent=0)
+                        # Hold the percent: the bar must not go backwards on a retry.
+                        percent, phase = state.advance(0, "restarted")
+                        _report_status(
+                            job_id, "RUNNING", progress_percent=percent,
+                            progress_phase="restarted",
+                        )
                         continue
                     raise
 
-            artifacts = (result or {}).get("artifacts") or {}
+            result = result or {}
+            artifacts = result.get("artifacts") or {}
+            for skipped in result.get("artifacts_skipped") or []:
+                print(f"[job {job_id}] artifact skipped on the GPU side: {skipped}")
+            percent = max(state.percent, UPLOAD_BAND[0])
+            _report_status(job_id, "RUNNING", progress_percent=percent, progress_phase="upload")
             uploaded: list[str] = []
             if output_prefix:
                 prefix = output_prefix.rstrip("/") + "/"
                 for relative_path, data in artifacts.items():
-                    # Only the box-score outputs matter to the backend; raw masks
-                    # and the manifest are left on the GPU side. The stats files
-                    # are flattened to the results-key root, which is where the
-                    # stats endpoints read `projected_shots.json`, `teams.json`,
-                    # `numbers.json`, `projected_tracks.jsonl`, etc.
-                    if not relative_path.startswith(STATS_PREFIX):
+                    # Only allowlisted box-score outputs are uploaded, flattened to
+                    # the results-key root where the stats endpoints read them.
+                    if not _is_returnable(relative_path) or not relative_path.startswith(STATS_PREFIX):
                         continue
                     name = relative_path[len(STATS_PREFIX):]
                     staged = work / "upload.bin"
@@ -328,7 +513,7 @@ def run_backed_job(payload: dict) -> dict:
                 job_id,
                 "DONE",
                 artifacts=uploaded,
-                summary={"engine": "v2", "acceptance": result.get("acceptance")},
+                summary=_build_summary(result, engine=engine, window=window, attempts=attempts),
                 progress_percent=100,
             )
             return {"status": "DONE", "artifacts": uploaded}

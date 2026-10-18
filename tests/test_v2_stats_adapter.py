@@ -1502,3 +1502,107 @@ def test_v2_number_evidence_counts_detector_frames_and_ocr_crops(tmp_path, monke
     )
 
     assert counters == {"number_detector_frames": 2, "ocr_crops": 2}
+
+
+def _fake_stats_run(tmp_path, monkeypatch, *, on_stage, order=None, hook_numbers=True):
+    import pipeline.runner as runner
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(runner, "probe", lambda _path: SimpleNamespace(
+        fps=30.0, frame_count=3, width=100, height=100, duration_seconds=0.1))
+
+    def fake_project(_video, path, rows, *, on_frame=None, **_kwargs):
+        for done in range(1, 3):
+            if on_frame is not None:
+                on_frame(done, 2)
+        path.write_text("".join(json.dumps({
+            "frame_index": row["frame_index"], "track_id": row["track_id"],
+            "stable_player_id": row["stable_player_id"], "team_id": 1,
+            "court_xy_m": [5.0 + row["frame_index"], 7.0],
+        }) + "\n" for row in rows))
+        return len(rows)
+
+    def fake_shots(_video, path, *, on_progress=None, **_kwargs):
+        path.write_text("")
+        if on_progress is not None:
+            on_progress(1, 2)
+            on_progress(2, 2)
+
+    def fake_collect(_video, *, output_path, on_progress=None, **_kwargs):
+        output_path.write_text("")
+        if on_progress is not None:
+            on_progress(1, 2)
+
+    def fake_numbers(_video, rows, _config, output_dir, *, on_progress=None, **_kwargs):
+        if on_progress is not None:
+            on_progress(1, 1)
+        (output_dir / "numbers.json").write_text(json.dumps({"players": [
+            {"stable_player_id": "player-001", "number": "7", "status": "confirmed", "support_count": 3}]}))
+        (output_dir / "number_manifest.json").write_text(json.dumps({"artifacts": {}}))
+        return True
+
+    real_projected = runner._maybe_write_projected_shots
+
+    def spy_projected(output_dir):
+        if order is not None:
+            order.append(("projected_shots", (output_dir / "numbers.json").exists()))
+        return real_projected(output_dir)
+
+    monkeypatch.setattr(runner, "_project_v2_rows", fake_project)
+    monkeypatch.setattr(runner, "_write_shot_events", fake_shots)
+    monkeypatch.setattr(runner, "_collect_tracknet_rows", fake_collect)
+    monkeypatch.setattr(runner, "build_tracknet_detector", lambda _checkpoint: object())
+    monkeypatch.setattr(runner, "run_v2_number_evidence", fake_numbers)
+    monkeypatch.setattr(runner, "_maybe_write_projected_shots", spy_projected)
+    config = PipelineConfig(
+        roboflow_api_key="test-key", court_model_id="court/1", team_embedder_backend="none",
+        tracknet_enabled=True, tracknet_checkpoint="ckpt",
+    )
+    observations = [
+        {"frame_index": frame, "raw_track_id": 17, "stable_player_id": "player-001", "team_id": 1,
+         "bbox_xyxy": [10, 10, 30, 50], "track_state": "tracked"}
+        for frame in (0, 1, 2)
+    ]
+    return run_stats_from_v2_observations(
+        video, config, tmp_path / "stats", observations, number_predictor=object(),
+        **({"on_stage": on_stage} if on_stage is not None else {}),
+    )
+
+
+def test_on_stage_reports_canonical_phases_in_order(tmp_path, monkeypatch):
+    calls = []
+    _fake_stats_run(tmp_path, monkeypatch, on_stage=lambda name, fraction=None: calls.append((name, fraction)))
+
+    names = [name for name, _ in calls]
+    deduped = [name for index, name in enumerate(names) if index == 0 or names[index - 1] != name]
+    assert deduped == ["court_projection", "ball_tracking", "shot_detection", "possession", "jersey_numbers"]
+    for name in deduped:
+        fractions = [fraction for phase_name, fraction in calls if phase_name == name]
+        assert fractions[0] == 0.0 and fractions[-1] == 1.0
+    assert all(0.0 <= fraction <= 1.0 for _, fraction in calls)
+    assert ("court_projection", 0.5) in calls and ("jersey_numbers", 1.0) in calls
+
+
+def test_on_stage_errors_never_break_the_run(tmp_path, monkeypatch):
+    def broken(*_args):
+        raise RuntimeError("sink down")
+
+    result = _fake_stats_run(tmp_path, monkeypatch, on_stage=broken)
+
+    assert result.numbers_file == "numbers.json"
+    assert (tmp_path / "stats" / "results.json").exists()
+
+
+def test_numbers_exist_before_projected_shots_and_summary_is_written(tmp_path, monkeypatch):
+    order = []
+    result = _fake_stats_run(tmp_path, monkeypatch, on_stage=None, order=order)
+
+    assert order == [("projected_shots", True)]
+    stats = tmp_path / "stats"
+    summary = json.loads((stats / "player_summary.json").read_text())
+    assert summary["players"][0]["jersey"] == {"number": "7", "status": "confirmed", "support_count": 3}
+    assert summary["players"][0]["frames_observed"] == 3
+    assert summary["ball"] == {"detected_frames": 0, "frames": 0}
+    assert (stats / "player_paths.jsonl").exists()
+    assert result.artifact_references["player_summary"]["summary"] == "player_summary.json"

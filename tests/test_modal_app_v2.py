@@ -2684,7 +2684,8 @@ def test_process_exposes_runtime_diagnostics_only_through_explicit_debug_respons
     assert "debug_diagnostics" not in normal
     assert "runtime_diagnostics" not in json.loads(normal["artifacts"]["tracks.jsonl"].decode())
     assert "runtime_diagnostics" not in json.loads(normal["artifacts"]["manifest.json"].decode())
-    assert debug == {"acceptance": {}, "debug_diagnostics": diagnostics}
+    assert debug.keys() == {"acceptance", "debug_diagnostics", "timings", "gpu", "frames"}
+    assert debug["acceptance"] == {} and debug["debug_diagnostics"] == diagnostics
 
 
 def test_conflicting_team_response_keeps_rejected_policy_with_debug_opt_in(monkeypatch):
@@ -2760,11 +2761,10 @@ def test_conflicting_team_response_keeps_rejected_policy_with_debug_opt_in(monke
         cls(), video_bytes=b"same-input", frame_start=60, frame_end=61, return_diagnostics=True
     )
 
-    assert normal == {
-        "acceptance": {"tracking_identity": "unvalidated", "statistics": "deferred"}
-    }
+    assert normal["acceptance"] == {"tracking_identity": "unvalidated", "statistics": "deferred"}
+    assert set(normal) == {"acceptance", "timings", "gpu", "frames"}
     assert debug["acceptance"] == normal["acceptance"]
-    assert debug.keys() == {"acceptance", "debug_diagnostics"}
+    assert debug.keys() == {"acceptance", "debug_diagnostics", "timings", "gpu", "frames"}
     assert debug["debug_diagnostics"]["team_vote_diagnostics"] == {
         "player-7": {"cluster_votes": {"0": 1, "1": 1}, "total_samples": 2}
     }
@@ -2868,7 +2868,8 @@ def test_process_preserves_explicit_runner_acceptance_states(monkeypatch, accept
 
     payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60)
 
-    assert payload == {"acceptance": acceptance}
+    assert payload["acceptance"] == acceptance
+    assert set(payload) == {"acceptance", "timings", "gpu", "frames"}
 
 
 def test_process_size_limit_fails_before_returning_partial_artifacts(monkeypatch):
@@ -3255,3 +3256,245 @@ def test_local_entrypoint_prints_client_side_job_timing(tmp_path, monkeypatch, c
     modal_app_v2.main(video_path=str(video), staged=True, job_id="job-9")
     last = capsys.readouterr().out.strip().splitlines()[-1]
     assert JOB_LINE_RE.match(last)["job_id"] == "job-9"
+
+
+# --- progress channel and artifact allowlist ---------------------------------
+
+
+def _process_fn():
+    import modal_app_v2
+
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items() if key.startswith("_sync_original"))._user_cls
+    raw = cls.process.__dict__[next(key for key in cls.process.__dict__ if key.startswith("_sync_original"))].raw_f
+    return cls, raw
+
+
+def _patch_process(monkeypatch, cls, *, metadata=None, track=None):
+    import modal_app_v2
+
+    monkeypatch.setattr(modal_app_v2, "_track_video", track or (lambda *args, **kwargs: ([], {})))
+    monkeypatch.setattr(modal_app_v2, "_video_metadata", lambda _path: metadata if metadata is not None else {})
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {})
+    monkeypatch.setattr(cls, "_ensure_predictor", lambda _self: object())
+
+
+class _FakeDict(dict):
+    pass
+
+
+def _fake_modal_dict(monkeypatch, store, *, fail=False):
+    import modal_app_v2
+
+    created = []
+
+    def from_name(name, create_if_missing=False):
+        created.append((name, create_if_missing))
+        if fail:
+            raise RuntimeError("dict down")
+        return store
+
+    monkeypatch.setattr(modal_app_v2.modal.Dict, "from_name", staticmethod(from_name))
+    return created
+
+
+def test_process_writes_phase_payloads_and_new_run_id_per_call(monkeypatch):
+    cls, process = _process_fn()
+    _patch_process(monkeypatch, cls, metadata={"fps": 30.0, "frame_count": 90})
+    writes = []
+
+    class Recorder(dict):
+        def __setitem__(self, key, value):
+            writes.append((key, value))
+            super().__setitem__(key, value)
+
+    store = Recorder()
+    created = _fake_modal_dict(monkeypatch, store)
+
+    first = process(cls(), video_bytes=b"v", frame_start=60, frame_end=60, progress_key="job-7")
+    first_writes = list(writes)
+    writes.clear()
+    process(cls(), video_bytes=b"v", frame_start=60, frame_end=60, progress_key="job-7")
+
+    assert created and set(created) == {("scoutai-v2-progress", True)}
+    assert {key for key, _ in first_writes} == {"job-7"}
+    phases = [payload["phase"] for _, payload in first_writes]
+    assert phases[0] == "model_load"
+    assert {"tracking", "identity", "packaging"} <= set(phases)
+    percents = [payload["percent"] for _, payload in first_writes]
+    assert percents == sorted(percents)
+    last = first_writes[-1][1]
+    assert set(last) == {"run_id", "phase", "fraction", "percent", "updated_at", "timings"}
+    assert last["phase"] == "packaging" and last["fraction"] == 1.0 and last["percent"] == 50.0
+    assert set(last["timings"]) >= {"model_load", "tracking", "identity", "packaging"}
+    assert first_writes[0][1]["run_id"] == last["run_id"]
+    assert writes[0][1]["run_id"] != last["run_id"]
+    assert first["video"] == {"fps": 30.0, "frame_count": 90, "duration_seconds": 3.0}
+    assert first["frames"] == {"requested": 1, "processed": 0}
+    assert set(first) >= {"acceptance", "timings", "gpu", "frames", "video"}
+
+
+def test_process_never_fails_when_progress_dict_raises(monkeypatch):
+    cls, process = _process_fn()
+    _patch_process(monkeypatch, cls)
+    _fake_modal_dict(monkeypatch, {}, fail=True)
+
+    payload = process(cls(), video_bytes=b"v", frame_start=60, frame_end=60, progress_key="job-1")
+
+    assert "acceptance" in payload
+    assert "video" not in payload
+
+
+def test_process_without_progress_key_skips_dict_and_on_stage(monkeypatch):
+    import modal_app_v2
+
+    cls, process = _process_fn()
+    _patch_process(monkeypatch, cls)
+    created = _fake_modal_dict(monkeypatch, {})
+    seen = []
+
+    def stats(_video, output_dir, _observations, **kwargs):
+        seen.append(kwargs)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "results.json").write_text("{}", encoding="utf-8")
+        (output_dir / "tracks.jsonl").write_text("", encoding="utf-8")
+        return types.SimpleNamespace(to_dict=lambda: {
+            "tracks_file": "tracks.jsonl", "teams_file": None, "numbers_file": None, "shot_events_file": None,
+        })
+
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", stats)
+    process(cls(), video_bytes=b"v", frame_start=60, frame_end=60)
+    process(cls(), video_bytes=b"v", frame_start=60, frame_end=60, progress_key="k")
+
+    assert created == [("scoutai-v2-progress", True)]
+    assert "on_stage" not in seen[0]
+    assert callable(seen[1]["on_stage"])
+
+
+def test_segmented_tracking_reports_segment_fraction(monkeypatch, tmp_path):
+    import modal_app_v2
+
+    segments = [types.SimpleNamespace(ordinal=i, frame_count=2) for i in range(4)]
+    monkeypatch.setattr(modal_app_v2, "plan_segment_windows", lambda *a, **k: segments)
+    monkeypatch.setattr(modal_app_v2, "extract_segment_video", lambda *a, **k: None)
+    monkeypatch.setattr(modal_app_v2, "_track_video", lambda *a, **k: ([], {}))
+    monkeypatch.setattr(modal_app_v2, "prune_segment_object_overflow", lambda rows, **k: rows)
+    monkeypatch.setattr(modal_app_v2, "assert_segment_object_limit", lambda *a, **k: None)
+    monkeypatch.setattr(modal_app_v2, "remap_segment_rows", lambda rows, masks, seg: (rows, masks))
+    monkeypatch.setattr(modal_app_v2, "stitch_segment_seams", lambda r, m, **k: (r, m))
+    monkeypatch.setattr(modal_app_v2, "deduplicate_segment_observations", lambda r, m, **k: (r, m))
+    fractions = []
+
+    modal_app_v2._track_segmented_video(
+        object(), tmp_path / "v.mp4", "p", 0, 7, tmp_path, window=2, on_progress=fractions.append
+    )
+
+    assert fractions == [0.25, 0.5, 0.75, 1.0]
+
+
+def test_track_video_reports_frame_fraction():
+    import modal_app_v2
+
+    class Predictor:
+        class Model:
+            def init_state(self, **_kwargs):
+                return None
+
+        model = Model()
+
+        def handle_request(self, request):
+            return {"session_id": "s"} if request["type"] == "start_session" else None
+
+        def handle_stream_request(self, _request):
+            for index in (10, 11):
+                yield {"frame_index": index, "out_obj_ids": [], "out_boxes_xywh": [], "out_probs": []}
+
+    fractions = []
+    modal_app_v2._track_video(Predictor(), Path("v.mp4"), "p", 10, 11, on_progress=fractions.append)
+
+    assert fractions == [0.5, 1.0]
+
+
+def _populate_output(tmp_path):
+    out = tmp_path / "out"
+    (out / "stats").mkdir(parents=True)
+    (out / "masks").mkdir()
+    (out / "stats" / "teams.json").write_bytes(b"t")
+    (out / "stats" / "results.json").write_bytes(b"r")
+    (out / "stats" / "big.jsonl").write_bytes(b"x" * 100)
+    (out / "stats" / "sub").mkdir()
+    (out / "stats" / "sub" / "a.json").write_bytes(b"a")
+    (out / "masks" / "m.png").write_bytes(b"m" * 1000)
+    return out
+
+
+def test_collect_artifacts_allowlist_selects_exact_and_prefix(tmp_path):
+    import modal_app_v2
+
+    out = _populate_output(tmp_path)
+
+    result = modal_app_v2.collect_artifacts(out, allow_paths=["stats/teams.json", "stats/sub/"])
+
+    assert set(result) == {"stats/teams.json", "stats/sub/a.json"}
+    assert modal_app_v2.collect_artifacts(out, allow_paths=[]) == {}
+    # Without a slash the entry is an exact path, not a prefix.
+    assert modal_app_v2.collect_artifacts(out, allow_paths=["stats"]) == {}
+    assert len(modal_app_v2.collect_artifacts(out)) == 5
+
+
+def test_collect_artifacts_skips_oversize_selected_files_and_reports_them(tmp_path):
+    import modal_app_v2
+
+    out = _populate_output(tmp_path)
+    skipped = []
+
+    result = modal_app_v2.collect_artifacts(
+        out, allow_paths=["stats/"], max_file_bytes=50, skipped=skipped
+    )
+
+    assert set(result) == {"stats/teams.json", "stats/results.json", "stats/sub/a.json"}
+    assert skipped == [{"path": "stats/big.jsonl", "bytes": 100}]
+
+
+def test_allowlist_ignores_excluded_huge_file_for_total_limit(tmp_path):
+    import modal_app_v2
+
+    out = _populate_output(tmp_path)
+    with open(out / "masks" / "huge.bin", "wb") as handle:
+        handle.truncate(200 * 1024 * 1024)
+
+    result = modal_app_v2.collect_artifacts(out, allow_paths=["stats/teams.json"])
+
+    assert set(result) == {"stats/teams.json"}
+    with pytest.raises(ValueError, match="exceeds configured artifact return limit"):
+        modal_app_v2.collect_artifacts(out)
+
+
+def test_process_allowlist_reports_artifacts_skipped(monkeypatch):
+    import modal_app_v2
+
+    cls, process = _process_fn()
+    _patch_process(monkeypatch, cls)
+
+    def stats(_video, output_dir, _observations, **_kwargs):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "results.json").write_text("{}", encoding="utf-8")
+        (output_dir / "tracks.jsonl").write_text("", encoding="utf-8")
+        (output_dir / "projected_shots.json").write_bytes(b"x" * 64)
+        return types.SimpleNamespace(to_dict=lambda: {
+            "tracks_file": "tracks.jsonl", "teams_file": None, "numbers_file": None, "shot_events_file": None,
+        })
+
+    monkeypatch.setattr(modal_app_v2, "_run_v2_stats", stats)
+
+    payload = process(
+        cls(), video_bytes=b"v", frame_start=60, frame_end=60, return_artifacts=True,
+        return_artifact_paths=["stats/results.json", "stats/projected_shots.json"],
+        return_artifact_max_file_bytes=32,
+    )
+
+    assert set(payload["artifacts"]) == {"stats/results.json"}
+    assert payload["artifacts_skipped"] == [{"path": "stats/projected_shots.json", "bytes": 64}]
+
+    plain = process(cls(), video_bytes=b"v", frame_start=60, frame_end=60, return_artifacts=True)
+    assert "manifest.json" in plain["artifacts"]
+    assert "artifacts_skipped" not in plain

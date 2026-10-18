@@ -148,6 +148,7 @@ def run_v2_number_evidence(
     clean_masks_by_observation=None,
     detector=None,
     counters: dict[str, int] | None = None,
+    on_progress=None,
 ) -> bool:
     """Use legacy detector number boxes, associated to authoritative V2 players."""
     if counters is not None:
@@ -170,7 +171,9 @@ def run_v2_number_evidence(
     capture = cv2.VideoCapture(str(video_path))
     records = []
     try:
-        for frame_index in sorted(by_frame):
+        for done, frame_index in enumerate(sorted(by_frame), start=1):
+            if on_progress is not None:
+                on_progress(done, len(by_frame))
             capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             ok, frame = capture.read()
             if not ok:
