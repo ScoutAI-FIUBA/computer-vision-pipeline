@@ -74,15 +74,41 @@ def load_clip(name: str, folder: Path, csv_path: Path | None, truth: dict[str, A
     pass_events = [e for e in events if e.get("type") == "pass"]
     transfers = [e for e in events if e.get("type") == "possession_transfer"]
     tolerance = float((truth or {}).get("tolerance_seconds", DEFAULT_TOLERANCE))
+
+    jersey_of: dict[str, str] = {}
+    numbers_path = folder / "numbers.json"
+    if numbers_path.is_file():
+        for player in _json(numbers_path).get("players", []):
+            if player.get("status") == "confirmed" and player.get("number"):
+                jersey_of[player["stable_player_id"]] = str(player["number"])
+    for event in pass_events + transfers:
+        event["from_jersey"] = jersey_of.get(event.get("from_stable_player_id"))
+        event["to_jersey"] = jersey_of.get(event.get("to_stable_player_id"))
+
+    def _label(event: dict[str, Any]) -> str:
+        return f"{event.get('from_jersey') or '?'}→{event.get('to_jersey') or '?'}"
+
     matched = 0
     if wanted is not None:
         free = list(range(len(pass_events)))
         for expected in wanted:
-            t = expected.get("approx_time_seconds")
-            best = min(free, key=lambda i: abs(pass_events[i]["timestamp_seconds"] - t), default=None) if t is not None else (free[0] if free else None)
-            if best is not None and (t is None or abs(pass_events[best]["timestamp_seconds"] - t) <= tolerance):
-                free.remove(best)
+            hit = None
+            for i in free:
+                event = pass_events[i]
+                if expected.get("from") is not None and (event["from_jersey"], event["to_jersey"]) != (str(expected["from"]), str(expected["to"])):
+                    continue
+                when = expected.get("approx_time_seconds")
+                if when is not None and abs(event["timestamp_seconds"] - when) > tolerance:
+                    continue
+                if expected.get("from") is None and when is None:
+                    continue  # nothing to match on: never counted as a hit
+                hit = i
+                break
+            if hit is not None:
+                free.remove(hit)
                 matched += 1
+    sequence_real = ", ".join(f"{x.get('from', '?')}→{x.get('to', '?')}" for x in wanted) if wanted else ""
+    sequence_found = ", ".join(_label(e) for e in pass_events)
     return {
         "clip": name,
         "description": (truth or {}).get("description"),
@@ -96,6 +122,9 @@ def load_clip(name: str, folder: Path, csv_path: Path | None, truth: dict[str, A
         "ball_truth": ball_truth,
         "pass_events": pass_events,
         "transfers": transfers,
+        "sequence_real": sequence_real,
+        "sequence_found": sequence_found,
+        "changes_real": (truth or {}).get("possession_changes"),
         "wanted": wanted,
         "matched": matched,
         "linked_to_roster": (stats.get("coverage") or {}).get("players_linked_to_roster"),

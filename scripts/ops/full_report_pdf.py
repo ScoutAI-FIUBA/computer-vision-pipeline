@@ -128,6 +128,12 @@ def build(args: argparse.Namespace) -> Path:
             detected = "; ".join(vr._fmt_found(d) for d in s.get("detections", [])) or "ninguno"
             parts.append("Tiros: sin anotar. Detectados por el sistema: " + tex(detected) + ".\n")
         wanted = p["wanted"]
+        if wanted:
+            parts.append("Pases reales, en orden (quién pasa a quién): " + tex(p["sequence_real"]) + ".\n")
+        if p["pass_events"]:
+            parts.append("Pases detectados: " + tex(p["sequence_found"]) + " (``?'' = camiseta no leída).\n")
+        if p["changes_real"] is not None:
+            parts.append(f"Cambios de posesión reales: {p['changes_real']}; detectados por el sistema: {len(p['transfers'])}.\n")
         parts.append("Pases: " + (f"reales {len(wanted)}, detectados correctamente {p['matched']}, sin pase real "
                                   f"{len(p['pass_events']) - p['matched']}." if wanted is not None
                                   else f"sin anotar; el sistema detectó {len(p['pass_events'])}.")
