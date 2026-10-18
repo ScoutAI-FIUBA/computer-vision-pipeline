@@ -468,6 +468,11 @@ def test_possession_only_stage_loads_durable_inputs_records_failure_and_retries_
     assert possession["tracking_generation"] == tracking["generation"]
     assert possession["complete"] is True
     assert len(list((job / "possession" / "generations").iterdir())) == 1
+    metrics = json.loads((job / "possession" / "generations" / first["generation"] / "stage_metrics.json").read_text())
+    assert metrics["stage"] == "possession"
+    assert metrics["attempt"] == 2
+    assert "possession_seconds" in metrics["phases"]
+    assert "stage_metrics.json" in possession["artifacts"]
 
 
 def test_stale_and_replacement_inputs_are_isolated_and_stats_rejects_tampering(tmp_path: Path, monkeypatch):
@@ -3113,12 +3118,12 @@ def test_track_stage_recomputes_when_matching_generation_is_corrupt(tmp_path: Pa
     tracked, _stats = _run_track_then_stats(cls, instance)
     (tmp_path / "job-1" / "tracking" / "generations" / tracked["generation"] / "tracks.jsonl").write_text("corrupt")
 
-    # Generation ids are content-addressed, so republishing over the corrupt directory is refused
-    # (pre-existing behaviour); the point here is that a corrupt generation is never reused.
-    with pytest.raises(ValueError, match="hash mismatch"):
-        instance._track_stage(job_id="job-1", video_bytes=b"video", prompt="player",
-                              frame_start=0, frame_end=0, worker_id="worker-a")
+    # stage_metrics.json carries timestamps, so the recompute lands in a new generation instead of
+    # colliding with the corrupt directory; the corrupt one is never reused.
+    again = instance._track_stage(job_id="job-1", video_bytes=b"video", prompt="player",
+                                  frame_start=0, frame_end=0, worker_id="worker-a")
 
+    assert again["generation"] != tracked["generation"]
     assert calls["tracker"] == 2
 
 
@@ -3135,3 +3140,118 @@ def test_repeated_staged_process_on_completed_job_runs_no_tracker_or_stats(tmp_p
     assert second == first
     assert calls == {"tracker": 1, "predictor": 1, "stats": 1}
     assert job_json.read_bytes() == before_bytes
+
+
+def _generation_metrics(tmp_path: Path, stage: str, generation: str) -> dict:
+    path = tmp_path / "job-1" / stage / "generations" / generation / "stage_metrics.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_tracking_and_stats_publish_hashed_stage_metrics(tmp_path: Path, monkeypatch, capsys):
+    import modal_app_v2
+    from pipeline.results import load_stage_generation
+    from pipeline.stage_metrics import STAGE_LINE_RE
+
+    cls, instance, _calls = _staged_reuse_setup(tmp_path, monkeypatch)
+    tracked, stats = _run_track_then_stats(cls, instance)
+
+    tracking_metrics = _generation_metrics(tmp_path, "tracking", tracked["generation"])
+    assert tracking_metrics["schema"] == "v2-stage-metrics-1"
+    assert tracking_metrics["stage"] == "tracking"
+    assert tracking_metrics["attempt"] == 1
+    assert tracking_metrics["function_timeout_seconds"] == modal_app_v2.PIPELINE_TIMEOUT_SECONDS
+    assert tracking_metrics["timeout_margin_seconds"] == pytest.approx(
+        modal_app_v2.PIPELINE_TIMEOUT_SECONDS - tracking_metrics["elapsed_seconds"])
+    assert {"model_load_seconds", "tracking_seconds", "identity_seconds", "artifact_write_seconds"} <= set(
+        tracking_metrics["phases"])
+    assert tracking_metrics["frames"] == {"requested": 1, "processed": 1}
+    assert tracking_metrics["api_calls"]["roboflow_ocr_crops"] == 0
+    assert tracking_metrics["gpu"] is None  # no CUDA in the test environment
+    assert tracking_metrics["container"] == {"cpu": None, "memory_mib": None}
+
+    stats_metrics = _generation_metrics(tmp_path, "stats", stats["generation"])
+    assert stats_metrics["stage"] == "stats"
+    assert stats_metrics["attempt"] == 1
+    assert "generation_validation_seconds" in stats_metrics["phases"]
+    assert stats_metrics["frames"]["requested"] == 1
+    # The fake stats worker reports nothing, so counts stay unknown instead of zero.
+    assert set(stats_metrics["api_calls"].values()) == {None}
+
+    # Hashed into the generation manifest, so tampering is detected.
+    for stage, generation in (("tracking", tracked["generation"]), ("stats", stats["generation"])):
+        loaded = load_stage_generation(tmp_path / "job-1" / stage, generation)
+        assert "stage_metrics.json" in loaded["artifacts"]
+    lines = [STAGE_LINE_RE.match(line) for line in capsys.readouterr().out.splitlines()
+             if line.startswith("[v2-timing] stage=")]
+    assert [line["stage"] for line in lines] == ["tracking", "stats"]
+
+
+def test_reuse_does_not_write_metrics_or_touch_the_job(tmp_path: Path, monkeypatch, capsys):
+    cls, instance, _calls = _staged_reuse_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("MODAL_TASK_ID", "task-1")
+    _staged_process(cls, instance)
+    job_json = tmp_path / "job-1" / "job.json"
+    before = job_json.read_bytes()
+    capsys.readouterr()
+
+    _staged_process(cls, instance)
+
+    assert job_json.read_bytes() == before
+    assert "[v2-timing]" not in capsys.readouterr().out
+    for stage in ("tracking", "stats"):
+        generations = list((tmp_path / "job-1" / stage / "generations").iterdir())
+        assert len(generations) == 1
+        assert len(list(generations[0].glob("stage_metrics.json"))) == 1
+
+
+def test_stats_stage_forwards_metrics_to_the_stats_runner(tmp_path: Path, monkeypatch):
+    cls, instance, _calls = _staged_reuse_setup(tmp_path, monkeypatch)
+    import modal_app_v2
+
+    seen = {}
+
+    def stats_worker(_video, _config, _root, output, *_args, metrics=None, **_kwargs):
+        seen["metrics"] = metrics
+        metrics.add_phase("shot_detection_seconds", 1.25)
+        metrics.set_api_calls(roboflow_shot_detection_frames=7)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "results.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_generation", stats_worker)
+    _tracked, stats = _run_track_then_stats(cls, instance)
+
+    record = _generation_metrics(tmp_path, "stats", stats["generation"])
+    assert record["phases"]["shot_detection_seconds"] == 1.25
+    assert record["api_calls"]["roboflow_shot_detection_frames"] == 7
+
+
+def test_function_timeout_constant_drives_the_class_decorator_and_container_is_undeclared():
+    import modal_app_v2
+
+    tree = ast.parse((Path(__file__).parents[1] / "modal_app_v2.py").read_text(encoding="utf-8"))
+    pipeline = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "PipelineV2")
+    decorator = next(d for d in pipeline.decorator_list if isinstance(d, ast.Call))
+    keywords = {keyword.arg: keyword.value for keyword in decorator.keywords}
+    assert isinstance(keywords["timeout"], ast.Name) and keywords["timeout"].id == "PIPELINE_TIMEOUT_SECONDS"
+    assert "cpu" not in keywords and "memory" not in keywords
+    assert modal_app_v2.PIPELINE_CONTAINER == {"cpu": None, "memory_mib": None}
+
+
+def test_local_entrypoint_prints_client_side_job_timing(tmp_path, monkeypatch, capsys):
+    import modal_app_v2
+    from pipeline.stage_metrics import JOB_LINE_RE
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+
+    class FakeProcess:
+        def remote(self, **_kwargs):
+            return {"status": "complete"}
+
+    class FakePipeline:
+        process = FakeProcess()
+
+    monkeypatch.setattr(modal_app_v2, "PipelineV2", FakePipeline)
+    modal_app_v2.main(video_path=str(video), staged=True, job_id="job-9")
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert JOB_LINE_RE.match(last)["job_id"] == "job-9"

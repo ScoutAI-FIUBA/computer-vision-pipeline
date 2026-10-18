@@ -1430,3 +1430,75 @@ def test_run_stats_v2_disabled_numbers_skip_initialization_and_remove_reused_art
     assert all(not (output / name).exists() for name in (
         "numbers.json", "number_predictions.json", "number_prediction_cases.jsonl", "number_manifest.json",
     ))
+
+
+def test_v2_stats_reports_phase_timings_and_api_counts_to_metrics(tmp_path, monkeypatch):
+    import pipeline.runner as runner
+    from pipeline.stage_metrics import StageMetrics
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        runner, "probe",
+        lambda _path: SimpleNamespace(fps=30.0, frame_count=2, width=100, height=100, duration_seconds=2 / 30),
+    )
+
+    def shot_events(_video, path, *, on_progress=None, **_kwargs):
+        path.write_text("")
+        on_progress(0, 2)
+        on_progress(2, 2)
+
+    monkeypatch.setattr(runner, "_write_shot_events", shot_events)
+    monkeypatch.setattr(runner, "_read_video_frames", lambda _path, _indices: {0: 0, 1: 1})
+    monkeypatch.setattr(runner, "_build_detector_for_model", lambda *_a, **_k: SimpleNamespace(detect=lambda _f: {}))
+    monkeypatch.setattr(runner, "parse_court_keypoints", lambda *_a, **_k: [])
+    monkeypatch.setattr(runner, "compute_frame_homography", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad")))
+    observations = [
+        {"frame_index": frame, "raw_track_id": 17, "stable_player_id": "player-001",
+         "bbox_xyxy": [10, 10, 30, 50], "team_id": 1, "track_state": "tracked", "confidence": 0.95}
+        for frame in (0, 1)
+    ]
+    config = PipelineConfig(roboflow_api_key="test-key", team_embedder_backend="none",
+                            court_model_id="court-model/1")
+    metrics = StageMetrics("stats", function_timeout_seconds=60)
+
+    run_stats_from_v2_observations(video, config, tmp_path / "stats", observations, metrics=metrics)
+
+    record = metrics.build()
+    assert {"court_projection_seconds", "shot_detection_seconds", "possession_seconds",
+            "artifact_write_seconds"} <= set(record["phases"])
+    assert record["api_calls"] == {
+        "roboflow_shot_detection_frames": 2,
+        "roboflow_court_detection_frames": 2,
+        "roboflow_number_detector_frames": 0,
+        "roboflow_ocr_crops": 0,
+    }
+
+
+def test_v2_number_evidence_counts_detector_frames_and_ocr_crops(tmp_path, monkeypatch):
+    import pipeline.v2_numbers as numbers
+
+    class Capture:
+        def set(self, *_a): pass
+        def read(self): return True, SimpleNamespace(shape=(100, 100, 3))
+        def release(self): pass
+
+    import sys
+    monkeypatch.setitem(sys.modules, "cv2", SimpleNamespace(
+        VideoCapture=lambda _p: Capture(), CAP_PROP_POS_FRAMES=1))
+    monkeypatch.setattr(numbers, "_detector_rows", lambda *_a, **_k: [{"n": 1}])
+    sample = SimpleNamespace(
+        track_id=1, player_xyxy=(0, 0, 1, 1), number_xyxy=(0, 0, 1, 1), overlap_ratio=1.0,
+        player_overlap_ratio=1.0, contains_number_center=True, crop_image=None, confidence_hints={},
+    )
+    monkeypatch.setattr(numbers, "associate_number_rows", lambda *_a, **_k: [sample])
+    rows = [{"frame_index": f, "track_id": 1, "stable_player_id": "p", "xyxy": [0, 0, 1, 1]} for f in (0, 1)]
+    predictor = SimpleNamespace(predict=lambda _s: SimpleNamespace(raw_text="7", score=0.9, raw_response={}))
+    counters: dict[str, int] = {}
+
+    numbers.run_v2_number_evidence(
+        tmp_path / "v.mp4", rows, PipelineConfig(roboflow_api_key="k", frame_stride=1), tmp_path,
+        predictor=predictor, detector=SimpleNamespace(detect=lambda _f: {}), counters=counters,
+    )
+
+    assert counters == {"number_detector_frames": 2, "ocr_crops": 2}

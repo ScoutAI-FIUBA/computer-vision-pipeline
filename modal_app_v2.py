@@ -38,6 +38,14 @@ from pipeline.runner import (
 )
 from pipeline.runner_v2 import run_v2
 from pipeline.input_integrity import verify_sha256_file
+from pipeline.stage_metrics import (
+    METRICS_FILENAME,
+    StageMetrics,
+    detect_gpu,
+    format_job_line,
+    format_stage_line,
+    metrics_artifact,
+)
 from pipeline.sam31_tracking import normalize_multiplex_output
 from pipeline.sam31_segments import (
     SAM31_MAX_NUM_OBJECTS,
@@ -82,6 +90,10 @@ V2_VOLUMES = {CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data, V2_JOB
 JOB_SCHEMA = "v2-job-1"
 JOB_LEASE_SECONDS = 1800
 MAX_JOB_ERRORS = 8
+# One value for the decorator and for stage_metrics.json, so the margin cannot drift from the real limit.
+PIPELINE_TIMEOUT_SECONDS = 3600
+# The class decorator declares no cpu/memory; keep in sync if it ever does.
+PIPELINE_CONTAINER = {"cpu": None, "memory_mib": None}
 
 
 def _job_path(root: Path, job_id: str) -> Path:
@@ -808,13 +820,36 @@ def _load_possession_tracking_inputs(job: Path, generation: dict[str, Any]) -> t
     return observations, _load_jsonl_file(ball_path), mask_values, clean_values, fps, width, height
 
 
+def _new_stage_metrics(stage: str) -> StageMetrics:
+    return StageMetrics(stage, function_timeout_seconds=PIPELINE_TIMEOUT_SECONDS, container=PIPELINE_CONTAINER)
+
+
+def _attempt_number(manifest: Mapping[str, Any], stage: str) -> int | None:
+    value = (manifest.get("attempts") or {}).get(stage)
+    return value if type(value) is int else None
+
+
+def _distinct_frames(rows) -> int | None:
+    try:
+        return len({int(row["frame_index"]) for row in rows})
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _finish_stage_metrics(metrics: StageMetrics) -> bytes:
+    """Serialize the record and log it; publishing time is excluded because the file is hashed into the generation."""
+    record = metrics.build(gpu=detect_gpu())
+    print(format_stage_line(record), flush=True)
+    return metrics_artifact(record)
+
+
 @app.cls(
     image=image,
     gpu="A100-80GB",
     # volumes={CACHE_DIR: model_cache, TRACKNET_VOLUME_DIR: tracknet_data}
     volumes=V2_VOLUMES,
     secrets=[hf_secret, roboflow_secret],
-    timeout=3600,
+    timeout=PIPELINE_TIMEOUT_SECONDS,
 )
 class PipelineV2:
     @modal.enter()
@@ -876,6 +911,7 @@ class PipelineV2:
         """Persist tracking evidence once; retries return the matching generation."""
         validate_entrypoint_args(video_bytes=video_bytes, prompt=prompt,
                                  frame_start=frame_start, frame_end=frame_end)
+        metrics = _new_stage_metrics("tracking")
         job = self._job_dir(job_id)
         job.mkdir(parents=True, exist_ok=True)
         input_fingerprint = f"sha256:{hashlib.sha256(video_bytes).hexdigest()}"
@@ -892,9 +928,10 @@ class PipelineV2:
         owner = _stage_owner(worker_id)
         acquired = False
         try:
-            acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="tracking",
-                              input_fingerprint=input_fingerprint, request_fingerprint=request_fingerprint)
+            leased = acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="tracking",
+                                       input_fingerprint=input_fingerprint, request_fingerprint=request_fingerprint)
             acquired = True
+            metrics.attempt = _attempt_number(leased, "tracking")
             job = self._job_dir(job_id)
             _persist_job_input(job, input_fingerprint, video_bytes)
             with tempfile.TemporaryDirectory(prefix="v2-track-") as work:
@@ -904,22 +941,28 @@ class PipelineV2:
                 segmented_run = _segmented_enabled(segmented)
                 seams: list[dict[str, Any]] = []
                 overflow_diagnostics: list[dict[str, Any]] = []
+                with metrics.phase("model_load_seconds"):
+                    predictor = self._ensure_predictor()
                 if segmented_run:
-                    rows, masks = _track_segmented_video(
-                        self._ensure_predictor(), source, prompt, frame_start, frame_end, root,
-                        window=_segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
-                        overlap=_segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
-                        seam_min_score=_segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
-                        seam_ambiguity_margin=_segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
-                        seam_diagnostics=seams,
-                        overflow_diagnostics=overflow_diagnostics,
-                    )
+                    with metrics.phase("tracking_seconds"):
+                        rows, masks = _track_segmented_video(
+                            predictor, source, prompt, frame_start, frame_end, root,
+                            window=_segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
+                            overlap=_segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
+                            seam_min_score=_segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
+                            seam_ambiguity_margin=_segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
+                            seam_diagnostics=seams,
+                            overflow_diagnostics=overflow_diagnostics,
+                        )
                 else:
-                    rows, masks = _track_video(self._ensure_predictor(), source, prompt, frame_start, frame_end)
+                    with metrics.phase("tracking_seconds"):
+                        rows, masks = _track_video(predictor, source, prompt, frame_start, frame_end)
                 _add_mask_references(rows, masks)
                 if getattr(self, "_models_loaded", False):
-                    self._ensure_seams()
-                frames = _load_video_frames(source, frame_start, frame_end)
+                    with metrics.phase("model_load_seconds"):
+                        self._ensure_seams()
+                with metrics.phase("frame_load_seconds"):
+                    frames = _load_video_frames(source, frame_start, frame_end)
                 runner_kwargs = {
                     "frames_by_index": frames,
                     "masks_by_observation": masks,
@@ -927,7 +970,8 @@ class PipelineV2:
                 }
                 if hasattr(self, "seams"):
                     runner_kwargs["seams"] = self.seams
-                tracking_result = run_v2(rows, **runner_kwargs)
+                with metrics.phase("identity_seconds"):
+                    tracking_result = run_v2(rows, **runner_kwargs)
                 if segmented_run:
                     tracking_result.runtime_diagnostics = {
                         **(getattr(tracking_result, "runtime_diagnostics", {}) or {}),
@@ -953,16 +997,23 @@ class PipelineV2:
                 sanitizer_metadata = getattr(tracking_result, "runtime_diagnostics", {}).get("bbox_sanitizer", {})
                 if sanitizer_metadata.get("corrected_count", 0) or sanitizer_metadata.get("unresolved_count", 0):
                     artifact_config["bbox_sanitizer"] = sanitizer_metadata
-                package_artifacts(package, tracking_result.observations, masks, clean_masks=clean_masks,
-                                  input_fingerprint=input_fingerprint, frame_bounds=[frame_start, frame_end],
-                                  video_metadata=_video_metadata(source),
-                                  prompts=[prompt], config=artifact_config,
-                                  acceptance=getattr(tracking_result, "acceptance", {}),
-                                  acceptance_reasons=getattr(tracking_result, "acceptance_reasons", []))
+                with metrics.phase("artifact_write_seconds"):
+                    package_artifacts(package, tracking_result.observations, masks, clean_masks=clean_masks,
+                                      input_fingerprint=input_fingerprint, frame_bounds=[frame_start, frame_end],
+                                      video_metadata=_video_metadata(source),
+                                      prompts=[prompt], config=artifact_config,
+                                      acceptance=getattr(tracking_result, "acceptance", {}),
+                                      acceptance_reasons=getattr(tracking_result, "acceptance_reasons", []))
                 artifacts = {
                     ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
                     for path in package.rglob("*") if path.is_file()
                 }
+                metrics.set_frames(requested=frame_end - frame_start + 1,
+                                   processed=_distinct_frames(tracking_result.observations))
+                # Tracking runs SAM, ReID and the team embedder locally; no hosted model is called.
+                metrics.set_api_calls(roboflow_shot_detection_frames=0, roboflow_court_detection_frames=0,
+                                      roboflow_number_detector_frames=0, roboflow_ocr_crops=0)
+                artifacts[METRICS_FILENAME] = _finish_stage_metrics(metrics)
                 generation = _finalize_stage(
                     Path(V2_JOB_VOLUME_DIR), job_id, owner=owner,
                     publish=lambda: publish_stage_generation(
@@ -1010,6 +1061,7 @@ class PipelineV2:
     def _stats_stage(self, *, job_id: str, possession_engine: str | None = None,
                      worker_id: str | None = None, tracking_payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Consume one validated tracking generation and publish bounded stats metadata."""
+        metrics = _new_stage_metrics("stats")
         job = self._job_dir(job_id)
         started = time.perf_counter()
         _stats_progress("job manifest read start")
@@ -1018,6 +1070,7 @@ class PipelineV2:
         started = time.perf_counter()
         _stats_progress("stage generation validation/hash checks start")
         generation = load_stage_generation(job / "tracking", manifest.get("tracking_generation"))
+        metrics.add_phase("generation_validation_seconds", time.perf_counter() - started)
         _stats_progress(
             "stage generation validation/hash checks complete: "
             f"elapsed={time.perf_counter() - started:.2f}s"
@@ -1034,9 +1087,10 @@ class PipelineV2:
         try:
             owner = _stage_owner(worker_id)
             acquired = False
-            acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="stats",
-                              input_fingerprint=manifest["input_fingerprint"], request_fingerprint=stats_request)
+            leased = acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="stats",
+                                       input_fingerprint=manifest["input_fingerprint"], request_fingerprint=stats_request)
             acquired = True
+            metrics.attempt = _attempt_number(leased, "stats")
             with tempfile.TemporaryDirectory(prefix="v2-stats-") as work:
                 output = Path(work) / "stats"
                 _stats_progress("stats start")
@@ -1046,7 +1100,15 @@ class PipelineV2:
                     _committed_job_input(job, generation["input_fingerprint"]), config,
                     job / "tracking", output,
                     generation, validated=True, tracking_payload=tracking_payload,
-                    number_predictor=number_predictor, number_detector=number_detector)
+                    number_predictor=number_predictor, number_detector=number_detector,
+                    metrics=metrics)
+                bounds = generation.get("frame_bounds") or []
+                metrics.set_frames(
+                    requested=bounds[1] - bounds[0] + 1 if len(bounds) == 2 else None,
+                    processed=getattr(getattr(result, "summary", None), "frames_processed", None),
+                )
+                # Written before the rglob so the file is published and hashed with the generation.
+                (output / METRICS_FILENAME).write_bytes(_finish_stage_metrics(metrics))
                 artifacts = {path.relative_to(output).as_posix(): path for path in output.rglob("*") if path.is_file()}
                 published = _finalize_stage(
                     Path(V2_JOB_VOLUME_DIR), job_id, owner=owner,
@@ -1070,9 +1132,11 @@ class PipelineV2:
     def _possession_only_stage(self, *, job_id: str, possession_engine: str,
                                worker_id: str | None = None) -> dict[str, Any]:
         engine = _validate_possession_only_engine(possession_engine)
+        metrics = _new_stage_metrics("possession")
         job = self._job_dir(job_id)
         manifest = read_job_manifest(job)
-        tracking = load_stage_generation(job / "tracking", manifest.get("tracking_generation"))
+        with metrics.phase("generation_validation_seconds"):
+            tracking = load_stage_generation(job / "tracking", manifest.get("tracking_generation"))
         config = PipelineConfig.from_env(possession_engine=engine)
         request = _possession_only_fingerprint(engine, tracking["generation"], config)
         existing = _find_matching_generation(
@@ -1086,17 +1150,26 @@ class PipelineV2:
         owner = _stage_owner(worker_id)
         acquired = False
         try:
-            acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="possession",
-                              input_fingerprint=manifest["input_fingerprint"], request_fingerprint=request)
+            leased = acquire_job_lease(Path(V2_JOB_VOLUME_DIR), job_id, owner=owner, stage="possession",
+                                       input_fingerprint=manifest["input_fingerprint"], request_fingerprint=request)
             acquired = True
+            metrics.attempt = _attempt_number(leased, "possession")
             observations, ball_rows, masks, clean_masks, fps, width, height = _load_possession_tracking_inputs(job, tracking)
             with tempfile.TemporaryDirectory(prefix="v2-possession-") as work:
                 output = Path(work) / "possession"
-                run_possession_only_from_v2_artifacts(
-                    output, observations, ball_rows, fps=fps, config=config,
-                    masks_by_observation=masks, clean_masks_by_observation=clean_masks,
-                    frame_width=width, frame_height=height,
-                )
+                with metrics.phase("possession_seconds"):
+                    run_possession_only_from_v2_artifacts(
+                        output, observations, ball_rows, fps=fps, config=config,
+                        masks_by_observation=masks, clean_masks_by_observation=clean_masks,
+                        frame_width=width, frame_height=height,
+                    )
+                bounds = tracking.get("frame_bounds") or []
+                metrics.set_frames(requested=bounds[1] - bounds[0] + 1 if len(bounds) == 2 else None,
+                                   processed=_distinct_frames(observations))
+                # No hosted model is called here; the possession engines work on persisted evidence.
+                metrics.set_api_calls(roboflow_shot_detection_frames=0, roboflow_court_detection_frames=0,
+                                      roboflow_number_detector_frames=0, roboflow_ocr_crops=0)
+                (output / METRICS_FILENAME).write_bytes(_finish_stage_metrics(metrics))
                 artifacts = {path.relative_to(output).as_posix(): path for path in output.rglob("*") if path.is_file()}
                 published = _finalize_stage(
                     Path(V2_JOB_VOLUME_DIR), job_id, owner=owner,
@@ -1186,6 +1259,7 @@ class PipelineV2:
             output_dir = root / "artifacts"
             video_path.write_bytes(video_bytes)
             started = time.perf_counter()
+            direct_metrics = _new_stage_metrics("direct")
             print("[v2] progress=0")
             try:
                 segmented_run = _segmented_enabled(segmented)
@@ -1305,6 +1379,7 @@ class PipelineV2:
                 raise
             print("[v2] progress=100")
             print("[v2] overall V2 complete", flush=True)
+            _finish_stage_metrics(direct_metrics)
             payload = {"acceptance": result.acceptance}
             if return_diagnostics:
                 payload["debug_diagnostics"] = result.runtime_diagnostics
@@ -1360,6 +1435,8 @@ def main(
     (_validate_possession_only_engine if possession_only else _validate_possession_engine)(possession_engine)
 
     pipeline = PipelineV2()
+    # Client-side wall time: unlike the container-side stage numbers it includes cold start and model load.
+    wall_started = time.perf_counter()
     if possession_only:
         payload = pipeline.possession_only_stage.remote(
             job_id=job_id, possession_engine=possession_engine
@@ -1415,3 +1492,4 @@ def main(
     print(json.dumps(payload, indent=2, sort_keys=True))
     if artifacts is not None:
         write_artifacts(artifacts, Path(output_dir))
+    print(format_job_line(job_id or None, time.perf_counter() - wall_started), flush=True)
