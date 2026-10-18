@@ -604,3 +604,179 @@ def test_numbers_are_none_without_any_mapping():
 
     assert shot["shooter_confirmed_number"] is None
     assert [row["confirmed_number"] for row in shot["projected_player_snapshot"]] == [None, None]
+
+
+def _with_team(tracks: list[dict], teams_by_track: dict[int, int | None]) -> list[dict]:
+    return [{**row, "team_id": teams_by_track[row["track_id"]]} if row["track_id"] in teams_by_track else row for row in tracks]
+
+
+def test_shooter_candidates_are_the_top_three_of_the_vote_ranking():
+    tracks, _ = _vote_scene()
+    tracks = _with_team([*tracks, *(_player(5, "player-extra", [300, 100, 380, 260], [22.0, 4.0], f) for f in (10, 12, 14, 16, 18, 20))], {2: 0, 3: 1, 1: 1})
+    boxes = (
+        ([500, 280, 600, 460], 0.9, (550, 270)),
+        ([200, 300, 300, 480], 0.6, (250, 320)),
+        ([0, 430, 45, 620], 0.4, (20, 480)),
+        ([300, 100, 380, 260], 0.2, (340, 150)),
+    )
+    scene = {
+        frame: [_pred(7, "player-shot-block", box, conf) for box, conf, _ in boxes] + [_ball_pred(*ball) for _, _, ball in boxes]
+        for frame in (10, 12, 14, 16, 18, 20)
+    }
+
+    shot = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(scene))["shots"][0]
+
+    candidates = shot["shooter_candidates"]
+    assert [c["stable_player_id"] for c in candidates] == ["player-shooter", "player-mate", "player-edge"]
+    assert [c["team_id"] for c in candidates] == [0, 1, 1]
+    assert candidates[0]["score"] > candidates[1]["score"] > candidates[2]["score"]
+    assert set(candidates[0]) == {"stable_player_id", "team_id", "score"}
+
+
+def test_shooter_candidates_are_returned_for_an_ambiguous_vote_and_empty_without_a_vote():
+    tracks, raw = _vote_scene()
+    ambiguous = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(_close_vote_raw(raw)))["shots"][0]
+    assert ambiguous["shooter_attribution_method"] == "ambiguous"
+    assert {c["stable_player_id"] for c in ambiguous["shooter_candidates"]} == {"player-shooter", "player-mate"}
+
+    no_raw = build_projected_shots([_made_event()], tracks)["shots"][0]
+    missed = build_projected_shots([{**_made_event(), "outcome": "missed", "ball_in_basket_frame_index": None}], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+    no_ball = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows({f: [] for f in raw}))["shots"][0]
+    assert no_raw["shooter_candidates"] == []
+    assert missed["shooter_candidates"] == []
+    assert no_ball["shooter_candidates"] == []
+
+
+def test_shooter_team_falls_back_to_the_player_majority_team():
+    tracks, raw = _vote_scene()
+    # The shooter's rows carry team 1 at most frames; the track-level map knows nothing.
+    tracks = [{**row, "team_id": 1} if row["track_id"] == 2 else row for row in tracks]
+    tracks[5] = {**tracks[5], "team_id": None}
+
+    shot = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["shooter_stable_player_id"] == "player-shooter"
+    assert shot["shooter_team_id"] == 1
+
+
+def test_track_level_team_wins_over_the_player_majority_and_zero_is_a_team():
+    tracks, raw = _vote_scene()
+    tracks = _with_team(tracks, {2: 1})
+
+    shot = build_projected_shots(
+        [_made_event()], tracks, team_ids_by_track_id={2: 0}, raw_prediction_rows=_raw_rows(raw)
+    )["shots"][0]
+
+    assert shot["shooter_team_id"] == 0
+
+
+def test_shooter_team_stays_null_without_a_strict_majority():
+    tracks, raw = _vote_scene()
+    shooter_rows = [row for row in tracks if row["track_id"] == 2]
+    teams = {id(row): (0 if index % 2 else 1) for index, row in enumerate(shooter_rows)}
+    tracks = [{**row, "team_id": teams[id(row)]} if id(row) in teams else row for row in tracks]
+
+    shot = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+
+    assert shot["shooter_stable_player_id"] == "player-shooter"
+    assert shot["shooter_team_id"] is None
+    assert shot["needs_review"] is True
+
+
+def test_ambiguous_vote_between_teammates_keeps_the_team_but_not_the_player():
+    tracks, raw = _vote_scene()
+    tracks = _with_team(tracks, {2: 1, 3: 1})
+    event = {**_made_event(), "start_shot_xyxy": [300.0, 300.0, 400.0, 500.0]}
+
+    shot = build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(_close_vote_raw(raw)))["shots"][0]
+
+    assert shot["shooter_attribution_method"] == "ambiguous_same_team"
+    assert shot["shooter_stable_player_id"] is None
+    assert shot["shooter_track_id"] is None
+    assert shot["shooter_team_id"] == 1
+    assert shot["start_frame_source"] == "shot_detector"
+    assert shot["shot_origin_projection_method"] == "shot_anchor_homography_from_projected_players"
+    assert shot["needs_review"] is True
+
+
+def test_ambiguous_vote_between_different_teams_or_unknown_teams_stays_ambiguous():
+    tracks, raw = _vote_scene()
+    for teams in ({2: 0, 3: 1}, {2: 0, 3: None}, {}):
+        shot = build_projected_shots(
+            [_made_event()], _with_team(tracks, teams), raw_prediction_rows=_raw_rows(_close_vote_raw(raw))
+        )["shots"][0]
+        assert shot["shooter_attribution_method"] == "ambiguous"
+        assert shot["shooter_team_id"] is None
+
+
+def _review_shot(*, attribution_clear: bool, team: int | None, outcome: str = "made") -> dict:
+    tracks, raw = _vote_scene()
+    tracks = _with_team(tracks, {2: team, 3: team})
+    scene = raw if attribution_clear else _close_vote_raw(raw)
+    event = {**_made_event(), "outcome": outcome, "outcome_source": "ball_in_basket"}
+    return build_projected_shots([event], tracks, raw_prediction_rows=_raw_rows(scene))["shots"][0]
+
+
+def test_needs_review_truth_table():
+    assert _review_shot(attribution_clear=True, team=1)["needs_review"] is False
+    assert _review_shot(attribution_clear=True, team=None)["needs_review"] is True
+    assert _review_shot(attribution_clear=False, team=1)["needs_review"] is True
+    assert _review_shot(attribution_clear=True, team=1, outcome="unknown")["needs_review"] is True
+    # Missed shots never run the vote, so the anchor rule decides and the shot stays under review.
+    assert _review_shot(attribution_clear=True, team=1, outcome="missed")["needs_review"] is True
+
+
+def test_needs_review_for_the_nearest_bbox_anchor_rule():
+    tracks, _ = _vote_scene()
+    tracks = _with_team(tracks, {1: 0, 2: 0, 3: 0, 4: 0})
+
+    shot = build_projected_shots([_made_event()], tracks)["shots"][0]
+
+    assert shot["shooter_attribution_method"] == "nearest_player_bbox_to_shot_anchor"
+    assert shot["shooter_stable_player_id"] is not None
+    assert shot["shooter_team_id"] == 0
+    assert shot["needs_review"] is True
+
+
+def test_release_timestamp_only_for_action_box_release():
+    tracks, raw = _vote_scene()
+    released = build_projected_shots([_made_event()], tracks, raw_prediction_rows=_raw_rows(raw))["shots"][0]
+    assert released["start_frame_source"] == "action_box_release"
+    assert released["release_timestamp_seconds"] == released["start_timestamp_seconds"]
+    assert released["release_timestamp_seconds"] is not None
+
+    detector = build_projected_shots([_made_event()], tracks)["shots"][0]
+    assert detector["release_timestamp_seconds"] is None
+
+
+def test_resolved_timestamp_and_source_fields_are_copied_or_null():
+    tracks, _ = _vote_scene()
+    event = {**_made_event(), "resolved_timestamp_seconds": 0.5, "outcome_source": "ball_in_basket", "resolution_reason": "ball_in_basket"}
+
+    shot = build_projected_shots([event], tracks)["shots"][0]
+    bare = build_projected_shots([_made_event()], tracks)["shots"][0]
+
+    assert (shot["resolved_timestamp_seconds"], shot["outcome_source"], shot["resolution_reason"]) == (0.5, "ball_in_basket", "ball_in_basket")
+    assert (bare["resolved_timestamp_seconds"], bare["outcome_source"], bare["resolution_reason"]) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    "outcome, source, reason, expected",
+    [
+        ("made", "ball_in_basket", "ball_in_basket", "detected"),
+        ("made", "rim_trajectory", "rim_trajectory", "inferred"),
+        ("missed", "shot_detector", "shot_timeout", "timeout"),
+        ("missed", "shot_detector", "new_shot_started", "timeout"),
+        ("unknown", "shot_detector", "end_of_clip", "unresolved"),
+        ("unknown", "ball_in_basket", "ball_in_basket_unconfirmed", "unresolved"),
+        ("unknown", "shot_detector", "shot_timeout", "unresolved"),
+    ],
+)
+def test_outcome_confidence_mapping(outcome, source, reason, expected):
+    tracks, _ = _vote_scene()
+    event = {**_made_event(), "outcome": outcome, "outcome_source": source, "resolution_reason": reason}
+
+    shot = build_projected_shots([event], tracks)["shots"][0]
+
+    assert shot["outcome_confidence"] == expected
+    assert shot["needs_review"] is True or expected != "unresolved"
