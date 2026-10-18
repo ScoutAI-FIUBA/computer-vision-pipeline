@@ -816,6 +816,7 @@ workflow.
 | `scripts/tracking/track_players_video.py` | Tracking core | Tracker adapter point used by `video_pipeline.py`; keeps ByteTrack and Deep OC-SORT backend logic in one place. |
 | `scripts/tracking/track_players_sam2_experiment.py` | SAM2 implementation module | Keeps the current SAM2 CLI implementation that the stable wrapper calls. |
 | `scripts/tracking/evaluate_tracking.py` | Baseline tracking review | Turn manual review events into baseline counts for ID switches, full losses, and successful recoveries. |
+| `scripts/tracking/prepare_eval_dataset.py` | Evaluation clip set | Cut review clips, build contact sheets, write `evaluation_manifest.json` and a pending review template, and attach existing run outputs as the baseline. Local only. |
 | `scripts/tracking/summarize_tracking_run.py` | Automatic track-file summary | Print technical summary metrics that are directly derivable from one `tracks.jsonl` file. |
 | `scripts/court/detect_court_keypoints.py` | Court keypoints on one image | Test court landmarks on a single frame. |
 | `scripts/court/detect_court_keypoints_video.py` | Court keypoints on sampled video | Evaluate court keypoint behavior across a clip. |
@@ -848,6 +849,8 @@ python3 scripts/tracking/evaluate_tracking.py review/tracking_events.jsonl --tra
 ```
 
 The report prints the three baseline counts plus a simple occlusion recovery rate.
+
+`evaluate_tracking.py` also supports `--per-clip`, `--json`, `--validate` and `--baseline`/`--candidate` comparison. The evaluation clip set, the review boundary (a human confirms every semantic label) and the ground-truth fixtures are described in `docs/tracking-evaluation.md`.
 
 For an automatic summary from the track file alone:
 
