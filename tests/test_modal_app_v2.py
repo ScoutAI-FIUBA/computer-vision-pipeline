@@ -3020,3 +3020,118 @@ def test_number_components_helper_builds_nothing_without_stable_players_or_when_
     disabled = types.SimpleNamespace(number_evidence_enabled=False)
     assert modal_app_v2._build_number_evidence_components(enabled, False) == (None, None)
     assert modal_app_v2._build_number_evidence_components(disabled, True) == (None, None)
+
+
+def _staged_reuse_setup(tmp_path: Path, monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.runner_v2 import RunnerV2Result
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "dummy")
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    row = {"observation_key": "0:3", "frame_index": 0, "raw_track_id": 3,
+           "bbox_xyxy": [0, 0, 2, 2], "track_state": "tracked"}
+    enriched = {**row, "stable_player_id": "player-3", "team_id": 1}
+    calls = {"tracker": 0, "predictor": 0, "stats": 0}
+
+    def track_video(*_args):
+        calls["tracker"] += 1
+        return [dict(row)], {"0:3": np.ones((2, 2), dtype=np.uint8)}
+
+    def ensure_predictor(_self):
+        calls["predictor"] += 1
+        return object()
+
+    def stats_worker(_video, _config, _tracking_root, output, *_args, **_kwargs):
+        calls["stats"] += 1
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "results.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(modal_app_v2, "_track_video", track_video)
+    monkeypatch.setattr(modal_app_v2, "_load_video_frames", lambda *_args: {0: object()})
+    monkeypatch.setattr(modal_app_v2, "run_v2", lambda observations, **kwargs: RunnerV2Result(
+        [enriched], cleaned_masks_by_observation={"0:3": np.eye(2, dtype=np.uint8)}))
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_generation", stats_worker)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+               if key.startswith("_sync_original"))._user_cls
+    monkeypatch.setattr(cls, "_ensure_predictor", ensure_predictor)
+    return cls, cls(), calls
+
+
+def _staged_process(cls, instance, **overrides):
+    kwargs = dict(video_bytes=b"video", job_id="job-1", staged=True, prompt="player",
+                  frame_start=0, frame_end=0, possession_engine="v3")
+    kwargs.update(overrides)
+    return _raw_method(cls, "process")(instance, **kwargs)
+
+
+def _run_track_then_stats(cls, instance, **overrides):
+    kwargs = dict(job_id="job-1", video_bytes=b"video", prompt="player", frame_start=0, frame_end=0,
+                  worker_id="worker-a")
+    kwargs.update(overrides)
+    tracked = instance._track_stage(**kwargs)
+    stats = instance._stats_stage(job_id="job-1", possession_engine="v3", worker_id="worker-a")
+    return tracked, stats
+
+
+def test_track_stage_reuses_generation_after_stats_overwrote_job_fingerprint(tmp_path: Path, monkeypatch):
+    cls, instance, calls = _staged_reuse_setup(tmp_path, monkeypatch)
+    tracked, stats = _run_track_then_stats(cls, instance)
+    job_json = tmp_path / "job-1" / "job.json"
+    manifest = json.loads(job_json.read_text())
+    assert manifest["request_fingerprint"] != json.loads(
+        (tmp_path / "job-1" / "tracking" / "generations" / tracked["generation"] / "manifest.json").read_text()
+    )["request_fingerprint"]
+    before_bytes = job_json.read_bytes()
+    calls.update(tracker=0, predictor=0, stats=0)
+
+    again = instance._track_stage(job_id="job-1", video_bytes=b"video", prompt="player",
+                                  frame_start=0, frame_end=0, worker_id="worker-b")
+
+    assert again == tracked
+    assert calls == {"tracker": 0, "predictor": 0, "stats": 0}
+    assert job_json.read_bytes() == before_bytes
+
+
+def test_track_stage_recomputes_for_different_input_or_options(tmp_path: Path, monkeypatch):
+    cls, instance, calls = _staged_reuse_setup(tmp_path, monkeypatch)
+    tracked, _stats = _run_track_then_stats(cls, instance)
+    assert calls["tracker"] == 1
+
+    other_video = instance._track_stage(job_id="job-1", video_bytes=b"other video", prompt="player",
+                                        frame_start=0, frame_end=0, worker_id="worker-a")
+    assert calls["tracker"] == 2
+    assert other_video["generation"] != tracked["generation"]
+
+    instance._track_stage(job_id="job-1", video_bytes=b"other video", prompt="another prompt",
+                          frame_start=0, frame_end=0, worker_id="worker-a")
+    assert calls["tracker"] == 3
+
+
+def test_track_stage_recomputes_when_matching_generation_is_corrupt(tmp_path: Path, monkeypatch):
+    cls, instance, calls = _staged_reuse_setup(tmp_path, monkeypatch)
+    tracked, _stats = _run_track_then_stats(cls, instance)
+    (tmp_path / "job-1" / "tracking" / "generations" / tracked["generation"] / "tracks.jsonl").write_text("corrupt")
+
+    # Generation ids are content-addressed, so republishing over the corrupt directory is refused
+    # (pre-existing behaviour); the point here is that a corrupt generation is never reused.
+    with pytest.raises(ValueError, match="hash mismatch"):
+        instance._track_stage(job_id="job-1", video_bytes=b"video", prompt="player",
+                              frame_start=0, frame_end=0, worker_id="worker-a")
+
+    assert calls["tracker"] == 2
+
+
+def test_repeated_staged_process_on_completed_job_runs_no_tracker_or_stats(tmp_path: Path, monkeypatch):
+    cls, instance, calls = _staged_reuse_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("MODAL_TASK_ID", "task-1")
+    first = _staged_process(cls, instance)
+    job_json = tmp_path / "job-1" / "job.json"
+    before_bytes = job_json.read_bytes()
+    assert calls == {"tracker": 1, "predictor": 1, "stats": 1}
+
+    second = _staged_process(cls, instance)
+
+    assert second == first
+    assert calls == {"tracker": 1, "predictor": 1, "stats": 1}
+    assert job_json.read_bytes() == before_bytes

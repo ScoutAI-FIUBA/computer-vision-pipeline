@@ -884,15 +884,11 @@ class PipelineV2:
             prompt, frame_start, frame_end, segmented, segment_window, segment_overlap,
             segment_seam_min_score, segment_seam_ambiguity_margin, config,
         )
-        manifest_path = job / "job.json"
-        if manifest_path.is_file():
-            existing = read_job_manifest(job)
-            if (existing.get("input_fingerprint"), existing.get("request_fingerprint")) == (input_fingerprint, request_fingerprint):
-                try:
-                    generation = load_stage_generation(job / "tracking", existing.get("tracking_generation"))
-                    return {"status": "tracked", "generation": generation["generation"], "fingerprint": input_fingerprint}
-                except ValueError:
-                    pass
+        # job.json holds the latest stage's fingerprint, so match on the published tracking generations.
+        existing = _find_matching_generation(job / "tracking", input_fingerprint=input_fingerprint,
+                                             request_fingerprint=request_fingerprint)
+        if existing is not None:
+            return {"status": "tracked", "generation": existing["generation"], "fingerprint": input_fingerprint}
         owner = _stage_owner(worker_id)
         acquired = False
         try:
