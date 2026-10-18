@@ -86,6 +86,7 @@ def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict
         ),
         "shots_needing_review": sum(1 for s in detected if s.get("needs_review")),
         "job_summary": job_doc.get("summary") if isinstance(job_doc, dict) else None,
+        "wall_seconds": _wall_seconds(job_doc.get("job") if isinstance(job_doc, dict) else None),
     }
     if truth is None:
         result["detections"] = [_describe(s) for s in detected]
@@ -129,6 +130,15 @@ def _describe(shot: dict[str, Any] | None) -> dict[str, Any] | None:
         "attribution": shot.get("shooter_attribution_method"),
         "needs_review": shot.get("needs_review"),
     }
+
+
+def _wall_seconds(job: dict[str, Any] | None) -> float | None:
+    from datetime import datetime
+
+    try:
+        return (datetime.fromisoformat(job["finished_at"]) - datetime.fromisoformat(job["started_at"])).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _cost(summary: dict[str, Any] | None, rate: float | None) -> tuple[str, str]:
@@ -209,6 +219,17 @@ def render(results: list[dict[str, Any]], rate: float | None) -> str:
         cost, per_minute = _cost(summary, rate)
         if summary:
             lines.append(f"- Duración del video: {round(summary['duration_seconds'], 1) if isinstance(summary.get('duration_seconds'), (int, float)) else 'n/d'} s; GPU: {(summary.get('gpu') or {}).get('name', 'n/d')}; costo estimado: {cost} ({per_minute} por minuto de video).")
+        timings = summary.get("timings") or {}
+        if timings:
+            total = sum(v for v in timings.values() if isinstance(v, (int, float)))
+            wall = r.get("wall_seconds")
+            lines.append(
+                f"- Tiempo: {round(total)} s dentro del pipeline"
+                + (f", {round(wall)} s en total (incluye arranque y subida)" if wall else "")
+                + ". Por fase: "
+                + ", ".join(f"{k} {round(v)} s" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))
+                + "."
+            )
         if r["status"] == "sin_verdad_terreno":
             lines.append("- Sin verdad de terreno: tiros detectados listados, sin evaluar.")
             for d in r["detections"]:
@@ -231,6 +252,8 @@ def render(results: list[dict[str, Any]], rate: float | None) -> str:
         "los porcentajes no son una estimación estadística, sino una verificación caso por caso.",
         "- El detector solo funciona sobre el plano general de la cancha; primeros planos y repeticiones no producen detecciones.",
         "- Asistencias, pérdidas, robos y tiempo de posesión no se miden.",
+        "- El costo es una estimación: tiempo de GPU informado por el pipeline por la tarifa del plan. No incluye "
+        "las consultas a los modelos alojados (Roboflow) ni el almacenamiento; la factura de Modal es la fuente definitiva.",
     ]
     return "\n".join(lines) + "\n"
 
