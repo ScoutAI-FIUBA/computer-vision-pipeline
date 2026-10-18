@@ -727,10 +727,27 @@ def _tracking_stage_fingerprint(
     )
 
 
+# Bump to invalidate cached stats generations produced before numbers were wired in.
+STATS_NUMBERS_WIRING_VERSION = "numbers-wired-v1"
+
+
+def _numbers_enabled(config: PipelineConfig) -> bool:
+    return bool(getattr(config, "number_evidence_enabled", True))
+
+
+def _build_number_evidence_components(config: PipelineConfig, has_stable_players: bool = True):
+    """Return (predictor, detector); client construction makes no network call."""
+    if not (_numbers_enabled(config) and has_stable_players):
+        return None, None
+    return build_number_predictor(config), build_detector(config)
+
+
 def _stats_stage_fingerprint(possession_engine: str | None, generation: str, config: PipelineConfig) -> str:
-    return stage_fingerprint(
-        "stats", possession_engine or config.possession_engine, generation, _config_fingerprint(config)
-    )
+    values = ["stats", possession_engine or config.possession_engine, generation, _config_fingerprint(config)]
+    if _numbers_enabled(config):
+        # Appended only when enabled so disabled fingerprints stay identical to before.
+        values.append(STATS_NUMBERS_WIRING_VERSION)
+    return stage_fingerprint(*values)
 
 
 def _possession_only_fingerprint(possession_engine: str, generation: str, config: PipelineConfig) -> str:
@@ -1027,10 +1044,13 @@ class PipelineV2:
             with tempfile.TemporaryDirectory(prefix="v2-stats-") as work:
                 output = Path(work) / "stats"
                 _stats_progress("stats start")
+                # Stable-id presence isn't cheap to read here; the runner skips when no rows qualify.
+                number_predictor, number_detector = _build_number_evidence_components(config)
                 result = run_stats_from_v2_generation(
                     _committed_job_input(job, generation["input_fingerprint"]), config,
                     job / "tracking", output,
-                                                       generation, validated=True, tracking_payload=tracking_payload)
+                    generation, validated=True, tracking_payload=tracking_payload,
+                    number_predictor=number_predictor, number_detector=number_detector)
                 artifacts = {path.relative_to(output).as_posix(): path for path in output.rglob("*") if path.is_file()}
                 published = _finalize_stage(
                     Path(V2_JOB_VOLUME_DIR), job_id, owner=owner,
@@ -1243,15 +1263,9 @@ class PipelineV2:
                     acceptance=result.acceptance,
                     acceptance_reasons=result.acceptance_reasons,
                 )
-                numbers_enabled = bool(getattr(config, "number_evidence_enabled", True))
                 has_stable_players = any(row.get("stable_player_id") for row in result.observations)
-                number_predictor = (
-                    build_number_predictor(config)
-                    if numbers_enabled and has_stable_players else None
-                )
-                number_detector = (
-                    build_detector(config)
-                    if numbers_enabled and has_stable_players else None
+                number_predictor, number_detector = _build_number_evidence_components(
+                    config, has_stable_players
                 )
                 stats_kwargs = {
                     "masks": masks, "clean_masks": clean_masks, "config": config,

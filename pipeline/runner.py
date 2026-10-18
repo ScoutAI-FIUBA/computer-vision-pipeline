@@ -59,7 +59,11 @@ from pipeline.possession_v3 import (
     PossessionResolver, derive_ball_primitives, derive_ball_transitions, classify_transition,
     normalize_ball_rows, score_candidates, score_candidates_v4, debounce_reverted_switches, V3_CONTRACT_VERSION, _point,
 )
-from pipeline.projected_shots import build_projected_shots, write_projected_shots_image
+from pipeline.projected_shots import (
+    _load_confirmed_numbers_by_stable_player_id,
+    build_projected_shots,
+    write_projected_shots_image,
+)
 from pipeline.reid import Embedder, build_embedder
 from pipeline.results import (
     RESULTS_SCHEMA_VERSION, PipelineResults, RunSummary, TrackWriter, write_v3_artifacts,
@@ -75,6 +79,7 @@ from pipeline.shot_events import (
     write_shot_raw_prediction_record,
     write_shot_signal_record,
 )
+from pipeline.shot_outcome import refine_shot_events_file
 from pipeline.team_evidence import TeamEvidenceSample, select_top_k_evidence, summarize_track_evidence, write_debug_artifacts
 from pipeline.team_embedder import TeamEmbeddingSample, build_team_embedder
 from pipeline.team_id import (
@@ -126,6 +131,7 @@ POSSESSION_V3_MANIFEST_FILENAME = "possession_v3_manifest.json"
 PROJECTED_TRACKS_FILENAME = "projected_tracks.jsonl"
 PROJECTED_SHOTS_FILENAME = "projected_shots.json"
 PROJECTED_SHOTS_IMAGE_FILENAME = "projected_shots.png"
+RELEASE_START_FIELDS = ("start_frame_index", "start_timestamp_seconds", "start_image_xy", "start_shot_xyxy")
 
 
 def _build_detector_for_model(config: PipelineConfig, *, model_id: str | None = None):
@@ -913,6 +919,12 @@ def _maybe_write_projected_shots(output_dir: Path) -> tuple[str | None, str | No
         projected_tracks,
         team_ids_by_track_id=_load_team_ids_by_track_id(output_dir / TEAMS_FILENAME),
         confirmed_numbers_by_track_id=_load_confirmed_numbers_by_track_id(output_dir / NUMBERS_FILENAME),
+        confirmed_numbers_by_stable_player_id=_load_confirmed_numbers_by_stable_player_id(output_dir / NUMBERS_FILENAME),
+        raw_prediction_rows=(
+            _load_jsonl_rows(output_dir / SHOT_RAW_PREDICTIONS_FILENAME)
+            if (output_dir / SHOT_RAW_PREDICTIONS_FILENAME).exists()
+            else None
+        ),
     )
     projected_shots_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     write_projected_shots_image(artifact, projected_shots_image_path)
@@ -1053,6 +1065,16 @@ def _write_shot_events(
             write_shot_event_record(shot_events_file, final_shot_event)
 
 
+def _refine_shot_outcomes(output_dir: Path, config: PipelineConfig) -> None:
+    if not getattr(config, "shot_rim_trajectory_outcome", True):
+        return
+    refine_shot_events_file(
+        output_dir / SHOT_EVENTS_FILENAME,
+        output_dir / SHOT_RAW_PREDICTIONS_FILENAME,
+        output_dir / BALL_TRACKS_FILENAME,
+    )
+
+
 def _attach_ball_evidence(
     output_dir: Path, *, expected_frame_indices, team_ids_by_track_id: dict[int, int] | None = None,
     projected_shots: dict | None = None,
@@ -1062,6 +1084,25 @@ def _attach_ball_evidence(
     tracks = _load_jsonl_rows(output_dir / TRACKS_FILENAME)
     if team_ids_by_track_id is None:
         team_ids_by_track_id = _load_team_ids_by_track_id(output_dir / TEAMS_FILENAME)
+    if projected_shots is None:
+        projected_shots_path = output_dir / PROJECTED_SHOTS_FILENAME
+        if projected_shots_path.exists():
+            projected_shots = json.loads(projected_shots_path.read_text(encoding="utf-8"))
+    projected_by_event_id = None
+    if projected_shots is not None:
+        projected_by_event_id = {
+            shot.get("event_id"): shot
+            for shot in projected_shots.get("shots", [])
+            if isinstance(shot, dict) and shot.get("event_id") is not None
+        }
+        # Evidence windows follow the corrected release frame; shot_events.jsonl itself stays as detected.
+        events = [
+            {**event, **{key: projected[key] for key in RELEASE_START_FIELDS}}
+            if (projected := projected_by_event_id.get(event.get("event_id")))
+            and projected.get("start_frame_source") == "action_box_release"
+            else event
+            for event in events
+        ]
     enriched = attach_shot_evidence(
         events,
         load_ball_track_rows(output_dir / BALL_TRACKS_FILENAME),
@@ -1069,16 +1110,7 @@ def _attach_ball_evidence(
         player_rows=tracks,
         team_ids_by_track_id=team_ids_by_track_id,
     )
-    if projected_shots is None:
-        projected_shots_path = output_dir / PROJECTED_SHOTS_FILENAME
-        if projected_shots_path.exists():
-            projected_shots = json.loads(projected_shots_path.read_text(encoding="utf-8"))
-    if projected_shots is not None:
-        projected_by_event_id = {
-            shot.get("event_id"): shot
-            for shot in projected_shots.get("shots", [])
-            if isinstance(shot, dict) and shot.get("event_id") is not None
-        }
+    if projected_by_event_id is not None:
         for event in enriched:
             identity = event.get("player_identity", {})
             projected = projected_by_event_id.get(event.get("event_id"))
@@ -1293,6 +1325,7 @@ def run_stats_from_v2_observations(
         on_progress=shot_progress,
     ))
     shot_progress.complete(info.frame_count if info.frame_count > 0 else None)
+    phase("shot outcome refinement", lambda: _refine_shot_outcomes(output_dir, config))
     projected_shots_file, projected_shots_image_file = phase(
         "projected shot artifacts", lambda: _maybe_write_projected_shots(output_dir)
     )
@@ -2029,6 +2062,7 @@ def run_pipeline(
         step=shot_step,
         config=config,
     )
+    _refine_shot_outcomes(output_dir, config)
     if projected_track_records == 0 and projected_tracks_path.exists():
         projected_tracks_path.unlink()
     results.projected_shots_file, results.projected_shots_image_file = _maybe_write_projected_shots(output_dir)

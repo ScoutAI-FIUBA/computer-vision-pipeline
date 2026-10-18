@@ -2916,3 +2916,107 @@ def test_fake_sam_cardinality_errors_are_explicit(ids, boxes, message):
         output["out_probs"] = [0.5, 0.6]
     with pytest.raises(RuntimeError, match=message):
         _session_objects(output)
+
+
+def _staged_stats_fixture(tmp_path: Path, monkeypatch):
+    import numpy as np
+    import modal_app_v2
+    from pipeline.results import package_artifacts, publish_stage_generation
+    from modal_app_v2 import write_job_manifest
+
+    monkeypatch.setattr(modal_app_v2, "V2_JOB_VOLUME_DIR", str(tmp_path))
+    job = tmp_path / "job-1"
+    package = job / "package"
+    enriched = [{
+        "observation_key": "0:3", "frame_index": 0, "raw_track_id": 3,
+        "bbox_xyxy": [0, 0, 2, 2], "stable_player_id": "player-3", "team_id": 1,
+        "track_state": "tracked",
+    }]
+    package_artifacts(package, enriched, {"0:3": np.ones((2, 2), dtype=np.uint8)},
+                      input_fingerprint="input", frame_bounds=[0, 0])
+    artifacts = {
+        ("tracking-manifest.json" if path.name == "manifest.json" else path.relative_to(package).as_posix()): path
+        for path in package.rglob("*") if path.is_file()
+    }
+    tracking = publish_stage_generation(
+        job / "tracking", stage="tracking", input_fingerprint="input", request_fingerprint="request",
+        artifacts=artifacts, frame_bounds=[0, 0],
+    )
+    write_job_manifest(job, {
+        "job_id": "job-1", "state": "tracked", "input_fingerprint": "input",
+        "tracking_generation": tracking["generation"],
+    })
+
+
+def _run_staged_stats_with_fakes(monkeypatch):
+    import modal_app_v2
+
+    captured = {}
+    predictor, detector = object(), object()
+
+    def fake_stats(video_path, config, tracking_root, output, generation, **kwargs):
+        captured.update(kwargs)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "results.json").write_text("{}")
+        return object()
+
+    # Fakes keep tests off the hosted Roboflow clients.
+    monkeypatch.setattr(modal_app_v2, "run_stats_from_v2_generation", fake_stats)
+    monkeypatch.setattr(modal_app_v2, "build_number_predictor", lambda _config: predictor)
+    monkeypatch.setattr(modal_app_v2, "build_detector", lambda _config: detector)
+    cls = next(value for key, value in modal_app_v2.PipelineV2.__dict__.items()
+               if key.startswith("_sync_original"))._user_cls
+    _raw_method(cls, "stats_stage")(cls(), job_id="job-1", worker_id="worker-a")
+    return captured, predictor, detector
+
+
+def test_staged_stats_stage_passes_number_components_when_enabled(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "dummy")
+    monkeypatch.setenv("NUMBER_EVIDENCE_ENABLED", "1")
+    _staged_stats_fixture(tmp_path, monkeypatch)
+
+    captured, predictor, detector = _run_staged_stats_with_fakes(monkeypatch)
+
+    assert captured["number_predictor"] is predictor
+    assert captured["number_detector"] is detector
+
+
+def test_staged_stats_stage_passes_no_number_components_when_disabled(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "dummy")
+    monkeypatch.setenv("NUMBER_EVIDENCE_ENABLED", "0")
+    _staged_stats_fixture(tmp_path, monkeypatch)
+
+    captured, _predictor, _detector = _run_staged_stats_with_fakes(monkeypatch)
+
+    assert captured["number_predictor"] is None
+    assert captured["number_detector"] is None
+
+
+def test_stats_fingerprint_tracks_numbers_wiring_only_when_enabled(monkeypatch):
+    import modal_app_v2
+    from pipeline.config import PipelineConfig
+    from pipeline.results import stage_fingerprint
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "dummy")
+    monkeypatch.setenv("NUMBER_EVIDENCE_ENABLED", "1")
+    enabled = PipelineConfig.from_env()
+    monkeypatch.setenv("NUMBER_EVIDENCE_ENABLED", "0")
+    disabled = PipelineConfig.from_env()
+
+    original = stage_fingerprint(
+        "stats", disabled.possession_engine, "tracking-1", modal_app_v2._config_fingerprint(disabled)
+    )
+    assert modal_app_v2._stats_stage_fingerprint(None, "tracking-1", disabled) == original
+    assert modal_app_v2._stats_stage_fingerprint(None, "tracking-1", enabled) != \
+        modal_app_v2._stats_stage_fingerprint(None, "tracking-1", disabled)
+
+
+def test_number_components_helper_builds_nothing_without_stable_players_or_when_disabled(monkeypatch):
+    import modal_app_v2
+
+    monkeypatch.setattr(modal_app_v2, "build_number_predictor", lambda _c: pytest.fail("built"))
+    monkeypatch.setattr(modal_app_v2, "build_detector", lambda _c: pytest.fail("built"))
+    enabled = types.SimpleNamespace(number_evidence_enabled=True)
+    disabled = types.SimpleNamespace(number_evidence_enabled=False)
+    assert modal_app_v2._build_number_evidence_components(enabled, False) == (None, None)
+    assert modal_app_v2._build_number_evidence_components(disabled, True) == (None, None)

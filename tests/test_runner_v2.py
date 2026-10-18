@@ -1291,3 +1291,111 @@ def test_reid_embedding_contract_is_normalized_and_one_result_preserves_raw_trac
     assert len(result.observations) == 1
     assert result.observations[0]["raw_track_id"] == 3
     assert result.observations[0]["reid_embedding"] == [1.0, 0.0]
+
+
+def _invalid_row_run(total, invalid_keys, *, authority=None, reid_receipt_drop=None):
+    class Embedder:
+        def embed(self, _frame, boxes):
+            return [[3.0, 4.0] for _ in boxes]
+
+    class TeamEmbedder:
+        name = "fake-team"
+
+        def embed(self, _frame, samples):
+            return [TeamFeatures(color_signature=[1.0], embedding=None) for _ in samples]
+
+    class OneTeam:
+        name = "one-team"
+
+        def fit_predict(self, embeddings, _team_count):
+            return [0 for _ in embeddings]
+
+    observations = [row(frame_index=60 + index, raw_track_id=1 + index % 2) for index in range(total)]
+    masks = {item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations}
+    for index in invalid_keys:
+        masks[observations[index]["observation_key"]] = np.zeros((24, 12), dtype=bool)
+    result = RunnerV2(
+        RunnerV2Seams(
+            identity=resolve,
+            reid=Embedder(),
+            team_embedder=TeamEmbedder(),
+            team_clusterer=OneTeam(),
+            identity_authority=authority or RuntimeIdentityAuthority(),
+        )
+    ).run(
+        observations,
+        frames_by_index={60 + index: np.ones((24, 12, 3), dtype=np.uint8) for index in range(total)},
+        masks_by_observation=masks,
+    )
+    return observations, result
+
+
+def test_authority_tolerates_one_invalid_mask_row_among_many_valid_rows():
+    observations, result = _invalid_row_run(300, [150])
+    bad_key = observations[150]["observation_key"]
+
+    assert result.acceptance["tracking_identity"] == "accepted"
+    assert result.acceptance["identity_excluded_observations"] == 1
+    assert result.acceptance["identity_excluded_observation_keys"] == [bad_key]
+    by_key = {item["observation_key"]: item for item in result.observations}
+    assert by_key[bad_key]["stable_player_id"] is None
+    assert by_key[bad_key]["reid_evidence"] == {"status": "invalid", "reason": "invalid_mask"}
+    valid = [item for key, item in by_key.items() if key != bad_key]
+    assert len(valid) == 299
+    assert all(item["stable_player_id"] == f"player-{item['raw_track_id']}" for item in valid)
+    assert all(item["team_id"] == 0 for item in valid)
+    assert "identity_excluded_invalid_rows:1" in result.acceptance_reasons
+
+
+def test_authority_exclusion_list_is_bounded_but_count_is_exact():
+    _, result = _invalid_row_run(3000, list(range(0, 90, 3)))  # 30 invalid, 1.0%
+
+    assert result.acceptance["tracking_identity"] == "accepted"
+    assert result.acceptance["identity_excluded_observations"] == 30
+    assert len(result.acceptance["identity_excluded_observation_keys"]) == 20
+
+
+def test_authority_rejects_and_scrubs_when_invalid_fraction_exceeds_cap():
+    _, result = _invalid_row_run(300, [10, 20, 30, 40])  # 1.33% > 1%
+
+    assert result.acceptance == {"tracking_identity": "rejected", "statistics": "deferred"}
+    assert result.downstream == {}
+    assert any("missing_stage_receipt:reid" in reason for reason in result.acceptance_reasons)
+    assert all(
+        not ({"stable_player_id", "reid_embedding", "reid_evidence", "team_id"} & item.keys())
+        for item in result.observations
+    )
+
+
+def test_invalid_row_does_not_mask_a_different_authority_failure():
+    class DropTeamReceipt(RuntimeIdentityAuthority):
+        def __call__(self, rows, receipts):
+            victim = rows[0]["observation_key"]
+            trimmed = receipts._with(team=receipts.team - {victim})
+            return super().__call__(rows, trimmed)
+
+    _, result = _invalid_row_run(300, [150], authority=DropTeamReceipt())
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert "identity_excluded_observations" not in result.acceptance
+    assert any("missing_stage_receipt:team" in reason for reason in result.acceptance_reasons)
+    assert all("stable_player_id" not in item for item in result.observations)
+
+
+def test_invalid_row_does_not_excuse_forged_prepopulated_fields_on_other_rows():
+    class Embedder:
+        def embed(self, _frame, boxes):
+            return [[3.0, 4.0] for _ in boxes]
+
+    observations = [row(frame_index=60 + index) for index in range(300)]
+    observations[5]["reid_evidence"] = {"status": "valid"}
+    observations[5]["reid_embedding"] = [1.0, 0.0]
+    masks = {item["observation_key"]: np.ones((24, 12), dtype=bool) for item in observations}
+    masks[observations[150]["observation_key"]] = np.zeros((24, 12), dtype=bool)
+    # No reid seam: the forged evidence has no runtime receipt, so rejection must hold.
+    result = RunnerV2(
+        RunnerV2Seams(identity=resolve, identity_authority=RuntimeIdentityAuthority())
+    ).run(observations, masks_by_observation=masks)
+
+    assert result.acceptance["tracking_identity"] == "rejected"
+    assert "identity_excluded_observations" not in result.acceptance

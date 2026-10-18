@@ -3,20 +3,51 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 BALL_IN_BASKET_CLASS_ID = 1
 JUMP_SHOT_CLASS_ID = 5
 LAYUP_DUNK_CLASS_ID = 6
+BALL_CLASS_ID = 0
+RIM_CLASS_ID = 9
 
 BALL_IN_BASKET_CLASS_NAMES = {"ball_in_basket"}
 JUMP_SHOT_CLASS_NAMES = {"jump_shot"}
 LAYUP_DUNK_CLASS_NAMES = {"layup_dunk"}
+BALL_CLASS_NAMES = {"ball"}
+RIM_CLASS_NAMES = {"rim"}
+# A shot box is a false positive when it is cut off by the image edge and the detector sees
+# the ball only far away from it. Distance alone is not enough: the detector's ball can itself
+# be wrong, and confident mid-court shot boxes must survive that.
+SHOT_BALL_MAX_DISTANCE_BOX_HEIGHTS = 2.0
+SHOT_BOX_EDGE_TOLERANCE_PX = 1.0
+# A ball-in-basket box is a false positive when the detector sees the ball confidently far away
+# (a pass in a player's hands). A ball hidden in the net is often missed or low-confidence, so
+# only confident balls count.
+BASKET_CONTRADICTING_BALL_MIN_CONFIDENCE = 0.5
+BASKET_CONTRADICTING_BALL_MIN_DISTANCE_BASKET_WIDTHS = 10.0
 SAME_EVENT_WINDOW_SECONDS = 1.0
 OPENING_CONFIRMATION_WINDOW_SECONDS = 0.3
 POST_MADE_SUPPRESSION_SECONDS = 2.0
 MISSED_SHOT_TIMEOUT_SECONDS = 5.0
 LOW_CONFIDENCE_BURST_THRESHOLD = 0.5
+# A weak first box must not swallow the confident boxes that follow it (a real shot often starts
+# with one weak box); two consecutive confident boxes rule out a lone confident false positive.
+SUPPRESSED_BURST_RELEASE_CONFIDENT_FRAMES = 2
+# A release can open an event on a pass in front of the basket (a layup-like burst with no shot).
+# Such an event is dropped when the ball never gets this close to the rim (in rim widths) up to
+# the window after its last shot box. Fitted on two release-opened events only (one real shot,
+# one phantom): treat the threshold as a guess, not a measured boundary.
+RELEASED_SHOT_MAX_BALL_RIM_DISTANCE = 1.25
+RELEASED_SHOT_BALL_RIM_WINDOW_SECONDS = 1.5
+# Used only when a timestamp is missing: 1.5 s at 30 fps.
+RELEASED_SHOT_BALL_RIM_WINDOW_FRAMES_FALLBACK = 45
+BALL_RIM_MIN_BALL_CONFIDENCE = 0.6
+# The event type is a confidence-weighted vote over the last burst of shot boxes. A single stray
+# box of the other class (a jump shot read once as a layup) must not relabel the whole event.
+SHOT_TYPE_BURST_GAP_SECONDS = 0.3
+# Used only when a timestamp is missing: 0.3 s at 30 fps.
+SHOT_TYPE_BURST_GAP_FRAMES_FALLBACK = 9
 
 
 @dataclass
@@ -35,6 +66,12 @@ class ShotEventCandidate:
     inactive_inference_count: int = 0
     ball_in_basket_frame_index: int | None = None
     ball_in_basket_timestamp_seconds: float | None = None
+    # (frame_index, timestamp_seconds, shot_type, confidence) for every frame with a shot signal.
+    shot_frames: list[tuple[int, float | None, str, float | None]] = field(default_factory=list)
+    # Only candidates opened by releasing a suppressed burst track the ball-to-rim distance.
+    released: bool = False
+    min_ball_rim_distance: float | None = None
+    last_ball_rim_frame_index: int | None = None
 
 
 @dataclass
@@ -48,6 +85,9 @@ class SuppressedShotBurst:
     latest_shot_frame_index: int
     latest_shot_timestamp_seconds: float | None
     shot_signal_active: bool = True
+    # Current run of consecutive confident shot frames, kept so a release loses nothing:
+    # (frame_index, timestamp_seconds, shot_type, confidence, center_xy, xyxy, ball_rim_distance).
+    confident_run: list[tuple] = field(default_factory=list)
 
 
 def shot_signal_trace_record(
@@ -188,8 +228,133 @@ def best_shot_prediction(result: object) -> tuple[str | None, dict | None]:
     return None, None
 
 
+def _shot_prediction_is_truncated_and_far_from_ball(
+    prediction: dict, ball_centers: list[tuple[float, float]]
+) -> bool:
+    """True for an edge-truncated shot box when every ball detected this frame is far from it.
+
+    A frame with no ball detection never rejects a shot, so occluded balls cost no recall. The
+    right edge cannot be checked because the frame width is not part of the detector result.
+    """
+    if not ball_centers:
+        return False
+    xyxy = prediction_xyxy(prediction)
+    center = prediction_center_xy(prediction)
+    if xyxy is None or center is None:
+        return False
+    if xyxy[0] > SHOT_BOX_EDGE_TOLERANCE_PX and xyxy[1] > SHOT_BOX_EDGE_TOLERANCE_PX:
+        return False
+    max_distance = SHOT_BALL_MAX_DISTANCE_BOX_HEIGHTS * max(xyxy[3] - xyxy[1], 1.0)
+    nearest = min(
+        ((center[0] - ball_x) ** 2 + (center[1] - ball_y) ** 2) ** 0.5 for ball_x, ball_y in ball_centers
+    )
+    return nearest > max_distance
+
+
+def _ball_detections(predictions: list) -> list[tuple[tuple[float, float], float]]:
+    return [
+        (center, comparable_prediction_confidence(prediction))
+        for prediction in predictions
+        if isinstance(prediction, dict)
+        and prediction_matches(prediction, class_id=BALL_CLASS_ID, class_names=BALL_CLASS_NAMES)
+        for center in [prediction_center_xy(prediction)]
+        if center is not None
+    ]
+
+
+def reject_shot_predictions_far_from_ball(predictions: list) -> list:
+    ball_centers = [center for center, _ in _ball_detections(predictions)]
+    return [
+        prediction
+        for prediction in predictions
+        if not (
+            isinstance(prediction, dict)
+            and (
+                prediction_matches(prediction, class_id=JUMP_SHOT_CLASS_ID, class_names=JUMP_SHOT_CLASS_NAMES)
+                or prediction_matches(prediction, class_id=LAYUP_DUNK_CLASS_ID, class_names=LAYUP_DUNK_CLASS_NAMES)
+            )
+            and _shot_prediction_is_truncated_and_far_from_ball(prediction, ball_centers)
+        )
+    ]
+
+
+def _basket_is_contradicted_by_confident_ball(
+    prediction: dict, confident_ball_centers: list[tuple[float, float]]
+) -> bool:
+    """True when a confident ball is detected this frame and every one is far from the basket box."""
+    if not confident_ball_centers:
+        return False
+    xyxy = prediction_xyxy(prediction)
+    center = prediction_center_xy(prediction)
+    if xyxy is None or center is None:
+        return False
+    min_distance = BASKET_CONTRADICTING_BALL_MIN_DISTANCE_BASKET_WIDTHS * max(xyxy[2] - xyxy[0], 1.0)
+    nearest = min(
+        ((center[0] - ball_x) ** 2 + (center[1] - ball_y) ** 2) ** 0.5 for ball_x, ball_y in confident_ball_centers
+    )
+    return nearest > min_distance
+
+
+def reject_ball_in_basket_predictions_contradicted_by_ball(predictions: list) -> list:
+    confident_ball_centers = [
+        center
+        for center, confidence in _ball_detections(predictions)
+        if confidence >= BASKET_CONTRADICTING_BALL_MIN_CONFIDENCE
+    ]
+    return [
+        prediction
+        for prediction in predictions
+        if not (
+            isinstance(prediction, dict)
+            and prediction_matches(
+                prediction, class_id=BALL_IN_BASKET_CLASS_ID, class_names=BALL_IN_BASKET_CLASS_NAMES
+            )
+            and _basket_is_contradicted_by_confident_ball(prediction, confident_ball_centers)
+        )
+    ]
+
+
+def _best_box(predictions: list, *, class_id: int, class_names: set[str], min_confidence: float = 0.0):
+    best = None
+    for prediction in predictions:
+        if not isinstance(prediction, dict) or not prediction_matches(
+            prediction, class_id=class_id, class_names=class_names
+        ):
+            continue
+        confidence = comparable_prediction_confidence(prediction)
+        if confidence < min_confidence or prediction_center_xy(prediction) is None:
+            continue
+        if best is None or confidence > comparable_prediction_confidence(best):
+            best = prediction
+    return best
+
+
+def ball_rim_distance(predictions: list) -> float | None:
+    """Best confident ball to best rim distance in rim widths; None unless both are in the frame."""
+    ball = _best_box(
+        predictions,
+        class_id=BALL_CLASS_ID,
+        class_names=BALL_CLASS_NAMES,
+        min_confidence=BALL_RIM_MIN_BALL_CONFIDENCE,
+    )
+    rim = _best_box(predictions, class_id=RIM_CLASS_ID, class_names=RIM_CLASS_NAMES)
+    if ball is None or rim is None:
+        return None
+    rim_xyxy = prediction_xyxy(rim)
+    rim_width = rim_xyxy[2] - rim_xyxy[0]
+    if rim_width <= 0:
+        return None
+    ball_x, ball_y = prediction_center_xy(ball)
+    rim_x, rim_y = prediction_center_xy(rim)
+    return ((ball_x - rim_x) ** 2 + (ball_y - rim_y) ** 2) ** 0.5 / rim_width
+
+
 def shot_frame_signals(result: object) -> dict[str, object]:
     predictions = result.get("predictions", []) if isinstance(result, dict) else []
+    distance = ball_rim_distance(predictions)
+    predictions = reject_shot_predictions_far_from_ball(predictions)
+    predictions = reject_ball_in_basket_predictions_contradicted_by_ball(predictions)
+    result = {"predictions": predictions}
     shot_type_signal, shot_prediction = best_shot_prediction(result)
     has_jump_shot = any(
         prediction_matches(prediction, class_id=JUMP_SHOT_CLASS_ID, class_names=JUMP_SHOT_CLASS_NAMES)
@@ -218,6 +383,7 @@ def shot_frame_signals(result: object) -> dict[str, object]:
         "shot_signal_confidence": None if shot_prediction is None else prediction_confidence(shot_prediction),
         "shot_signal_xyxy": None if shot_prediction is None else prediction_xyxy(shot_prediction),
         "shot_signal_center_xy": None if shot_prediction is None else prediction_center_xy(shot_prediction),
+        "ball_rim_distance": distance,
     }
 
 
@@ -229,6 +395,45 @@ def shot_type_for_frame(signals: dict[str, object]) -> str | None:
     if signals["has_jump_shot"]:
         return "jump_shot"
     return None
+
+
+def _is_same_burst(
+    previous: tuple[int, float | None, str, float | None], current: tuple[int, float | None, str, float | None]
+) -> bool:
+    gap_seconds = elapsed_seconds(previous[1], current[1])
+    if gap_seconds is None:
+        return current[0] - previous[0] < SHOT_TYPE_BURST_GAP_FRAMES_FALLBACK
+    return gap_seconds < SHOT_TYPE_BURST_GAP_SECONDS
+
+
+def vote_shot_type(candidate: ShotEventCandidate) -> str:
+    """Confidence-weighted vote over the last burst of shot boxes; ties go to jump_shot."""
+    frames = sorted(candidate.shot_frames, key=lambda entry: entry[0])
+    if not frames:
+        return candidate.shot_type
+    burst = [frames[-1]]
+    for entry in reversed(frames[:-1]):
+        if not _is_same_burst(entry, burst[0]):
+            break
+        burst.insert(0, entry)
+    # A box without a confidence still counts, with the smallest weight that breaks no tie.
+    weights = {"jump_shot": 0.0, "layup_dunk": 0.0}
+    for _, _, shot_type, confidence in burst:
+        weights[shot_type] += confidence if confidence is not None else 1e-6
+    return "layup_dunk" if weights["layup_dunk"] > weights["jump_shot"] else "jump_shot"
+
+
+def _record_shot_frame(
+    candidate: ShotEventCandidate,
+    frame_index: int,
+    timestamp_seconds: float | None,
+    shot_type: str,
+    signals: dict[str, object],
+) -> None:
+    confidence = signals.get("shot_signal_confidence")
+    candidate.shot_frames.append(
+        (frame_index, timestamp_seconds, shot_type, None if confidence is None else float(confidence))
+    )
 
 
 def finalize_shot_event(
@@ -260,7 +465,7 @@ def finalize_shot_event(
         start_shot_xyxy = candidate.latest_shot_xyxy
     return {
         "event_id": candidate.event_id,
-        "shot_type": candidate.shot_type,
+        "shot_type": vote_shot_type(candidate),
         "outcome": outcome,
         "start_frame_index": start_frame_index,
         "end_frame_index": end_frame_index,
@@ -274,6 +479,56 @@ def finalize_shot_event(
         "start_shot_xyxy": None if start_shot_xyxy is None else [float(value) for value in start_shot_xyxy],
         "resolution_reason": resolution_reason,
     }
+
+
+def drop_single_frame_miss(event: dict) -> dict | None:
+    # A single shot box is detector noise (e.g. a pass read as a shot); a real attempt spans several frames.
+    if event["end_frame_index"] == event["start_frame_index"]:
+        return None
+    return event
+
+
+def _within_ball_rim_window(
+    candidate: ShotEventCandidate, frame_index: int, timestamp_seconds: float | None
+) -> bool:
+    gap = elapsed_seconds(candidate.latest_shot_timestamp_seconds, timestamp_seconds)
+    if gap is None:
+        return frame_index - candidate.latest_shot_frame_index <= RELEASED_SHOT_BALL_RIM_WINDOW_FRAMES_FALLBACK
+    return gap <= RELEASED_SHOT_BALL_RIM_WINDOW_SECONDS
+
+
+def _within_ball_rim_window_elapsed(
+    candidate: ShotEventCandidate, frame_index: int, timestamp_seconds: float | None
+) -> bool:
+    gap = elapsed_seconds(candidate.latest_shot_timestamp_seconds, timestamp_seconds)
+    if gap is None:
+        return frame_index - candidate.latest_shot_frame_index >= RELEASED_SHOT_BALL_RIM_WINDOW_FRAMES_FALLBACK
+    return gap >= RELEASED_SHOT_BALL_RIM_WINDOW_SECONDS
+
+
+def track_ball_rim_distance(
+    candidate: ShotEventCandidate, frame_index: int, timestamp_seconds: float | None, signals: dict[str, object]
+) -> None:
+    # Must run before the frame moves latest_shot_*: the window is anchored on the previous shot box.
+    distance = signals.get("ball_rim_distance")
+    if not candidate.released or distance is None:
+        return
+    if not _within_ball_rim_window(candidate, frame_index, timestamp_seconds):
+        return
+    if candidate.min_ball_rim_distance is None or distance < candidate.min_ball_rim_distance:
+        candidate.min_ball_rim_distance = float(distance)
+    candidate.last_ball_rim_frame_index = frame_index
+
+
+def drop_released_shot_far_from_rim(candidate: ShotEventCandidate, event: dict | None) -> dict | None:
+    # A basket detection always wins; no ball/rim pair seen means no evidence, so keep (fail open).
+    if event is None or not candidate.released or event["outcome"] == "made":
+        return event
+    if candidate.min_ball_rim_distance is None:
+        return event
+    if candidate.min_ball_rim_distance > RELEASED_SHOT_MAX_BALL_RIM_DISTANCE:
+        return None
+    return event
 
 
 def elapsed_seconds(start: float | None, end: float | None) -> float | None:
@@ -316,14 +571,55 @@ def update_shot_event_candidate(
     if isinstance(candidate, SuppressedShotBurst):
         if not has_shot_signal:
             candidate.shot_signal_active = False
+            candidate.confident_run = []
             return candidate, None, next_event_id
         shot_gap_seconds = elapsed_seconds(candidate.latest_shot_timestamp_seconds, timestamp_seconds)
         if candidate.shot_signal_active or (shot_gap_seconds is not None and shot_gap_seconds < SAME_EVENT_WINDOW_SECONDS):
-            candidate.shot_signal_active = True
-            candidate.latest_shot_frame_index = frame_index
-            candidate.latest_shot_timestamp_seconds = timestamp_seconds
-            return candidate, None, next_event_id
-        candidate = None
+            confidence = signals.get("shot_signal_confidence")
+            if confidence is not None and float(confidence) < LOW_CONFIDENCE_BURST_THRESHOLD:
+                candidate.confident_run = []
+            else:
+                candidate.confident_run.append(
+                    (
+                        frame_index,
+                        timestamp_seconds,
+                        shot_type,
+                        None if confidence is None else float(confidence),
+                        signals.get("shot_signal_center_xy"),
+                        signals.get("shot_signal_xyxy"),
+                        signals.get("ball_rim_distance"),
+                    )
+                )
+            if len(candidate.confident_run) < SUPPRESSED_BURST_RELEASE_CONFIDENT_FRAMES:
+                candidate.shot_signal_active = True
+                candidate.latest_shot_frame_index = frame_index
+                candidate.latest_shot_timestamp_seconds = timestamp_seconds
+                return candidate, None, next_event_id
+            # Release: open the candidate as if it had started at the run's first frame; the
+            # current frame is then handled below like any later frame of a live candidate.
+            first, *rest = candidate.confident_run
+            candidate = ShotEventCandidate(
+                event_id=next_event_id,
+                shot_type=first[2],
+                start_frame_index=first[0],
+                start_timestamp_seconds=first[1],
+                start_image_xy=first[4],
+                start_shot_xyxy=first[5],
+                latest_shot_frame_index=first[0],
+                latest_shot_timestamp_seconds=first[1],
+                latest_shot_image_xy=first[4],
+                latest_shot_xyxy=first[5],
+                shot_frames=[(entry[0], entry[1], entry[2], entry[3]) for entry in [first, *rest[:-1]]],
+                released=True,
+            )
+            # The current frame (last of the run) is counted below with the live candidate.
+            seeded = [entry for entry in [first, *rest[:-1]] if entry[6] is not None]
+            if seeded:
+                candidate.min_ball_rim_distance = float(min(entry[6] for entry in seeded))
+                candidate.last_ball_rim_frame_index = seeded[-1][0]
+            next_event_id += 1
+        else:
+            candidate = None
 
     if should_suppress_shot_burst(candidate, signals):
         return (
@@ -353,6 +649,8 @@ def update_shot_event_candidate(
     if candidate is None:
         return None, None, next_event_id
 
+    track_ball_rim_distance(candidate, frame_index, timestamp_seconds, signals)
+
     is_rising_edge = has_shot_signal and not candidate.shot_signal_active
     previous_latest_frame_index = candidate.latest_shot_frame_index
     previous_latest_timestamp_seconds = candidate.latest_shot_timestamp_seconds
@@ -366,7 +664,7 @@ def update_shot_event_candidate(
             candidate.latest_shot_timestamp_seconds = timestamp_seconds
             candidate.latest_shot_image_xy = signals.get("shot_signal_center_xy")
             candidate.latest_shot_xyxy = signals.get("shot_signal_xyxy")
-            candidate.shot_type = shot_type or candidate.shot_type
+            _record_shot_frame(candidate, frame_index, timestamp_seconds, shot_type, signals)
         candidate.ball_in_basket_frame_index = frame_index
         candidate.ball_in_basket_timestamp_seconds = timestamp_seconds
         cooldown_until = (
@@ -399,16 +697,21 @@ def update_shot_event_candidate(
             candidate.latest_shot_timestamp_seconds = timestamp_seconds
             candidate.latest_shot_image_xy = signals.get("shot_signal_center_xy")
             candidate.latest_shot_xyxy = signals.get("shot_signal_xyxy")
-            candidate.shot_type = shot_type
+            _record_shot_frame(candidate, frame_index, timestamp_seconds, shot_type, signals)
             candidate.shot_signal_active = True
             return candidate, None, next_event_id
         if shot_gap_seconds is not None and shot_gap_seconds >= SAME_EVENT_WINDOW_SECONDS:
-            resolved = finalize_shot_event(
+            resolved = drop_released_shot_far_from_rim(
                 candidate,
-                outcome="missed",
-                resolved_frame_index=frame_index,
-                resolved_timestamp_seconds=timestamp_seconds,
-                resolution_reason="new_shot_started",
+                drop_single_frame_miss(
+                    finalize_shot_event(
+                        candidate,
+                        outcome="missed",
+                        resolved_frame_index=frame_index,
+                        resolved_timestamp_seconds=timestamp_seconds,
+                        resolution_reason="new_shot_started",
+                    )
+                ),
             )
             replacement = ShotEventCandidate(
                 event_id=next_event_id,
@@ -422,6 +725,7 @@ def update_shot_event_candidate(
                 latest_shot_image_xy=signals.get("shot_signal_center_xy"),
                 latest_shot_xyxy=signals.get("shot_signal_xyxy"),
             )
+            _record_shot_frame(replacement, frame_index, timestamp_seconds, shot_type, signals)
             return replacement, resolved, next_event_id + 1
 
     if shot_type is not None:
@@ -430,20 +734,24 @@ def update_shot_event_candidate(
         candidate.latest_shot_timestamp_seconds = timestamp_seconds
         candidate.latest_shot_image_xy = signals.get("shot_signal_center_xy")
         candidate.latest_shot_xyxy = signals.get("shot_signal_xyxy")
-        if shot_type == "layup_dunk":
-            candidate.shot_type = shot_type
+        _record_shot_frame(candidate, frame_index, timestamp_seconds, shot_type, signals)
         return candidate, None, next_event_id
 
     inactive_gap_seconds = elapsed_seconds(candidate.latest_shot_timestamp_seconds, timestamp_seconds)
     if inactive_gap_seconds is not None and inactive_gap_seconds >= MISSED_SHOT_TIMEOUT_SECONDS:
         return (
             None,
-            finalize_shot_event(
+            drop_released_shot_far_from_rim(
                 candidate,
-                outcome="missed",
-                resolved_frame_index=frame_index,
-                resolved_timestamp_seconds=timestamp_seconds,
-                resolution_reason="shot_timeout",
+                drop_single_frame_miss(
+                    finalize_shot_event(
+                        candidate,
+                        outcome="missed",
+                        resolved_frame_index=frame_index,
+                        resolved_timestamp_seconds=timestamp_seconds,
+                        resolution_reason="shot_timeout",
+                    )
+                ),
             ),
             next_event_id,
         )
@@ -459,13 +767,17 @@ def flush_open_shot_event(
 ) -> dict | None:
     if candidate is None or isinstance(candidate, (ShotEventCooldown, SuppressedShotBurst)):
         return None
-    return finalize_shot_event(
+    event = finalize_shot_event(
         candidate,
         outcome="unknown",
         resolved_frame_index=frame_index,
         resolved_timestamp_seconds=timestamp_seconds,
         resolution_reason="end_of_clip",
     )
+    # A clip that ends inside the window may still have the ball arriving at the rim: keep it.
+    if _within_ball_rim_window_elapsed(candidate, frame_index, timestamp_seconds):
+        return drop_released_shot_far_from_rim(candidate, event)
+    return event
 
 
 def write_shot_event_record(handle, event: dict) -> None:

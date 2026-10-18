@@ -247,6 +247,8 @@ class PipelineConfig:
     # Optional local temporal ball detector. Disabled by default so hosted
     # ball detection and Modal remain unchanged.
     tracknet_enabled: bool = False
+    # Heuristic: upgrade missed/unknown shots to made when the ball goes through the rim zone.
+    shot_rim_trajectory_outcome: bool = True
     tracknet_checkpoint: str | None = None
     tracknet_seed_radius: float = DEFAULT_TRACKNET_SEED_RADIUS
     tracknet_heatmap_threshold: float = DEFAULT_TRACKNET_HEATMAP_THRESHOLD
@@ -447,6 +449,7 @@ class PipelineConfig:
             "shot_model_id": os.getenv("SHOT_MODEL_ID", DEFAULT_SHOT_MODEL_ID),
             "court_model_id": os.getenv("COURT_MODEL_ID", DEFAULT_COURT_MODEL_ID),
             "sam2_model_id": os.getenv("SAM2_MODEL_ID", DEFAULT_SAM2_MODEL_ID),
+            "shot_rim_trajectory_outcome": _env_bool("SHOT_RIM_TRAJECTORY_OUTCOME", True),
             "tracknet_enabled": os.getenv("TRACKNET_ENABLED", "0").lower() in {"1", "true", "yes"},
             "tracknet_checkpoint": os.getenv("TRACKNET_CHECKPOINT") or None,
             "tracknet_seed_radius": _env_float("TRACKNET_SEED_RADIUS", DEFAULT_TRACKNET_SEED_RADIUS),

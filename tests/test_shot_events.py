@@ -15,10 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pipeline.config import PipelineConfig  # noqa: E402
 from pipeline.shot_events import (  # noqa: E402
+    ShotEventCandidate,
     flush_open_shot_event,
     shot_frame_signals,
     shot_signal_trace_record,
     update_shot_event_candidate,
+    vote_shot_type,
 )
 from pipeline.video import Segment, VideoInfo  # noqa: E402
 
@@ -42,6 +44,7 @@ def test_shot_frame_signals_match_verified_notebook_class_ids():
         "shot_signal_confidence": None,
         "shot_signal_xyxy": None,
         "shot_signal_center_xy": None,
+        "ball_rim_distance": None,
     }
 
 
@@ -258,8 +261,9 @@ def test_low_confidence_first_shot_burst_is_dropped_but_later_high_confidence_bu
     low_burst_frames = (
         (0, 0.0, detection_frame({"class_id": 5, "class": "jump_shot", "confidence": 0.473})),
         (4, 0.1333, frame()),
-        (8, 0.2667, detection_frame({"class_id": 5, "class": "jump_shot", "confidence": 0.91})),
-        (12, 0.4, detection_frame({"class_id": 5, "class": "jump_shot", "confidence": 0.88})),
+        # Still weak: confident boxes here would now release the suppression (see the tests below).
+        (8, 0.2667, detection_frame({"class_id": 5, "class": "jump_shot", "confidence": 0.41})),
+        (12, 0.4, detection_frame({"class_id": 5, "class": "jump_shot", "confidence": 0.38})),
         (18, 0.6, frame(1)),
     )
     for frame_index, timestamp_seconds, result in low_burst_frames:
@@ -310,6 +314,136 @@ def test_low_confidence_first_shot_burst_is_dropped_but_later_high_confidence_bu
     assert next_event_id == 2
 
 
+def _shot_box(confidence: float, class_id: int = 5) -> dict:
+    name = "jump_shot" if class_id == 5 else "layup_dunk"
+    return detection_frame(
+        {"class_id": class_id, "class": name, "confidence": confidence, "x": 100, "y": 100, "width": 20, "height": 40}
+    )
+
+
+def _run_steps(steps: list[tuple[int, float, dict]]) -> tuple[object, list[dict], int]:
+    candidate = None
+    next_event_id = 1
+    events = []
+    for frame_index, timestamp_seconds, result in steps:
+        candidate, resolved, next_event_id = update_shot_event_candidate(
+            candidate,
+            next_event_id=next_event_id,
+            frame_index=frame_index,
+            timestamp_seconds=timestamp_seconds,
+            signals=shot_frame_signals(result),
+        )
+        if resolved is not None:
+            events.append(resolved)
+    return candidate, events, next_event_id
+
+
+def test_two_consecutive_confident_boxes_release_a_weak_first_burst_and_start_at_the_first_of_them():
+    candidate, events, next_event_id = _run_steps(
+        [
+            (353, 11.77, _shot_box(0.45)),
+            (398, 13.27, _shot_box(0.66, 6)),
+            (399, 13.3, _shot_box(0.63, 6)),
+            (400, 13.33, _shot_box(0.77)),
+        ]
+    )
+
+    assert events == []
+    assert next_event_id == 2
+    assert candidate.start_frame_index == 398
+    assert candidate.start_timestamp_seconds == 13.27
+    assert candidate.start_shot_xyxy == (90.0, 80.0, 110.0, 120.0)
+    assert [entry[0] for entry in candidate.shot_frames] == [398, 399, 400]
+    assert candidate.latest_shot_frame_index == 400
+    assert vote_shot_type(candidate) == "layup_dunk"
+
+
+def test_released_candidate_resolves_made_on_ball_in_basket_with_latest_shot_start():
+    _, events, _ = _run_steps(
+        [
+            (353, 11.77, _shot_box(0.45)),
+            (360, 12.0, _shot_box(0.7)),
+            (361, 12.03, _shot_box(0.7)),
+            (380, 12.6, frame(1)),
+        ]
+    )
+
+    assert len(events) == 1
+    assert events[0]["outcome"] == "made"
+    assert events[0]["resolution_reason"] == "ball_in_basket"
+    assert events[0]["ball_in_basket_frame_index"] == 380
+    assert events[0]["start_frame_index"] == 361
+
+
+def test_released_candidate_without_ball_in_basket_flushes_as_unknown_from_first_confident_frame():
+    candidate, _, _ = _run_steps(
+        [
+            (353, 11.77, _shot_box(0.45)),
+            (360, 12.0, _shot_box(0.7)),
+            (361, 12.03, _shot_box(0.7)),
+        ]
+    )
+
+    event = flush_open_shot_event(candidate, frame_index=500, timestamp_seconds=16.0)
+    assert event["outcome"] == "unknown"
+    assert event["start_frame_index"] == 360
+    assert event["end_frame_index"] == 361
+
+
+def test_weak_only_burst_stays_suppressed_even_when_long():
+    candidate, events, next_event_id = _run_steps(
+        [(353 + i, 11.77 + i * 0.033, _shot_box(0.45)) for i in range(40)] + [(400, 13.2, frame(1))]
+    )
+
+    assert events == []
+    assert next_event_id == 1
+    assert flush_open_shot_event(candidate, frame_index=400, timestamp_seconds=13.2) is None
+
+
+def test_single_confident_box_between_weak_ones_does_not_release():
+    candidate, events, next_event_id = _run_steps(
+        [
+            (1, 0.0, _shot_box(0.45)),
+            (2, 0.03, _shot_box(0.8)),
+            (3, 0.07, _shot_box(0.4)),
+            (4, 0.1, _shot_box(0.8)),
+            (5, 0.13, _shot_box(0.4)),
+            (6, 0.17, frame(1)),
+        ]
+    )
+
+    assert events == []
+    assert next_event_id == 1
+    assert flush_open_shot_event(candidate, frame_index=6, timestamp_seconds=0.17) is None
+
+
+def test_confident_boxes_separated_by_a_frame_without_signal_do_not_release():
+    _, events, next_event_id = _run_steps(
+        [
+            (1, 0.0, _shot_box(0.45)),
+            (2, 0.03, _shot_box(0.8)),
+            (3, 0.07, frame()),
+            (4, 0.1, _shot_box(0.8)),
+        ]
+    )
+
+    assert events == []
+    assert next_event_id == 1
+
+
+def test_confident_box_after_a_gap_of_one_second_opens_a_normal_candidate():
+    candidate, _, next_event_id = _run_steps(
+        [
+            (1, 0.0, _shot_box(0.45)),
+            (2, 0.03, frame()),
+            (60, 2.0, _shot_box(0.8)),
+        ]
+    )
+
+    assert next_event_id == 2
+    assert candidate.start_frame_index == 60
+
+
 def test_shot_becomes_missed_after_five_seconds_without_ball_in_basket():
     candidate = None
     next_event_id = 1
@@ -326,8 +460,17 @@ def test_shot_becomes_missed_after_five_seconds_without_ball_in_basket():
     candidate, resolved, next_event_id = update_shot_event_candidate(
         candidate,
         next_event_id=next_event_id,
+        frame_index=100 + 1,
+        timestamp_seconds=4.5,
+        signals=shot_frame_signals(frame(6)),
+    )
+    assert resolved is None
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
         frame_index=225,
-        timestamp_seconds=9.0,
+        timestamp_seconds=9.5,
         signals=shot_frame_signals(frame()),
     )
 
@@ -356,6 +499,15 @@ def test_new_shot_outside_same_event_window_after_reset_misses_previous_and_star
         candidate,
         next_event_id=next_event_id,
         frame_index=101,
+        timestamp_seconds=4.05,
+        signals=shot_frame_signals(frame(5)),
+    )
+    assert resolved is None
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=102,
         timestamp_seconds=4.1,
         signals=shot_frame_signals(frame()),
     )
@@ -365,7 +517,7 @@ def test_new_shot_outside_same_event_window_after_reset_misses_previous_and_star
         candidate,
         next_event_id=next_event_id,
         frame_index=130,
-        timestamp_seconds=5.0,
+        timestamp_seconds=5.1,
         signals=shot_frame_signals(frame(5)),
     )
     assert resolved is not None
@@ -521,6 +673,85 @@ def test_open_shot_flushes_as_unknown_at_end_of_clip():
     assert final_event is not None
     assert final_event["outcome"] == "unknown"
     assert final_event["resolution_reason"] == "end_of_clip"
+
+
+def _run_shot_frames(steps: list[tuple[int, float, tuple[int, ...]]]) -> tuple[object, list[dict], int]:
+    candidate = None
+    next_event_id = 1
+    events = []
+    for frame_index, timestamp_seconds, class_ids in steps:
+        candidate, resolved, next_event_id = update_shot_event_candidate(
+            candidate,
+            next_event_id=next_event_id,
+            frame_index=frame_index,
+            timestamp_seconds=timestamp_seconds,
+            signals=shot_frame_signals(frame(*class_ids)),
+        )
+        if resolved is not None:
+            events.append(resolved)
+    return candidate, events, next_event_id
+
+
+def test_single_frame_shot_followed_by_new_shot_start_emits_no_missed_event():
+    candidate, events, next_event_id = _run_shot_frames(
+        [(100, 4.0, (5,)), (101, 4.1, ()), (130, 5.2, (5,))]
+    )
+
+    assert events == []
+    assert candidate is not None
+    assert candidate.start_frame_index == 130
+    assert next_event_id == 3
+
+    candidate, resolved, _ = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=140,
+        timestamp_seconds=5.6,
+        signals=shot_frame_signals(frame(1)),
+    )
+    assert resolved is not None
+    assert resolved["outcome"] == "made"
+    assert resolved["event_id"] == 2
+
+
+def test_multi_frame_shot_followed_by_new_shot_start_still_emits_missed_event():
+    _, events, _ = _run_shot_frames(
+        [(100, 4.0, (5,)), (101, 4.05, (5,)), (102, 4.1, ()), (130, 5.2, (5,))]
+    )
+
+    assert len(events) == 1
+    assert events[0]["outcome"] == "missed"
+    assert events[0]["resolution_reason"] == "new_shot_started"
+
+
+def test_single_frame_shot_timeout_emits_nothing_but_multi_frame_timeout_is_missed():
+    candidate, events, _ = _run_shot_frames([(100, 4.0, (5,)), (225, 9.0, ())])
+    assert candidate is None
+    assert events == []
+
+    candidate, events, _ = _run_shot_frames([(100, 4.0, (5,)), (101, 4.5, (5,)), (225, 9.5, ())])
+    assert candidate is None
+    assert len(events) == 1
+    assert events[0]["outcome"] == "missed"
+    assert events[0]["resolution_reason"] == "shot_timeout"
+
+
+def test_single_frame_shot_with_ball_in_basket_is_still_made():
+    _, events, _ = _run_shot_frames([(100, 4.0, (5,)), (130, 5.2, (1,))])
+
+    assert len(events) == 1
+    assert events[0]["outcome"] == "made"
+
+
+def test_single_frame_candidate_still_flushes_as_unknown_at_end_of_clip():
+    candidate, events, _ = _run_shot_frames([(100, 4.0, (5,))])
+    assert events == []
+
+    final_event = flush_open_shot_event(candidate, frame_index=100, timestamp_seconds=4.0)
+
+    assert final_event is not None
+    assert final_event["outcome"] == "unknown"
+    assert final_event["start_frame_index"] == final_event["end_frame_index"] == 100
 
 
 def test_shot_signal_trace_record_reports_active_and_resolved_states():
@@ -756,6 +987,10 @@ def test_run_pipeline_writes_shot_events_and_versions_results(
             "start_image_xy": None,
             "start_shot_xyxy": None,
             "resolution_reason": "ball_in_basket",
+            # Added by the rim-trajectory refinement, which runs by default.
+            "outcome_source": "ball_in_basket",
+            "rim_pass_frame_index": None,
+            "rim_exit_frame_index": None,
         }
     ]
     shot_evidence = [
@@ -1244,3 +1479,396 @@ def test_run_pipeline_handles_projected_artifacts_based_on_homography_availabili
         assert "projected_tracks_file" not in results_payload
         assert "projected_shots_file" not in results_payload
         assert "projected_shots_image_file" not in results_payload
+
+
+def _box(class_id: int, x: float, y: float, width: float, height: float, confidence: float = 0.6) -> dict:
+    return {"class_id": class_id, "x": x, "y": y, "width": width, "height": height, "confidence": confidence}
+
+
+def test_edge_truncated_shot_box_far_from_the_ball_is_not_a_shot_signal():
+    # Regression: queta2pts frames 420-423 produced a left-edge jump-shot box while the ball sat at the rim.
+    signals = shot_frame_signals(
+        {"predictions": [_box(5, 22.5, 523.5, 45, 197), _box(0, 661.5, 160.0, 23, 22)]}
+    )
+
+    assert signals["shot_type_signal"] is None
+    assert signals["has_jump_shot"] is False
+
+
+def test_edge_truncated_shot_box_near_the_ball_is_kept():
+    signals = shot_frame_signals(
+        {"predictions": [_box(5, 22.5, 523.5, 45, 197), _box(0, 60.0, 500.0, 23, 22)]}
+    )
+
+    assert signals["shot_type_signal"] == "jump_shot"
+
+
+def test_edge_truncated_shot_box_is_kept_when_no_ball_is_detected():
+    signals = shot_frame_signals({"predictions": [_box(5, 22.5, 523.5, 45, 197)]})
+
+    assert signals["shot_type_signal"] == "jump_shot"
+
+
+def test_confident_mid_frame_shot_box_is_kept_even_when_the_detected_ball_is_far():
+    # Regression: queta2pts shot 3 had a "ball" 500px away; a bad ball must not erase real shots.
+    signals = shot_frame_signals(
+        {"predictions": [_box(5, 304.0, 428.0, 70, 151, 0.8), _box(0, 810.0, 390.0, 23, 22)]}
+    )
+
+    assert signals["shot_type_signal"] == "jump_shot"
+
+
+def test_ball_in_basket_is_rejected_when_a_confident_ball_is_far_away():
+    # Regression: derrick frame 362 had a false basket at the rim while the ball was in a player's hands.
+    signals = shot_frame_signals(
+        {"predictions": [_box(1, 790.0, 146.0, 38, 40, 0.74), _box(0, 240.0, 371.0, 20, 20, 0.92)]}
+    )
+
+    assert signals["has_ball_in_basket"] is False
+
+
+def test_ball_in_basket_is_kept_when_a_confident_ball_is_within_five_basket_widths():
+    # Regression: queta2pts frame 443 had the real ball 172px from the basket.
+    signals = shot_frame_signals(
+        {"predictions": [_box(1, 638.0, 187.0, 49, 40, 0.6), _box(0, 752.0, 316.0, 20, 20, 0.82)]}
+    )
+
+    assert signals["has_ball_in_basket"] is True
+
+
+def test_ball_in_basket_is_kept_when_no_ball_is_detected():
+    # Regression: derrick frames 521-536 are a real make with the ball hidden in the net.
+    signals = shot_frame_signals({"predictions": [_box(1, 748.0, 172.0, 43, 40, 0.8)]})
+
+    assert signals["has_ball_in_basket"] is True
+
+
+def test_ball_in_basket_is_kept_when_the_only_far_ball_is_low_confidence():
+    # Regression: brown2pts frames 467-469 had only weak balls far from the basket.
+    signals = shot_frame_signals(
+        {"predictions": [_box(1, 670.0, 208.0, 42, 40, 0.8), _box(0, 789.0, 90.0, 20, 20, 0.46)]}
+    )
+
+    assert signals["has_ball_in_basket"] is True
+
+
+def test_false_ball_in_basket_leaves_the_shot_open_until_a_real_basket_arrives():
+    false_basket = {"predictions": [_box(1, 790.0, 146.0, 38, 40, 0.74), _box(0, 240.0, 371.0, 20, 20, 0.92)]}
+    real_basket = {"predictions": [_box(1, 748.0, 172.0, 43, 40, 0.8)]}
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        None, next_event_id=1, frame_index=350, timestamp_seconds=14.0, signals=shot_frame_signals(frame(5))
+    )
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=361,
+        timestamp_seconds=14.4,
+        signals=shot_frame_signals(false_basket),
+    )
+
+    assert resolved is None
+    assert candidate is not None
+
+    candidate, resolved, next_event_id = update_shot_event_candidate(
+        candidate,
+        next_event_id=next_event_id,
+        frame_index=521,
+        timestamp_seconds=20.8,
+        signals=shot_frame_signals(real_basket),
+    )
+
+    assert resolved is not None
+    assert resolved["outcome"] == "made"
+
+
+def shot_box_frame(class_id: int, confidence: float, *extra: dict) -> dict:
+    return detection_frame(
+        {"class_id": class_id, "confidence": confidence, "x": 100, "y": 100, "width": 20, "height": 40},
+        *extra,
+    )
+
+
+def replay_shot_frames(rows: list[tuple[int, float, dict]], *, flush: bool = True) -> list[dict]:
+    candidate = None
+    next_event_id = 1
+    events: list[dict] = []
+    for frame_index, timestamp, result in rows:
+        candidate, resolved, next_event_id = update_shot_event_candidate(
+            candidate,
+            next_event_id=next_event_id,
+            frame_index=frame_index,
+            timestamp_seconds=timestamp,
+            signals=shot_frame_signals(result),
+        )
+        if resolved is not None:
+            events.append(resolved)
+    if flush:
+        flushed = flush_open_shot_event(candidate, frame_index=rows[-1][0], timestamp_seconds=rows[-1][1])
+        if flushed is not None:
+            events.append(flushed)
+    return events
+
+
+def test_isolated_low_confidence_layup_box_among_jump_boxes_stays_jump_shot():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["shot_type"] == "jump_shot"
+
+
+def test_later_layup_burst_after_a_separate_jump_burst_is_layup_dunk():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.8)) for i in range(5)]
+    rows += [(i, i * 0.1, shot_box_frame(6, 0.6)) for i in range(15, 20)]
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["shot_type"] == "layup_dunk"
+
+
+def test_single_mixed_burst_is_decided_by_summed_confidence():
+    layup_heavy = [(0, 0.0, shot_box_frame(5, 0.5)), (1, 0.1, shot_box_frame(6, 0.9)), (2, 0.2, shot_box_frame(5, 0.3))]
+    jump_heavy = [(0, 0.0, shot_box_frame(5, 0.9)), (1, 0.1, shot_box_frame(6, 0.6)), (2, 0.2, shot_box_frame(5, 0.4))]
+
+    assert replay_shot_frames(layup_heavy)[0]["shot_type"] == "layup_dunk"
+    assert replay_shot_frames(jump_heavy)[0]["shot_type"] == "jump_shot"
+
+
+def test_tied_vote_goes_to_jump_shot():
+    rows = [(0, 0.0, shot_box_frame(5, 0.5)), (1, 0.1, shot_box_frame(6, 0.5))]
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["shot_type"] == "jump_shot"
+
+
+def test_vote_falls_back_to_frame_gaps_without_timestamps():
+    candidate = ShotEventCandidate(
+        event_id=1,
+        shot_type="jump_shot",
+        start_frame_index=0,
+        start_timestamp_seconds=None,
+        start_image_xy=None,
+        start_shot_xyxy=None,
+        latest_shot_frame_index=40,
+        latest_shot_timestamp_seconds=None,
+        latest_shot_image_xy=None,
+        latest_shot_xyxy=None,
+        shot_frames=[(0, None, "jump_shot", 0.9), (2, None, "jump_shot", 0.9), (40, None, "layup_dunk", 0.3)],
+    )
+
+    assert vote_shot_type(candidate) == "layup_dunk"
+
+
+def test_made_event_uses_the_last_burst_vote():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.8)) for i in range(3)]
+    rows += [(i, i * 0.1, shot_box_frame(6, 0.6)) for i in range(10, 13)]
+    rows.append((13, 1.3, frame(1)))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "made"
+    assert event["shot_type"] == "layup_dunk"
+
+
+def test_made_event_with_basket_and_shot_box_in_same_frame_counts_that_box():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.8)) for i in range(3)]
+    rows.append((3, 0.3, shot_box_frame(6, 3.0, {"class_id": 1})))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "made"
+    assert event["shot_type"] == "layup_dunk"
+
+
+def test_missed_by_timeout_event_uses_the_vote_not_any_layup():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+    rows.append((100, 10.0, frame()))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "missed"
+    assert event["resolution_reason"] == "shot_timeout"
+    assert event["shot_type"] == "jump_shot"
+
+
+def test_new_shot_started_missed_event_uses_the_vote():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+    rows += [(15, 1.5, frame()), (20, 2.5, shot_box_frame(6, 0.9))]
+
+    first, second = replay_shot_frames(rows)
+
+    assert (first["outcome"], first["resolution_reason"]) == ("missed", "new_shot_started")
+    assert first["shot_type"] == "jump_shot"
+    assert second["shot_type"] == "layup_dunk"
+
+
+def test_unknown_event_at_end_of_clip_uses_the_vote():
+    rows = [(i, i * 0.1, shot_box_frame(5, 0.7)) for i in range(10)]
+    rows[5] = (5, 0.5, shot_box_frame(6, 0.42))
+
+    (event,) = replay_shot_frames(rows)
+
+    assert event["outcome"] == "unknown"
+    assert event["shot_type"] == "jump_shot"
+
+
+# Ball-to-rim filter for events opened through the suppressed-burst release.
+RIM_BOX = {"class_id": 9, "class": "rim", "confidence": 0.9, "x": 500, "y": 300, "width": 40, "height": 30}
+
+
+def _ball_box(x: float, y: float, confidence: float = 0.8) -> dict:
+    return {"class_id": 0, "class": "ball", "confidence": confidence, "x": x, "y": y, "width": 10, "height": 10}
+
+
+def _near_ball() -> list[dict]:
+    # 20 px from the rim centre = 0.5 rim widths.
+    return [RIM_BOX, _ball_box(520, 300)]
+
+
+def _far_ball() -> list[dict]:
+    # 200 px from the rim centre = 5 rim widths.
+    return [RIM_BOX, _ball_box(700, 300)]
+
+
+def _with(result: dict, extra: list[dict]) -> dict:
+    return {"predictions": result["predictions"] + extra}
+
+
+def _released_steps(extra_by_frame: dict[int, list[dict]] | None = None) -> list[tuple[int, float, dict]]:
+    extra_by_frame = extra_by_frame or {}
+    steps = [
+        (100, 3.0, _shot_box(0.45)),
+        (110, 3.3, _shot_box(0.7)),
+        (111, 3.33, _shot_box(0.7)),
+        (112, 3.37, _shot_box(0.7)),
+    ]
+    return [(f, t, _with(r, extra_by_frame.get(f, []))) for f, t, r in steps]
+
+
+def test_shot_frame_signals_report_ball_rim_distance_in_rim_widths():
+    signals = shot_frame_signals(detection_frame(*_near_ball()))
+
+    assert signals["ball_rim_distance"] == pytest.approx(0.5)
+    assert shot_frame_signals(frame(5))["ball_rim_distance"] is None
+    assert shot_frame_signals(detection_frame(RIM_BOX, _ball_box(520, 300, 0.5)))["ball_rim_distance"] is None
+    assert shot_frame_signals(detection_frame(_ball_box(520, 300)))["ball_rim_distance"] is None
+
+
+def test_shot_signal_trace_record_works_for_released_candidate():
+    candidate, _, _ = _run_steps(_released_steps({111: _far_ball()}))
+
+    record = shot_signal_trace_record(
+        frame_index=112,
+        timestamp_seconds=3.37,
+        signals=shot_frame_signals(_shot_box(0.7)),
+        candidate=candidate,
+        resolved_event=None,
+    )
+    assert record["event_state"] == "active"
+    assert record["event_id"] == 1
+
+
+def test_released_far_from_rim_is_dropped_on_new_shot_started_and_ids_are_not_renumbered():
+    far = {f: _far_ball() for f in (110, 111, 112, 120)}
+    candidate, events, next_event_id = _run_steps(
+        _released_steps(far) + [(120, 3.7, frame()), (200, 6.7, _shot_box(0.7))]
+    )
+
+    assert events == []
+    assert candidate.event_id == 2
+    assert not candidate.released
+    assert next_event_id == 3
+
+
+def test_released_far_from_rim_is_dropped_on_shot_timeout():
+    far = {f: _far_ball() for f in (110, 111, 112)}
+    _, events, _ = _run_steps(_released_steps(far) + [(400, 9.0, frame())])
+
+    assert events == []
+
+
+def test_released_far_from_rim_is_dropped_at_end_of_clip_once_the_window_elapsed():
+    far = {f: _far_ball() for f in (110, 111, 112)}
+    candidate, _, _ = _run_steps(_released_steps(far))
+
+    assert flush_open_shot_event(candidate, frame_index=200, timestamp_seconds=3.37 + 1.5) is None
+
+
+def test_released_close_to_rim_is_kept():
+    extra = {110: _far_ball(), 111: _far_ball(), 112: _near_ball()}
+    _, events, _ = _run_steps(_released_steps(extra) + [(400, 9.0, frame())])
+
+    assert [event["outcome"] for event in events] == ["missed"]
+
+
+def test_released_close_ball_in_the_run_before_release_counts():
+    extra = {110: _near_ball(), 111: _far_ball(), 112: _far_ball()}
+    _, events, _ = _run_steps(_released_steps(extra) + [(400, 9.0, frame())])
+
+    assert len(events) == 1
+
+
+def test_released_made_by_ball_in_basket_is_kept_even_if_the_ball_is_far():
+    far = {f: _far_ball() for f in (110, 111, 112, 130)}
+    _, events, _ = _run_steps(_released_steps(far) + [(130, 3.8, _with(frame(1), _far_ball()))])
+
+    assert [event["outcome"] for event in events] == ["made"]
+
+
+def test_released_without_rim_or_without_ball_in_the_same_frame_fails_open():
+    # Ball in one frame and rim in another never pair up.
+    extra = {110: [RIM_BOX], 111: [_ball_box(700, 300)], 112: [_ball_box(700, 300)]}
+    candidate, _, _ = _run_steps(_released_steps(extra))
+
+    assert candidate.min_ball_rim_distance is None
+    assert flush_open_shot_event(candidate, frame_index=200, timestamp_seconds=10.0) is not None
+    _, events, _ = _run_steps(_released_steps(extra) + [(400, 9.0, frame())])
+    assert len(events) == 1
+
+
+def test_released_far_from_rim_is_kept_when_the_clip_ends_before_the_window_elapsed():
+    far = {f: _far_ball() for f in (110, 111, 112)}
+    candidate, _, _ = _run_steps(_released_steps(far))
+
+    event = flush_open_shot_event(candidate, frame_index=150, timestamp_seconds=3.37 + 1.4)
+    assert event is not None
+    assert event["outcome"] == "unknown"
+
+
+def test_non_released_candidate_far_from_rim_is_not_dropped():
+    steps = [
+        (110, 3.3, _with(_shot_box(0.7), _far_ball())),
+        (111, 3.33, _with(_shot_box(0.7), _far_ball())),
+        (112, 3.37, _with(_shot_box(0.7), _far_ball())),
+        (400, 9.0, frame()),
+    ]
+    candidate, events, _ = _run_steps(steps)
+
+    assert [event["outcome"] for event in events] == ["missed"]
+    assert events[0]["resolution_reason"] == "shot_timeout"
+
+
+def test_ball_rim_window_includes_one_and_a_half_seconds_after_the_latest_shot_box_but_not_later():
+    base = _released_steps({f: _far_ball() for f in (110, 111, 112)})
+
+    on_boundary, _, _ = _run_steps(base + [(150, 3.37 + 1.5, _with(frame(), _near_ball()))])
+    assert on_boundary.min_ball_rim_distance == pytest.approx(0.5)
+
+    after, _, _ = _run_steps(base + [(151, 3.37 + 1.51, _with(frame(), _near_ball()))])
+    assert after.min_ball_rim_distance > 1.25
+
+
+def test_ball_rim_window_follows_the_latest_shot_box_not_the_run_start():
+    # Rim reached 1.9 s after the run start but 1.4 s after its last shot box.
+    steps = _released_steps({f: _far_ball() for f in (110, 111)}) + [
+        (150, 4.9, _shot_box(0.7)),
+        (190, 6.3, _with(frame(), _near_ball())),
+    ]
+    candidate, _, _ = _run_steps(steps)
+
+    assert candidate.min_ball_rim_distance == pytest.approx(0.5)

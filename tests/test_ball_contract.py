@@ -361,3 +361,29 @@ def test_runner_projected_shooter_fallback_keeps_unknown_without_stable_identity
     assert evidence["player_identity"] == {
         "status": "unknown", "track_id": None, "stable_player_id": None, "team_id": None,
     }
+
+
+def test_runner_evidence_window_starts_at_the_projected_release_frame(tmp_path):
+    from pipeline.runner import _attach_ball_evidence
+
+    event = {"event_id": 1, "start_frame_index": 20, "end_frame_index": 22, "start_image_xy": [15, 15]}
+    (tmp_path / "shot_events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+    (tmp_path / "ball_tracks.jsonl").write_text(
+        "".join(json.dumps(row(frame)) + "\n" for frame in range(10, 23)), encoding="utf-8"
+    )
+    (tmp_path / "tracks.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "projected_shots.json").write_text(json.dumps({"shots": [{
+        "event_id": 1,
+        "start_frame_index": 12,
+        "start_timestamp_seconds": 0.4,
+        "start_image_xy": [15, 15],
+        "start_shot_xyxy": [8, 8, 22, 22],
+        "start_frame_source": "action_box_release",
+    }]}), encoding="utf-8")
+
+    _attach_ball_evidence(tmp_path, expected_frame_indices=range(10, 23))
+
+    evidence = json.loads((tmp_path / "shot_evidence.jsonl").read_text())
+    assert evidence["start_frame_index"] == 12
+    assert evidence["ball_evidence"]["frame_window"][0] == 12
+    assert json.loads((tmp_path / "shot_events.jsonl").read_text())["start_frame_index"] == 20
