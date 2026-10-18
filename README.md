@@ -146,6 +146,14 @@ generation. Do not replay an incomplete or hash-invalid generation.
   successful self-integrity check; the parent stats manifest remains the source
   for the recorded hash of the nested file.
 
+### Acceptance report
+
+`scripts/ops/acceptance_report.py` builds a redacted acceptance report for one staged run from its `modal run` log and the downloaded job folder: GPU, stage durations, artifact hash verification, tracking identity status, whether jersey-number OCR ran, a shot outcome summary and a checklist with PASS, FAIL, NOT_RUN or NOT_MEASURED for each item. It never invents numbers. Use `--diff A.json B.json` to compare two reports. See `docs/acceptance/README.md`.
+
+```bash
+python3 scripts/ops/acceptance_report.py --log outputs/<job>/run.log --job outputs/<job>-job/<job> --output report.md
+```
+
 ## Current pipeline
 
 The current production path is `pipeline/` plus `modal_app.py`.
