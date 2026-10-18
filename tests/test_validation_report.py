@@ -78,3 +78,9 @@ def test_review_note_is_shown(tmp_path):
     result = vr.evaluate_clip("d", folder, {"review_note": "Tirador verificado a mano.", "shots": [{"outcome": "made", "jersey_number": "9"}]})
     assert result["rows"][0]["number_ok"] is False
     assert "Nota de revisión: Tirador verificado a mano." in vr.render([result], None)
+
+
+def test_truth_without_a_shots_key_is_not_scored(tmp_path):
+    folder = _write(tmp_path / "a", [_shot(3.0)])
+    result = vr.evaluate_clip("a", folder, {"description": "solo pases", "passes": []})
+    assert result["status"] == "sin_verdad_terreno" and "rows" not in result and len(result["detections"]) == 1

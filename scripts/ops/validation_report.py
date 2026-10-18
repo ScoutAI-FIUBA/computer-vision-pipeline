@@ -76,7 +76,7 @@ def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict
     confirmed = [p for p in players if (p.get("jersey") or {}).get("status") == "confirmed"]
     result: dict[str, Any] = {
         "clip": name,
-        "status": "evaluado" if truth is not None else "sin_verdad_terreno",
+        "status": "evaluado" if truth is not None and "shots" in truth else "sin_verdad_terreno",
         "description": (truth or {}).get("description"),
         "review_note": (truth or {}).get("review_note"),
         "shots_detected": len(detected),
@@ -89,7 +89,7 @@ def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict
         "job_summary": job_doc.get("summary") if isinstance(job_doc, dict) else None,
         "wall_seconds": _wall_seconds(job_doc.get("job") if isinstance(job_doc, dict) else None),
     }
-    if truth is None:
+    if truth is None or "shots" not in truth:
         result["detections"] = [_describe(s) for s in detected]
         return result
 
