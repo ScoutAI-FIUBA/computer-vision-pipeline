@@ -327,6 +327,13 @@ class ActionVote:
     release_timestamp_seconds: float | None
 
 
+@dataclass(frozen=True)
+class VoteResult:
+    # ranking is (stable_player_id, score, best-box row), best first; winner is None when the vote is unclear.
+    ranking: list[tuple[str, float, dict]]
+    winner: ActionVote | None
+
+
 def _made_anchor_frame_index(event: dict) -> int | None:
     # A trajectory-made event has no basket detection; the rim pass is the frame the made shot is anchored to.
     if event.get("outcome") != "made":
@@ -341,7 +348,7 @@ def _action_box_vote(
     event: dict,
     raw_rows_by_frame: dict[int, dict],
     projected_by_frame: dict[int, list[dict]],
-) -> ActionVote | None:
+) -> VoteResult | None:
     """Vote for the shooter among the detector's shooting-pose boxes before a made basket.
 
     A box votes for the projected player it overlaps most, but only when a ball detection sits at
@@ -351,6 +358,8 @@ def _action_box_vote(
 
     The release is the first frame of the winner's last run of qualifying frames, so a putback is
     not anchored to an earlier miss.
+
+    Returns None when no vote can run; otherwise the ranking is returned even without a clear winner.
     """
     from pipeline.shot_events import (
         prediction_confidence,
@@ -421,10 +430,11 @@ def _action_box_vote(
                 frame_boxes[frame] = (confidence, box, row)
 
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    ranking = [(stable_id, score, best_box[stable_id][2]) for stable_id, score in ranked]
     if not ranked or ranked[0][1] < ACTION_MIN_VOTE_SCORE:
-        return None
+        return VoteResult(ranking, None)
     if len(ranked) > 1 and ranked[0][1] < ACTION_MIN_WINNER_RATIO * ranked[1][1]:
-        return None
+        return VoteResult(ranking, None)
     winner = ranked[0][0]
     _, best_frame, row = best_box[winner]
     max_gap = max(1, round(ACTION_RELEASE_MAX_GAP_SECONDS * fps))
@@ -434,14 +444,45 @@ def _action_box_vote(
         if current - previous > max_gap:
             release_frame = current
     _, release_box, release_row = boxes_by_frame[winner][release_frame]
-    return ActionVote(
-        row=row,
-        best_frame=best_frame,
-        release_frame=release_frame,
-        release_row=release_row,
-        release_xyxy=[float(value) for value in release_box],
-        release_timestamp_seconds=(raw_rows_by_frame.get(release_frame) or {}).get("timestamp_seconds"),
+    return VoteResult(
+        ranking,
+        ActionVote(
+            row=row,
+            best_frame=best_frame,
+            release_frame=release_frame,
+            release_row=release_row,
+            release_xyxy=[float(value) for value in release_box],
+            release_timestamp_seconds=(raw_rows_by_frame.get(release_frame) or {}).get("timestamp_seconds"),
+        ),
     )
+
+
+def _majority_team_by_stable_player_id(projected_tracks: list[dict]) -> dict[str, int]:
+    """Player-level team: the team most of the player's rows carry, only when it is a strict majority."""
+    counts: dict[str, dict[int, int]] = {}
+    for row in projected_tracks:
+        stable_id = row.get("stable_player_id")
+        if not isinstance(stable_id, str) or not stable_id.strip() or row.get("team_id") is None:
+            continue
+        team_counts = counts.setdefault(stable_id, {})
+        team_counts[int(row["team_id"])] = team_counts.get(int(row["team_id"]), 0) + 1
+    majority: dict[str, int] = {}
+    for stable_id, team_counts in counts.items():
+        team_id, count = max(team_counts.items(), key=lambda item: (item[1], -item[0]))
+        if count / sum(team_counts.values()) > 0.5:
+            majority[stable_id] = team_id
+    return majority
+
+
+def _outcome_confidence(event: dict) -> str:
+    outcome = event.get("outcome")
+    if outcome == "made":
+        # A trajectory make is inferred from the ball path; any other make comes from a basket detection.
+        inferred = event.get("outcome_source") == "rim_trajectory" or event.get("resolution_reason") == "rim_trajectory"
+        return "inferred" if inferred else "detected"
+    if outcome == "missed":
+        return "timeout"
+    return "unresolved"
 
 
 def build_projected_shots(
@@ -466,6 +507,16 @@ def build_projected_shots(
     confirmed_numbers_by_stable_player_id = confirmed_numbers_by_stable_player_id or {}
     projected_by_frame = _group_projected_tracks_by_frame(projected_tracks)
     available_frame_indexes = sorted(projected_by_frame)
+    majority_team_by_stable_id = _majority_team_by_stable_player_id(projected_tracks)
+
+    def team_for(row: dict | None) -> int | None:
+        if row is None:
+            return None
+        track_id = row.get("track_id")
+        team_id = None if track_id is None else team_ids_by_track_id.get(int(track_id))
+        if team_id is None:
+            team_id = majority_team_by_stable_id.get(row.get("stable_player_id"))
+        return team_id
     raw_rows_by_frame = (
         None
         if raw_prediction_rows is None
@@ -480,6 +531,8 @@ def build_projected_shots(
         shooter_row = None
         start_fields: dict = {"start_frame_source": "shot_detector"}
         attribution_method = "no_projected_frame_within_gap"
+        shooter_candidates: list[dict] = []
+        ambiguous_team_id = None
         if matched_frame_index is not None:
             frame_rows = projected_by_frame.get(matched_frame_index, [])
             snapshot_rows = [
@@ -497,7 +550,13 @@ def build_projected_shots(
                 shot_anchor_image_xy,
             )
             if raw_rows_by_frame is not None and _made_anchor_frame_index(event) is not None:
-                vote = _action_box_vote(event, raw_rows_by_frame, projected_by_frame)
+                vote_result = _action_box_vote(event, raw_rows_by_frame, projected_by_frame)
+                if vote_result is not None:
+                    shooter_candidates = [
+                        {"stable_player_id": stable_id, "team_id": team_for(row), "score": float(score)}
+                        for stable_id, score, row in vote_result.ranking[:3]
+                    ]
+                vote = None if vote_result is None else vote_result.winner
                 if vote is not None:
                     shooter_row = vote.release_row
                     attribution_method = "action_box_vote"
@@ -529,9 +588,14 @@ def build_projected_shots(
                     # The anchor rule would have guessed; an unclear vote leaves the shooter unknown instead.
                     shooter_row = None
                     attribution_method = "ambiguous"
+                    if len(shooter_candidates) >= 2 and shooter_candidates[0]["team_id"] is not None and (
+                        shooter_candidates[0]["team_id"] == shooter_candidates[1]["team_id"]
+                    ):
+                        attribution_method = "ambiguous_same_team"
+                        ambiguous_team_id = shooter_candidates[0]["team_id"]
             shot_origin_court_xy_m = None
             shot_origin_projection_method = None
-            if attribution_method == "ambiguous":
+            if attribution_method in ("ambiguous", "ambiguous_same_team"):
                 # The backend drops shots without an origin; keep an approximate one so the make stays on the chart as unattributed.
                 shot_box = event.get("start_shot_xyxy")
                 foot_anchor = (
@@ -552,6 +616,15 @@ def build_projected_shots(
         if shooter_row is not None:
             shot_origin_court_xy_m = [float(value) for value in shooter_row.get("court_xy_m", [])[:2]]
             shot_origin_projection_method = "shooter_foot"
+        shooter_team_id = ambiguous_team_id if shooter_row is None else team_for(shooter_row)
+        outcome_confidence = _outcome_confidence(event)
+        needs_review = (
+            shooter_stable_player_id is None
+            or attribution_method == "nearest_player_bbox_to_shot_anchor"
+            or attribution_method.startswith("ambiguous")
+            or outcome_confidence == "unresolved"
+            or shooter_team_id is None
+        )
         shots.append(
             {
                 **event,
@@ -564,7 +637,7 @@ def build_projected_shots(
                 "shot_origin_projection_method": shot_origin_projection_method,
                 "shooter_track_id": shooter_track_id,
                 "shooter_stable_player_id": shooter_stable_player_id,
-                "shooter_team_id": None if shooter_track_id is None else team_ids_by_track_id.get(shooter_track_id),
+                "shooter_team_id": shooter_team_id,
                 "shooter_confirmed_number": None
                 if shooter_row is None
                 else _confirmed_number(
@@ -574,6 +647,15 @@ def build_projected_shots(
                 ),
                 "shooter_attribution_method": attribution_method,
                 "projected_player_snapshot": snapshot_rows,
+                "shooter_candidates": shooter_candidates,
+                "needs_review": needs_review,
+                "release_timestamp_seconds": start_fields.get("start_timestamp_seconds")
+                if start_fields.get("start_frame_source") == "action_box_release"
+                else None,
+                "resolved_timestamp_seconds": event.get("resolved_timestamp_seconds"),
+                "outcome_confidence": outcome_confidence,
+                "outcome_source": event.get("outcome_source"),
+                "resolution_reason": event.get("resolution_reason"),
             }
         )
 
@@ -583,7 +665,11 @@ def build_projected_shots(
             "event_anchor": "made shots with a clear shooting-pose vote: first frame of the winner's last shooting-pose run; otherwise start_frame_index/start_image_xy from shot_events.jsonl",
             "frame_matching": "nearest projected frame by minimum temporal distance",
             "shot_origin_projection": "use the attributed shooter's projected foot/court point; ambiguous made shots project the detector shot box foot point through a homography from projected players when at least 4 are available",
-            "shooter_selection": "made shots with raw detector predictions: vote among shooting-pose boxes with the ball at their hands in the 2s before the basket, ambiguous when unclear; otherwise prefer containing bbox, then nearest bbox center and foot point",
+            "shooter_selection": "made shots with raw detector predictions: vote among shooting-pose boxes with the ball at their hands in the 2s before the basket, ambiguous when unclear (ambiguous_same_team when the top two candidates share a team); otherwise prefer containing bbox, then nearest bbox center and foot point",
+            "shooter_team": "track-level team, else the strict-majority team of the shooter's projected rows; ambiguous_same_team carries the shared team of the top two candidates",
+            "shooter_candidates": "top 3 of the action-box vote ranking (empty when no vote ran)",
+            "needs_review": "shooter unknown, attribution by nearest bbox or ambiguous, outcome unresolved, or shooter team unknown",
+            "outcome_confidence": "detected = made via ball_in_basket, inferred = made via rim_trajectory, timeout = missed, unresolved = unknown",
             "team_number_enrichment": "compatibility-only lookup keyed by raw track_id; stable_player_id remains canonical",
         },
         "shots": shots,
