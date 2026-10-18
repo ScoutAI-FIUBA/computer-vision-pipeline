@@ -108,6 +108,32 @@ def _time_chart(rows: list[dict[str, Any]], out: Path) -> None:
     plt.close(fig)
 
 
+_REASONS = {"ball_track_lost": "balón no detectado", "no_authoritative_player_match": "balón sin jugador asociado",
+            "confirmation_pending": "confirmación pendiente", "ambiguous_player_candidates": "varios jugadores posibles",
+            "player_identity_unassigned": "jugador sin identidad"}
+
+
+def pass_stats(folder: Path) -> dict[str, Any]:
+    """What the system produced about possession and passes, straight from the stored files."""
+    import collections
+
+    rows_path = folder / "possession_events.jsonl"
+    rows = [json.loads(x) for x in rows_path.read_text().splitlines() if x.strip()] if rows_path.is_file() else []
+    events_path = folder.parent / f"{folder.name}-events.json"
+    events = _json(events_path).get("events", []) if events_path.is_file() else []
+    stats_path = folder.parent / f"{folder.name}-stats.json"
+    coverage = _json(stats_path).get("coverage", {}) if stats_path.is_file() else {}
+    reasons = collections.Counter(r.get("rejection_reason") for r in rows if r.get("status") != "confirmed")
+    return {
+        "frames": len(rows),
+        "confirmed": sum(1 for r in rows if r.get("status") == "confirmed"),
+        "passes_detected": sum(1 for e in events if e.get("type") == "pass"),
+        "transfers_detected": sum(1 for e in events if e.get("type") == "possession_transfer"),
+        "ball_visibility_pct": coverage.get("ball_visibility_pct"),
+        "top_reasons": [(_REASONS.get(k, str(k)), v) for k, v in reasons.most_common(2)],
+    }
+
+
 def _status(row: dict[str, Any] | None) -> str:
     if row is None:
         return "---"
@@ -215,6 +241,21 @@ def build(args: argparse.Namespace) -> Path:
                      r"posición del tiro en la cancha (abajo; verde = convertido).}\end{figure}")
         clip_sections.append("\n".join(parts))
 
+    pass_rows, annotated_passes, detected_on_annotated = [], 0, 0
+    for r in new:
+        info = pass_stats(new_runs[r["clip"]][0])
+        wanted = (truth.get(r["clip"]) or {}).get("passes")
+        if wanted is not None:
+            annotated_passes += len(wanted)
+            detected_on_annotated += min(len(wanted), info["passes_detected"])
+        share = f"{info['confirmed']} de {info['frames']}" if info["frames"] else "n/d"
+        ball = f"{info['ball_visibility_pct']:.0f} %" if isinstance(info["ball_visibility_pct"], (int, float)) else "n/d"
+        pass_rows.append([r["clip"], str(len(wanted)) if wanted is not None else "sin anotar", str(info["passes_detected"]),
+                          ball, share, "; ".join(f"{k} ({v})" for k, v in info["top_reasons"]) or "n/d"])
+    passes_table = _table(["Clip", "Pases reales", "Pases detectados", "Balón visible", "Fotogramas con poseedor", "Motivos principales"],
+                          pass_rows, "lccp{1.9cm}p{2.6cm}p{4.6cm}")
+    total_passes = sum(pass_stats(new_runs[r["clip"]][0])["passes_detected"] for r in new)
+
     derrick_crop = args.derrick_crop
     derrick_fig = ""
     if derrick_crop and derrick_crop.is_file():
@@ -247,6 +288,8 @@ ocurre en cuatro videos, verificados a mano por una persona del equipo. Resultad
 \item Resultado del tiro (convertido o fallado) correcto: \textbf{""" + f"{outcomes} de {found}" + r"""}.
 \item Camiseta del tirador leída correctamente: \textbf{""" + f"{numbers_ok} de {len(numbered)}" + r"""}. El tirador asignado
 fue el correcto en los cuatro videos; en uno el sistema lo identificó bien pero leyó mal su número (sección~\ref{sec:hallazgos}).
+\item Pases: \textbf{""" + f"{detected_on_annotated} de {annotated_passes}" + r"""} pases anotados detectados (derrick); el sistema no detectó
+ningún pase en los cuatro videos y no los mide de forma confiable (sección~\ref{sec:pases}).
 \item Costo estimado de GPU: entre USD 0,55 y 0,65 por video de 8 a 13 segundos (USD """ + f"{cost_total:.2f}".replace(".", ",") + r""" los cuatro).
 \end{itemize}
 \textbf{Alcance:} son cuatro videos con un tiro cada uno. Es una verificación caso por caso, no una estimación estadística
@@ -281,6 +324,21 @@ modelo anterior no leía camisetas, por lo que esa columna solo puede compararse
 \clearpage\section{Detalle por video}
 """ + "\n".join(clip_sections) + r"""
 
+\clearpage\section{Pases}\label{sec:pases}
+El sistema reporta pases como eventos experimentales, derivados de los cambios de poseedor del balón; nunca se suman a las
+estadísticas. Resultado en estos videos:
+
+{\small
+""" + passes_table + r"""}
+
+\textbf{Pases detectados en los cuatro videos: """ + str(total_passes) + r""".} Pase real anotado: """ + str(annotated_passes) + r""" (derrick, a los 5~s);
+detectados: """ + str(detected_on_annotated) + r""". En los otros videos no se anotaron pases, por lo que no pueden evaluarse.
+
+\textbf{Por qué.} Para declarar un pase el sistema necesita confirmar quién tiene el balón en dos momentos distintos. Con el balón
+visible solo en una parte de los cuadros, casi nunca llega a confirmar un poseedor (columna ``fotogramas con poseedor''): o no ve el balón,
+o no puede asociarlo a un único jugador, o queda a la espera de más cuadros. Sin poseedor confirmado no hay cambio de poseedor y, por lo
+tanto, tampoco pase. Mientras tanto, asistencias, pérdidas, robos y tiempo de posesión siguen sin medirse.
+
 \clearpage\section{Tiempo y costo}
 """ + cost_table + r"""
 
@@ -299,7 +357,7 @@ no se vinculan al jugador de la plantilla.
 \textbf{Otras limitaciones conocidas.}
 \begin{itemize}
 \item El detector de tiros solo funciona con el plano general de la cancha; en primeros planos y repeticiones no detecta nada.
-\item No se miden asistencias, pérdidas, robos ni tiempo de posesión.
+\item No se miden asistencias, pérdidas, robos ni tiempo de posesión, y la detección de pases es experimental y no confirmó ninguno.
 \item Pocas muestras (cuatro tiros): los resultados no permiten estimar una tasa de acierto general.
 \item La regla de identidad estable (tolerar hasta 1\% de filas inválidas) está pendiente de confirmación del responsable del módulo.
 \end{itemize}
