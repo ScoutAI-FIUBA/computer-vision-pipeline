@@ -5,7 +5,8 @@ Usage:
     python scripts/ops/acceptance_report.py --log run.log --job outputs/<id>-job/<id> \
         [--commit SHA] [--replay-output DIR|FILE.mp4] [--notes FILE.md] \
         [--also-log RUN2.log ...] [--gpu-rate-usd-per-hour RATE] [--video-seconds S] \
-        [--volume-listing-before FILE --volume-listing-after FILE] [--json] [--output FILE]
+        [--volume-listing-before FILE --volume-listing-after FILE] \
+        [--repeat-log FILE] [--retry-log FILE] [--retention-policy PATH] [--json] [--output FILE]
     python scripts/ops/acceptance_report.py --diff A.json B.json
 
 Every figure comes from the log or the downloaded job folder. Anything the
@@ -829,10 +830,162 @@ def build_performance(
     }
 
 
+# ------------------------------------------------- repeat / retry / integrations
+TRACKING_MARKERS = ("propagate_in_video", "started new session", "Running add_prompt", "frame loading (OpenCV)")
+_STAGE_FAILURE = re.compile(
+    r"lease.{0,40}expired|expired.{0,40}lease|stage\s+failed|previous\s+.{0,30}failed", re.I)
+
+
+def analyze_stage_log(text: str) -> dict[str, Any]:
+    """What a repeat/retry log proves: final JSON, tracking activity, timing lines, preemption."""
+    clean = "\n".join(_clean_lines(text))
+    parsed = parse_log(text)
+    return {
+        "final": parsed["final_json"] or {},
+        "tracking_markers": [m for m in TRACKING_MARKERS if m in clean],
+        "stage_timing_lines": len(parsed["timing_stages"]),
+        "stats_elapsed": next((t["elapsed_seconds"] for t in reversed(parsed["timing_stages"]) if t["stage"] == "stats"), None),
+        "wall_seconds": parsed["timing_jobs"][-1]["total_wall_seconds"] if parsed["timing_jobs"] else None,
+        "preempted": "terminated due to preemption" in clean,
+        "failure_evidence": bool(_STAGE_FAILURE.search(clean)),
+    }
+
+
+def _repeat_row(job: dict[str, Any], gens: dict[str, Any], text: str) -> tuple[str, str]:
+    a = analyze_stage_log(text)
+    final = a["final"]
+    stats_id, track_id = gens["stats"]["id"], gens["tracking"]["id"]
+    failed = []
+    if not stats_id or final.get("generation") != stats_id:
+        failed.append("(a) log generation differs from the job stats generation")
+    if not track_id or final.get("tracking_generation") != track_id:
+        failed.append("(a) log tracking_generation differs from the job tracking generation")
+    if a["tracking_markers"]:
+        failed.append("(b) tracking activity in the log: " + ", ".join(a["tracking_markers"]))
+    if a["stage_timing_lines"]:
+        failed.append(f"(c) {a['stage_timing_lines']} [v2-timing] stage= line(s) present, a pure reuse writes none")
+    evidence = (f"log generation={final.get('generation')}, tracking_generation={final.get('tracking_generation')}; "
+                f"job stats={stats_id}, tracking={track_id}; attempts={json.dumps(job.get('attempts'), sort_keys=True)}")
+    if a["wall_seconds"] is not None:
+        evidence += f"; client-side total_wall_seconds={a['wall_seconds']}"
+    if a["preempted"]:
+        evidence += "; preempted and restarted"
+    return (FAIL, "failed conditions: " + "; ".join(failed) + ". " + evidence) if failed else (PASS, evidence)
+
+
+def _first_error_text(job: dict[str, Any]) -> str | None:
+    errors = job.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return None
+    first = errors[0]
+    text = first.get("error") if isinstance(first, dict) and "error" in first else first
+    return redact_text(str(text))[:200]
+
+
+def _retry_row(job: dict[str, Any], gens: dict[str, Any], text: str) -> tuple[str, str]:
+    a = analyze_stage_log(text)
+    final = a["final"]
+    error = _first_error_text(job)
+    attempts = (job.get("attempts") or {}).get("stats") if isinstance(job.get("attempts"), dict) else None
+    failed = []
+    if error is None and not a["failure_evidence"]:
+        failed.append("no recorded stage failure (job.json errors empty) and no expired/failed state in the retry log")
+    if job.get("state") != "complete" or job.get("lease") is not None:
+        failed.append(f"job state={job.get('state')!r}, lease={job.get('lease')!r} (need complete and null)")
+    if not isinstance(attempts, int) or attempts < 2:
+        failed.append(f"stats attempts={attempts!r} (need >= 2)")
+    if final.get("status") != "complete":
+        failed.append(f"retry log final status={final.get('status')!r}")
+    if not gens["tracking"]["id"] or final.get("tracking_generation") != gens["tracking"]["id"]:
+        failed.append("retry log tracking_generation differs from the job tracking generation")
+    if a["tracking_markers"]:
+        failed.append("tracking was recomputed, markers: " + ", ".join(a["tracking_markers"]))
+    evidence = f"stats attempts={attempts}"
+    if error is not None:
+        evidence += f"; first recorded error: {error}"
+    if a["stats_elapsed"] is not None:
+        evidence += f"; retry stats stage elapsed {a['stats_elapsed']} s"
+    return (FAIL, "failed conditions: " + "; ".join(failed) + ". " + evidence) if failed else (PASS, evidence)
+
+
+def _jsonl_count(path: Path) -> int | None:
+    return len(_jsonl_rows(path)[0]) if path.is_file() else None
+
+
+def integration_status(jobinfo: dict[str, Any], stats_dir: Path | None) -> list[dict[str, Any]]:
+    """Per integration: verified / failed (configured, no output) / unavailable, from job artifacts only."""
+    res = jobinfo["stats_results"] or {}
+    cfg = res.get("config") or {}
+    nums = jobinfo["numbers"]
+    out: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, evidence: str) -> None:
+        out.append({"integration": name, "status": status, "evidence": evidence})
+
+    d = stats_dir
+    shot = _jsonl_count(d / "shot_raw_predictions.jsonl") if d else None
+    if shot is None:
+        add("hosted shot detector", "unavailable", "shot_raw_predictions.jsonl not in the stats generation")
+    elif shot:
+        add("hosted shot detector", "verified", f"shot_raw_predictions.jsonl: {shot} rows (frames)")
+    else:
+        add("hosted shot detector", "failed", "shot_raw_predictions.jsonl has no rows")
+
+    proj = _jsonl_count(d / "projected_tracks.jsonl") if d else None
+    model = cfg.get("court_model_id")
+    if proj:
+        add("court model", "verified", f"projected_tracks.jsonl: {proj} rows (court_model_id={model})")
+    elif proj == 0 or model:
+        add("court model", "failed", f"court model configured ({model}) but projected_tracks.jsonl has no rows or is missing")
+    else:
+        add("court model", "unavailable", "no court model configured or projected_tracks.jsonl")
+
+    ball = jobinfo["ball"]
+    if ball and ball["non_lost_rows"] > 0:
+        add("TrackNet", "verified", f"ball_tracks: {ball['non_lost_rows']} non-lost of {ball['rows']} rows")
+    elif cfg.get("tracknet_enabled") is True or ball:
+        add("TrackNet", "failed", f"enabled but ball_tracks has no non-lost rows ({ball['rows'] if ball else 'file missing'} rows)")
+    else:
+        add("TrackNet", "unavailable", "not enabled in this job")
+
+    teams = _read_json(d / "teams.json") if d else None
+    assigned = (teams or {}).get("assignments_by_track_id") if isinstance(teams, dict) else None
+    if assigned:
+        add("team embedder / team ID", "verified", f"teams.json: {len(assigned)} track assignments")
+    elif teams is not None:
+        add("team embedder / team ID", "failed", "teams.json has no assignments")
+    else:
+        add("team embedder / team ID", "unavailable", "teams.json not in the stats generation")
+
+    if nums["numbers_file"] and nums["file_exists"] and nums["manifest_number_artifacts"]:
+        add("hosted jersey-number OCR", "verified",
+            f"numbers_file={nums['numbers_file']}; artifacts listed: {', '.join(nums['manifest_number_artifacts'])}")
+    elif nums["number_predictor_backend"] == "roboflow-hosted":
+        add("hosted jersey-number OCR", "failed",
+            f"configured (number_predictor_backend=roboflow-hosted) but numbers_file={nums['numbers_file']!r}, "
+            f"file exists={nums['file_exists']}, number artifacts: {nums['manifest_number_artifacts'] or 'none'}")
+    else:
+        add("hosted jersey-number OCR", "unavailable: not run in this job",
+            f"number_predictor_backend={nums['number_predictor_backend']!r}, no numbers artifact")
+
+    tm = jobinfo["tracking_manifest"] or {}
+    trk = (jobinfo["generations"]["tracking"]["verification"] or {})
+    if tm.get("observation_count") and trk.get("listed_count"):
+        add("SAM 3.1 tracking", "verified",
+            f"tracking package: observation_count={tm['observation_count']}, {trk['listed_count']} listed artifacts")
+    elif jobinfo["generations"]["tracking"]["id"]:
+        add("SAM 3.1 tracking", "failed", "tracking generation exists but is empty")
+    else:
+        add("SAM 3.1 tracking", "unavailable", "no tracking generation in the job folder")
+    return out
+
+
 # ----------------------------------------------------------------- checklist
 def build_checklist(
     log: dict[str, Any], jobinfo: dict[str, Any], replay: dict[str, Any], perf: dict[str, Any] | None = None,
+    inputs: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
+    inputs = inputs or {}
     job = jobinfo["job"]
     gens = jobinfo["generations"]
     tm = jobinfo["tracking_manifest"] or {}
@@ -932,12 +1085,22 @@ def build_checklist(
 
     cfg = res.get("config") or {}
     keys = {k: cfg[k] for k in ("tracknet_enabled", "court_model_id", "number_predictor_backend") if k in cfg}
-    add("Configured external model credentials and optional integrations are verified or explicitly marked unavailable",
-        NOT_MEASURED,
-        f"configuration seen in results.json: {json.dumps(keys, sort_keys=True)}; "
-        "the log does not show credential checks (Roboflow/OCR/ReID); "
-        "a successful stats stage is indirect evidence only. Whether OCR actually ran is judged "
-        "separately by the 'Jersey number OCR ran' row, which depends on an artifact, not on configuration")
+    integ_item = "Configured external model credentials and optional integrations are verified or explicitly marked unavailable"
+    integrations = jobinfo.get("integrations") or []
+    hosted_evidence = any(i["integration"] in ("hosted shot detector", "court model") and i["status"] == "verified"
+                          for i in integrations)
+    if hosted_evidence:
+        bad = [i for i in integrations if i["status"] == "failed"]
+        listing = "; ".join(f"{i['integration']}: {i['status']} ({i['evidence']})" for i in integrations)
+        add(integ_item, FAIL if bad else PASS,
+            (f"configured but no output: {', '.join(i['integration'] for i in bad)}. " if bad else "")
+            + listing + ". Names only, no credential values are read or printed")
+    else:
+        add(integ_item, NOT_MEASURED,
+            f"configuration seen in results.json: {json.dumps(keys, sort_keys=True)}; "
+            "no hosted-model artifacts (shot_raw_predictions.jsonl / projected_tracks.jsonl) to derive per-integration "
+            "status from; a successful stats stage is indirect evidence only. Whether OCR actually ran is judged "
+            "separately by the 'Jersey number OCR ran' row, which depends on an artifact, not on configuration")
 
     both = bool(gens["tracking"]["id"] and gens["stats"]["id"])
     flags = [
@@ -955,11 +1118,19 @@ def build_checklist(
         add("One-command staged execution publishes both generations", NOT_MEASURED,
             "job folder lacks one or both generation ids")
 
-    add("Repeating the same stage reuses the matching generation without recomputation", NOT_RUN,
-        "a single run was provided; repeat the command and compare generation ids and timings")
-    add("Stats-only retry succeeds after a tracking failure or expired lease", NOT_RUN,
-        f"job attempts={json.dumps(job.get('attempts'), sort_keys=True)}, errors={job.get('errors')!r}; "
-        "no simulated failure was exercised")
+    repeat_item = "Repeating the same stage reuses the matching generation without recomputation"
+    if inputs.get("repeat_log") is not None:
+        add(repeat_item, *_repeat_row(job, gens, inputs["repeat_log"]))
+    else:
+        add(repeat_item, NOT_RUN,
+            "a single run was provided; repeat the command and pass its log with --repeat-log")
+    retry_item = "Stats-only retry succeeds after a tracking failure or expired lease"
+    if inputs.get("retry_log") is not None:
+        add(retry_item, *_retry_row(job, gens, inputs["retry_log"]))
+    else:
+        add(retry_item, NOT_RUN,
+            f"job attempts={json.dumps(job.get('attempts'), sort_keys=True)}, errors={job.get('errors')!r}; "
+            "no --retry-log provided")
 
     video = replay.get("video")
     replay_item = "Downloaded artifacts render with debug_v2.py using an explicit generation"
@@ -1038,9 +1209,17 @@ def build_checklist(
     add("The acceptance report is redacted and reproducible", PASS,
         "redaction applied to all report text (see the Redaction line at the top); output is a deterministic "
         "function of the log, the job folder and --commit")
-    add("Cleanup/retention implications are recorded for follow-up", NOT_MEASURED,
-        "per-generation storage bytes are listed above; retention policy and Volume cleanup "
-        "are not derivable from the inputs and need a follow-up decision")
+    retention_item = "Cleanup/retention implications are recorded for follow-up"
+    policy = inputs.get("retention_policy")
+    if policy and policy["size_bytes"] > 0:
+        published = ((perf.get("generations") or {}).get("total_bytes"))
+        add(retention_item, PASS,
+            f"retention policy file {policy['name']} ({policy['size_bytes']} bytes); "
+            f"per-job published bytes {published}")
+    else:
+        add(retention_item, NOT_MEASURED,
+            "per-generation storage bytes are listed above; retention policy and Volume cleanup "
+            "are not derivable from the inputs and need a follow-up decision (--retention-policy PATH)")
     return items
 
 
@@ -1130,9 +1309,16 @@ def build_report(
     volume_rate_usd_per_gib_month: float | None = None,
     volume_listing_before: str | None = None,
     volume_listing_after: str | None = None,
+    repeat_log: str | None = None,
+    retry_log: str | None = None,
+    retention_policy: str | None = None,
 ) -> dict[str, Any]:
     log = parse_log(log_text)
     jobinfo = inspect_job(job_dir)
+    stats_id = jobinfo["generations"]["stats"]["id"]
+    stats_gen_dir = job_dir / "stats" / "generations" / stats_id if stats_id else None
+    jobinfo["integrations"] = integration_status(
+        jobinfo, stats_gen_dir if stats_gen_dir and stats_gen_dir.is_dir() else None)
     perf = build_performance(
         log, job_dir, jobinfo, gpu_rate=gpu_rate_usd_per_hour, video_seconds=video_seconds,
         volume_included_gib=volume_included_gib, volume_rate=volume_rate_usd_per_gib_month,
@@ -1264,7 +1450,22 @@ def build_report(
             "sizes above bound what a cleanup would reclaim."
         ),
     }
-    report["checklist"] = build_checklist(log, jobinfo, replay, perf)
+    policy = None
+    if retention_policy:
+        try:
+            policy = {"name": Path(retention_policy).name, "size_bytes": Path(retention_policy).stat().st_size}
+        except OSError:
+            policy = None
+    report["integrations"] = jobinfo["integrations"]
+    report["evidence_inputs"] = {
+        "repeat_log": repeat_log is not None,
+        "retry_log": retry_log is not None,
+        "retention_policy": policy["name"] if policy else None,
+        "retention_policy_size_bytes": policy["size_bytes"] if policy else None,
+    }
+    report["checklist"] = build_checklist(
+        log, jobinfo, replay, perf,
+        {"repeat_log": repeat_log, "retry_log": retry_log, "retention_policy": policy})
 
     counts: dict[str, int] = {}
     redact_text(log_text, counts)  # count what the raw log would have leaked
@@ -1598,6 +1799,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--volume-rate-usd-per-gib-month", type=float, help="Volume storage rate; needed for the storage cost")
     parser.add_argument("--volume-listing-before", help="listing of the job on the Volume before the run (JSON {path: bytes} or `modal volume ls` text)")
     parser.add_argument("--volume-listing-after", help="same listing after the run")
+    parser.add_argument("--repeat-log", help="`modal run` log of repeating the identical staged command on the same job")
+    parser.add_argument("--retry-log", help="log of a `--stats-only` retry after a failed stats stage or expired lease")
+    parser.add_argument("--retention-policy", help="retention/cleanup policy file; only its name and size are reported")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of Markdown")
     parser.add_argument("--output", help="write to this file instead of stdout")
     parser.add_argument("--max-files", type=int, default=40, help="max artifact rows per generation in Markdown")
@@ -1633,6 +1837,12 @@ def main(argv: list[str] | None = None) -> int:
         if not Path(args.notes).is_file():
             parser.error(f"notes file not found: {args.notes}")
         notes = Path(args.notes).read_text(encoding="utf-8", errors="replace")
+    extra: dict[str, str | None] = {}
+    for opt in ("repeat_log", "retry_log"):
+        path = getattr(args, opt)
+        if path and not Path(path).is_file():
+            parser.error(f"--{opt.replace('_', '-')} file not found: {path}")
+        extra[opt] = Path(path).read_text(encoding="utf-8", errors="replace") if path else None
     report = build_report(
         log_path.read_text(encoding="utf-8", errors="replace"),
         job_dir, commit=args.commit, replay_output=args.replay_output,
@@ -1641,6 +1851,7 @@ def main(argv: list[str] | None = None) -> int:
         volume_included_gib=args.volume_included_gib,
         volume_rate_usd_per_gib_month=args.volume_rate_usd_per_gib_month,
         volume_listing_before=args.volume_listing_before, volume_listing_after=args.volume_listing_after,
+        retention_policy=args.retention_policy, **extra,
     )
     text = json.dumps(report, indent=2, sort_keys=True) if args.json else render_markdown(report, args.max_files)
     text = redact_text(text) + "\n"

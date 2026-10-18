@@ -19,6 +19,8 @@ python scripts/ops/acceptance_report.py \
   --commit "$(git rev-parse HEAD)" \
   [--replay-output <debug_v2 render dir or .mp4>] \
   [--notes <human findings.md>] [--also-log <other run.log> ...] \
+  [--repeat-log <repeat run.log>] [--retry-log <stats-only retry run.log>] \
+  [--retention-policy <policy.md>] \
   [--json] [--output <report file>]
 
 # 4. Compare two JSON reports (e.g. before/after a fix); always exits 0
@@ -49,9 +51,16 @@ issue's acceptance criteria with PASS / FAIL / NOT_RUN / NOT_MEASURED and eviden
   no row has an id or identity is `rejected`.
 - **External integration evidence**: "Jersey number OCR ran" is PASS only when
   `results.json` has a non-null `numbers_file` that exists on disk; otherwise FAIL. A
-  configured backend alone proves nothing, so the older "Configured external model
-  credentials..." row stays NOT_MEASURED (configuration and indirect evidence) and
-  points to the OCR row for the artifact-based verdict. Only env var names are printed.
+  configured backend alone proves nothing. The "Configured external model credentials..."
+  row is derived per integration from the job artifacts (listed in the `integrations`
+  JSON key): hosted shot detector (`shot_raw_predictions.jsonl` rows), court model
+  (`projected_tracks.jsonl` rows), TrackNet (non-lost `ball_tracks` rows), team ID
+  (`teams.json` assignments), hosted jersey-number OCR (numbers file plus a number
+  artifact in the manifest; `unavailable: not run in this job` when the backend is not
+  roboflow-hosted) and SAM 3.1 tracking (non-empty tracking package). PASS when none
+  failed (unavailable ones are listed explicitly), FAIL when a configured integration
+  produced no output. Without any hosted-model artifact (shot or court rows) the row stays
+  NOT_MEASURED. Only names and counts are printed, never credential values.
 - **Outcome summary**: shot events by `outcome` and `outcome_source`, projected shots by
   `shooter_attribution_method`, shots with no shooter, ball rows lost vs non-lost.
   Facts only; fields a run did not emit show as `absent`.
@@ -64,6 +73,27 @@ issue's acceptance criteria with PASS / FAIL / NOT_RUN / NOT_MEASURED and eviden
   same job and flags when variants differ.
 - **`--diff A.json B.json`**: table of changed checklist statuses and key numbers
   (identity status, stable-id rows, numbers_file, outcome counts, generation ids).
+
+## Repeat, retry and retention evidence
+
+All optional; absent means the row keeps its NOT_RUN / NOT_MEASURED value.
+
+- `--repeat-log FILE`: `modal run` log of repeating the identical command on the same
+  job. PASS only if (a) the final JSON `generation` and `tracking_generation` equal the
+  job's current ids, (b) the log has none of `propagate_in_video`, `started new session`,
+  `Running add_prompt`, `frame loading (OpenCV)`, and (c) it has no `[v2-timing] stage=`
+  line (a pure reuse writes none). Otherwise FAIL naming the failed conditions. Attempts
+  from `job.json` are reported, not judged. Evidence also shows the client wall time and
+  "preempted and restarted" when the log has `terminated due to preemption`.
+- `--retry-log FILE`: log of a `--stats-only` retry. PASS only if `job.json` has a
+  recorded error (shown redacted) or the log shows an expired/failed state, the job is
+  `complete` with `lease` null, stats attempts >= 2, and the log's final JSON is
+  `complete` with the job's `tracking_generation` and no tracking-activity markers.
+  Evidence includes the attempts and the retry's `stage=stats` elapsed seconds.
+- `--retention-policy PATH`: PASS when the file exists and is non-empty; evidence is its
+  file name, size and the per-job published bytes. The content is not embedded.
+
+The JSON `evidence_inputs` object records which of these were given; `--diff` ignores it.
 
 ## Performance and cost
 
@@ -144,8 +174,8 @@ These stay NOT_MEASURED unless the inputs above provide them, with their source:
 | Modal image version | `modal app list` / deploy output |
 
 Steps never exercised by the provided run stay NOT_RUN: SAM3.1 smoke test (unless
-the log shows a result), repeat-stage reuse, stats-only retry, download and replay
-(unless `--replay-output` exists).
+the log shows a result), repeat-stage reuse (unless `--repeat-log`), stats-only retry
+(unless `--retry-log`), download and replay (unless `--replay-output` exists).
 
 ## Redaction
 

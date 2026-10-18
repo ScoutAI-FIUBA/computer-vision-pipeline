@@ -757,3 +757,201 @@ def test_diff_includes_performance_fields(mjob, job, tmp_path, capsys):
     assert "perf.cost_usd_stage_time" in out and "perf.elapsed_sum_seconds" in out
     assert ar.main(["--diff", str(pa), str(pa)]) == 0
     assert "no differences" in capsys.readouterr().out
+
+
+# ------------------------------------- repeat, retry, integrations, retention
+def _final(stats=STATS_GEN, track=TRACK_GEN, status="complete"):
+    return json.dumps({"generation": stats, "status": status, "tracking_generation": track}, indent=2)
+
+
+REPEAT_OK = "[v2-stats] job manifest read start\n" + _final() + "\n[v2-timing] job id=job-x total_wall_seconds=99.5\n"
+
+
+def _set_job(job, **fields):
+    path = job / "job.json"
+    data = json.loads(path.read_text())
+    data.update(fields)
+    path.write_text(json.dumps(data))
+
+
+REPEAT = "Repeating the same stage"
+RETRY = "Stats-only retry"
+
+
+def test_repeat_absent_is_not_run(job):
+    assert _status(ar.build_report(LOG, job, commit="x"), REPEAT)["status"] == ar.NOT_RUN
+
+
+def test_repeat_pass(job):
+    row = _status(ar.build_report(LOG, job, commit="x", repeat_log=REPEAT_OK), REPEAT)
+    assert row["status"] == ar.PASS
+    assert STATS_GEN in row["evidence"] and TRACK_GEN in row["evidence"]
+    assert "total_wall_seconds=99.5" in row["evidence"] and "preempted" not in row["evidence"]
+
+
+def test_repeat_preempted_noted(job):
+    text = "Container terminated due to preemption. restarted\n" + REPEAT_OK
+    row = _status(ar.build_report(LOG, job, commit="x", repeat_log=text), REPEAT)
+    assert row["status"] == ar.PASS and "preempted and restarted" in row["evidence"]
+
+
+@pytest.mark.parametrize("text,cond", [
+    (_final(stats="x" * 64), "(a)"),
+    (_final(track="y" * 64), "(a)"),
+    ("no json here\n", "(a)"),
+    ("started new session abc\n" + _final(), "(b)"),
+    ("propagate_in_video: 5%\n" + _final(), "(b)"),
+    ("frame loading (OpenCV)\n" + _final(), "(b)"),
+    ("[v2-timing] stage=stats started=a finished=b elapsed=5.0s timeout_margin=3.0s gpu=none\n" + _final(), "(c)"),
+])
+def test_repeat_failing_conditions(job, text, cond):
+    row = _status(ar.build_report(LOG, job, commit="x", repeat_log=text), REPEAT)
+    assert row["status"] == ar.FAIL and cond in row["evidence"]
+    other = {"(a)", "(b)", "(c)"} - {cond}
+    assert not any(o in row["evidence"] for o in other)
+
+
+RETRY_OK = ("[v2-stats] stats start\n"
+            "[v2-timing] stage=stats started=a finished=b elapsed=920.927 timeout_margin=3.0 gpu=A100\n"
+            + _final() + "\n")
+
+
+def _retry_job(job, **over):
+    fields = {"attempts": {"stats": 3, "tracking": 1}, "lease": None,
+              "errors": [{"error": "ConnectionError at /home/fede/x token sk-abcdefgh1234", "stage": "stats"}]}
+    fields.update(over)
+    _set_job(job, **fields)
+
+
+def test_retry_absent_is_not_run(job):
+    assert _status(ar.build_report(LOG, job, commit="x"), RETRY)["status"] == ar.NOT_RUN
+
+
+def test_retry_pass_and_error_redacted(job):
+    _retry_job(job)
+    rep = ar.build_report(LOG, job, commit="x", retry_log=RETRY_OK)
+    row = _status(rep, RETRY)
+    assert row["status"] == ar.PASS
+    assert "920.927" in row["evidence"] and "attempts=3" in row["evidence"]
+    assert "ConnectionError" in row["evidence"]
+    assert "sk-abcdefgh1234" not in row["evidence"] and "/home/fede" not in row["evidence"]
+
+
+def test_retry_pass_with_failure_evidence_in_log_only(job):
+    _retry_job(job, errors=[])
+    row = _status(ar.build_report(LOG, job, commit="x", retry_log="lease expired, retrying\n" + RETRY_OK), RETRY)
+    assert row["status"] == ar.PASS
+
+
+@pytest.mark.parametrize("over,text,needle", [
+    ({"errors": []}, RETRY_OK, "no recorded stage failure"),
+    ({"state": "running"}, RETRY_OK, "state='running'"),
+    ({"lease": {"owner": "a"}}, RETRY_OK, "lease="),
+    ({"attempts": {"stats": 1}}, RETRY_OK, "need >= 2"),
+    ({}, _final(status="failed"), "final status='failed'"),
+    ({}, _final(track="y" * 64), "tracking_generation differs"),
+    ({}, "started new session abc\n" + RETRY_OK, "tracking was recomputed"),
+])
+def test_retry_failing_conditions(job, over, text, needle):
+    _retry_job(job)
+    _set_job(job, **over)
+    row = _status(ar.build_report(LOG, job, commit="x", retry_log=text), RETRY)
+    assert row["status"] == ar.FAIL and needle in row["evidence"]
+
+
+EXT = "Configured external"
+
+
+def _hosted_artifacts(job, shots=3, proj=2, assigned=True, numbers=False):
+    d = _stats_dir(job)
+    (d / "shot_raw_predictions.jsonl").write_text("".join(json.dumps({"frame_index": i}) + "\n" for i in range(shots)))
+    (d / "projected_tracks.jsonl").write_text("".join(json.dumps({"frame_index": i}) + "\n" for i in range(proj)))
+    (d / "teams.json").write_text(json.dumps({"assignments_by_track_id": {"1": 0} if assigned else {}}))
+    cfg = {"tracknet_enabled": True, "court_model_id": "court/1", "number_predictor_backend": "roboflow-hosted"}
+    if numbers:
+        (d / "numbers.json").write_text("{}")
+        m = json.loads((d / "manifest.json").read_text())
+        m["artifacts"]["number_predictions"] = {"path": "numbers.json", "sha256": hashlib.sha256(b"{}").hexdigest(), "size_bytes": 2}
+        (d / "manifest.json").write_text(json.dumps(m))
+    _set_results(job, config=cfg, numbers_file="numbers.json" if numbers else None)
+
+
+def test_integrations_pass(job):
+    _hosted_artifacts(job, numbers=True)
+    rep = ar.build_report(LOG, job, commit="x")
+    row = _status(rep, EXT)
+    assert row["status"] == ar.PASS
+    assert "3 rows (frames)" in row["evidence"] and "hosted jersey-number OCR: verified" in row["evidence"]
+    assert {i["status"] for i in rep["integrations"]} == {"verified"}
+
+
+def test_integrations_unavailable_does_not_fail(job):
+    _hosted_artifacts(job)
+    _set_results(job, config={"tracknet_enabled": True, "court_model_id": "court/1"})
+    row = _status(ar.build_report(LOG, job, commit="x"), EXT)
+    assert row["status"] == ar.PASS and "unavailable: not run in this job" in row["evidence"]
+
+
+def test_integrations_configured_without_output_fails(job):
+    _hosted_artifacts(job)  # hosted OCR configured but no numbers artifact
+    row = _status(ar.build_report(LOG, job, commit="x"), EXT)
+    assert row["status"] == ar.FAIL
+    assert "configured but no output: hosted jersey-number OCR" in row["evidence"]
+
+
+def test_integrations_empty_teams_and_court_fail(job):
+    _hosted_artifacts(job, proj=0, assigned=False, numbers=True)
+    row = _status(ar.build_report(LOG, job, commit="x"), EXT)
+    assert row["status"] == ar.FAIL
+    assert "court model" in row["evidence"] and "team embedder / team ID" in row["evidence"]
+
+
+def test_integrations_no_secret_values(job, monkeypatch):
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "rf_supersecretvalue")
+    _hosted_artifacts(job, numbers=True)
+    assert "rf_supersecretvalue" not in json.dumps(ar.build_report(LOG, job, commit="x"))
+
+
+RET = "Cleanup/retention"
+
+
+def test_retention_present_and_absent(job, tmp_path):
+    assert _status(ar.build_report(LOG, job, commit="x"), RET)["status"] == ar.NOT_MEASURED
+    policy = tmp_path / "policy.md"
+    policy.write_text("keep 30 days\n")
+    rep = ar.build_report(LOG, job, commit="x", retention_policy=str(policy))
+    row = _status(rep, RET)
+    assert row["status"] == ar.PASS and "policy.md" in row["evidence"] and "13 bytes" in row["evidence"]
+    assert str(tmp_path) not in row["evidence"]
+    assert rep["evidence_inputs"]["retention_policy"] == "policy.md"
+    policy.write_text("")
+    assert _status(ar.build_report(LOG, job, commit="x", retention_policy=str(policy)), RET)["status"] == ar.NOT_MEASURED
+    missing = ar.build_report(LOG, job, commit="x", retention_policy=str(tmp_path / "none.md"))
+    assert _status(missing, RET)["status"] == ar.NOT_MEASURED
+
+
+def test_evidence_inputs_and_diff_ignores_them(job, tmp_path, capsys):
+    a = ar.build_report(LOG, job, commit="x")
+    b = ar.build_report(LOG, job, commit="x")
+    b["evidence_inputs"] = {"repeat_log": True, "retry_log": True, "retention_policy": "p.md"}
+    b["integrations"] = []
+    assert a["evidence_inputs"] == {"repeat_log": False, "retry_log": False,
+                                    "retention_policy": None, "retention_policy_size_bytes": None}
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(a))
+    pb.write_text(json.dumps(b))
+    assert ar.main(["--diff", str(pa), str(pb)]) == 0
+    assert "no differences" in capsys.readouterr().out
+
+
+def test_cli_new_options(job, tmp_path, capsys):
+    log, rep_log, pol = tmp_path / "run.log", tmp_path / "repeat.log", tmp_path / "p.md"
+    log.write_text(LOG)
+    rep_log.write_text(REPEAT_OK)
+    pol.write_text("policy")
+    assert ar.main(["--log", str(log), "--job", str(job), "--commit", "a", "--repeat-log", str(rep_log),
+                    "--retention-policy", str(pol), "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["evidence_inputs"]["repeat_log"] is True
+    with pytest.raises(SystemExit):
+        ar.main(["--log", str(log), "--job", str(job), "--retry-log", str(tmp_path / "nope")])
