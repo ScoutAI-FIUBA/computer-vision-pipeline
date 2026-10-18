@@ -38,6 +38,7 @@ from pipeline.runner import (
 )
 from pipeline.runner_v2 import run_v2
 from pipeline.input_integrity import verify_sha256_file
+from pipeline.progress import ProgressReporter
 from pipeline.stage_metrics import (
     METRICS_FILENAME,
     StageMetrics,
@@ -396,7 +397,18 @@ def _artifact_size_limit(max_bytes: int | None) -> int:
     return max_bytes
 
 
-def collect_artifacts(output_dir: Path, *, max_bytes: int | None = None) -> dict[str, bytes]:
+def _artifact_selected(relative: str, allow_paths: list[str]) -> bool:
+    return any(relative == entry or (entry.endswith("/") and relative.startswith(entry)) for entry in allow_paths)
+
+
+def collect_artifacts(
+    output_dir: Path,
+    *,
+    max_bytes: int | None = None,
+    allow_paths: list[str] | None = None,
+    max_file_bytes: int | None = None,
+    skipped: list[dict[str, Any]] | None = None,
+) -> dict[str, bytes]:
     root = output_dir.resolve()
     files = []
     for path in sorted(output_dir.rglob("*")):
@@ -408,6 +420,20 @@ def collect_artifacts(output_dir: Path, *, max_bytes: int | None = None) -> dict
         if resolved != root and root not in resolved.parents:
             raise ValueError(f"artifact path resolves outside output root: {path.relative_to(output_dir)}")
         files.append(path)
+    if allow_paths is not None:
+        # Selection happens before the size checks so unselected bulk (masks) is never counted.
+        selected = []
+        for path in files:
+            relative = path.relative_to(output_dir).as_posix()
+            if not _artifact_selected(relative, allow_paths):
+                continue
+            size = path.stat().st_size
+            if max_file_bytes is not None and size > max_file_bytes:
+                if skipped is not None:
+                    skipped.append({"path": relative, "bytes": size})
+                continue
+            selected.append(path)
+        files = selected
     total_bytes = sum(path.stat().st_size for path in files)
     limit = _artifact_size_limit(max_bytes)
     if total_bytes > limit:
@@ -501,7 +527,7 @@ def _load_video_frames(path: Path, frame_start: int, frame_end: int) -> dict[int
 
 
 def _run_v2_stats(video_path: Path, output_dir: Path, observations, *, masks=None, clean_masks=None,
-                  config=None, number_predictor=None, number_detector=None):
+                  config=None, number_predictor=None, number_detector=None, on_stage=None):
     """Run stats from SAM3.1 rows; never construct a legacy player tracker."""
     config = config or PipelineConfig.from_env()
     kwargs = {
@@ -510,6 +536,8 @@ def _run_v2_stats(video_path: Path, output_dir: Path, observations, *, masks=Non
         "number_predictor": number_predictor,
         "number_detector": number_detector,
     }
+    if on_stage is not None:
+        kwargs["on_stage"] = on_stage
     return run_stats_from_v2_observations(video_path, config, output_dir, observations, **kwargs)
 
 
@@ -606,6 +634,7 @@ def _track_video(
     frame_end: int,
     *,
     local_propagation: bool = False,
+    on_progress=None,
 ):
     start = _start_session(predictor, video_path)
     session_id = start["session_id"]
@@ -631,6 +660,8 @@ def _track_video(
             for row, obj in zip(frame_rows, objects):
                 if obj["mask"] is not None:
                     masks[row["observation_key"]] = obj["mask"]
+            if on_progress is not None:
+                on_progress((frame_index - frame_start + 1) / (frame_end - frame_start + 1))
     finally:
         predictor.handle_request({"type": "close_session", "session_id": session_id})
     return rows, masks
@@ -650,12 +681,14 @@ def _track_segmented_video(
     seam_ambiguity_margin: float = DEFAULT_SEAM_AMBIGUITY_MARGIN,
     seam_diagnostics: list[dict[str, Any]] | None = None,
     overflow_diagnostics: list[dict[str, Any]] | None = None,
+    on_progress=None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run independent bounded SAM sessions, then stitch their raw output."""
 
     all_rows: list[dict[str, Any]] = []
     all_masks: dict[str, Any] = {}
-    for segment in plan_segment_windows(frame_start, frame_end, window=window, overlap=overlap):
+    segments = list(plan_segment_windows(frame_start, frame_end, window=window, overlap=overlap))
+    for position, segment in enumerate(segments):
         segment_path = work_dir / f"segment-{segment.ordinal:04d}.mp4"
         extract_segment_video(video_path, segment_path, segment)
         # The temporary clip always starts at local frame zero.  This is also
@@ -677,6 +710,8 @@ def _track_segmented_video(
         remapped_rows, remapped_masks = remap_segment_rows(rows, masks, segment)
         all_rows.extend(remapped_rows)
         all_masks.update(remapped_masks)
+        if on_progress is not None:
+            on_progress((position + 1) / len(segments))
     stitched_rows, stitched_masks = stitch_segment_seams(
         all_rows,
         all_masks,
@@ -834,6 +869,38 @@ def _distinct_frames(rows) -> int | None:
         return len({int(row["frame_index"]) for row in rows})
     except (KeyError, TypeError, ValueError):
         return None
+
+
+PROGRESS_DICT_NAME = "scoutai-v2-progress"
+
+
+def _progress_dict_sink(key: str):
+    """Write each payload under `key`; a Dict failure must never fail the job."""
+    progress_dict = None
+
+    def sink(payload: dict[str, Any]) -> None:
+        nonlocal progress_dict
+        try:
+            if progress_dict is None:
+                progress_dict = modal.Dict.from_name(PROGRESS_DICT_NAME, create_if_missing=True)
+            progress_dict[key] = payload
+        except Exception as error:
+            print(f"[v2] progress write failed: {type(error).__name__}", flush=True)
+
+    return sink
+
+
+def _video_summary(video_metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    summary: dict[str, Any] = {}
+    fps = video_metadata.get("fps")
+    frame_count = video_metadata.get("frame_count")
+    if isinstance(fps, (int, float)) and fps > 0:
+        summary["fps"] = float(fps)
+    if isinstance(frame_count, int) and frame_count > 0:
+        summary["frame_count"] = frame_count
+    if "fps" in summary and "frame_count" in summary:
+        summary["duration_seconds"] = summary["frame_count"] / summary["fps"]
+    return summary or None
 
 
 def _finish_stage_metrics(metrics: StageMetrics) -> bytes:
@@ -1225,6 +1292,9 @@ class PipelineV2:
         staged: bool = False,
         job_id: str | None = None,
         possession_only: bool = False,
+        progress_key: str | None = None,
+        return_artifact_paths: list[str] | None = None,
+        return_artifact_max_file_bytes: int | None = None,
     ) -> dict[str, Any]:
         if possession_only:
             if not job_id:
@@ -1247,6 +1317,10 @@ class PipelineV2:
                                      tracking_payload=tracking.get("tracking_payload"))
         if possession_engine is not None:
             _validate_possession_engine(possession_engine)
+        if return_artifact_max_file_bytes is not None and (
+            type(return_artifact_max_file_bytes) is not int or return_artifact_max_file_bytes <= 0
+        ):
+            raise ValueError("return_artifact_max_file_bytes must be a positive integer")
         validate_entrypoint_args(
             video_bytes=video_bytes,
             prompt=prompt,
@@ -1260,29 +1334,44 @@ class PipelineV2:
             video_path.write_bytes(video_bytes)
             started = time.perf_counter()
             direct_metrics = _new_stage_metrics("direct")
+            reporter = ProgressReporter(
+                _progress_dict_sink(progress_key) if progress_key is not None else None,
+                run_id=uuid.uuid4().hex,
+            )
             print("[v2] progress=0")
             try:
                 segmented_run = _segmented_enabled(segmented)
+                reporter.stage("model_load", 0.0)
                 if getattr(self, "_models_loaded", False):
                     self._ensure_seams()
+                predictor = self._ensure_predictor()
+                reporter.stage("model_load", 1.0)
+                reporter.stage("tracking", 0.0)
+                tracking_progress = {}
+                if progress_key is not None:
+                    tracking_progress["on_progress"] = lambda fraction: reporter.stage("tracking", fraction)
                 seam_diagnostics: list[dict[str, Any]] = []
                 overflow_diagnostics: list[dict[str, Any]] = []
                 if segmented_run:
                     rows, masks = _track_segmented_video(
-                        self._ensure_predictor(), video_path, prompt, frame_start, frame_end, root,
+                        predictor, video_path, prompt, frame_start, frame_end, root,
                         window=_segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32),
                         overlap=_segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1),
                         seam_min_score=_segment_float_setting(segment_seam_min_score, "SAM31_V2_SEAM_MIN_SCORE", DEFAULT_SEAM_MIN_SCORE),
                         seam_ambiguity_margin=_segment_float_setting(segment_seam_ambiguity_margin, "SAM31_V2_SEAM_AMBIGUITY_MARGIN", DEFAULT_SEAM_AMBIGUITY_MARGIN),
                         seam_diagnostics=seam_diagnostics,
                         overflow_diagnostics=overflow_diagnostics,
+                        **tracking_progress,
                     )
                 else:
                     rows, masks = _track_video(
-                        self._ensure_predictor(), video_path, prompt, frame_start, frame_end
+                        predictor, video_path, prompt, frame_start, frame_end,
+                        **tracking_progress,
                     )
                 _add_mask_references(rows, masks)
                 frames = _load_video_frames(video_path, frame_start, frame_end)
+                reporter.stage("tracking", 1.0)
+                reporter.stage("identity", 0.0)
                 config_overrides = {}
                 if possession_engine is not None:
                     config_overrides["possession_engine"] = _validate_possession_engine(possession_engine)
@@ -1292,6 +1381,8 @@ class PipelineV2:
                 if hasattr(self, "seams"):
                     runner_kwargs["seams"] = self.seams
                 result = run_v2(rows, **runner_kwargs)
+                reporter.stage("identity", 1.0)
+                reporter.stage("packaging", 0.0)
                 if segmented_run:
                     result.runtime_diagnostics = {
                         **(getattr(result, "runtime_diagnostics", {}) or {}),
@@ -1342,6 +1433,8 @@ class PipelineV2:
                     "number_predictor": number_predictor,
                     "number_detector": number_detector,
                 }
+                if progress_key is not None:
+                    stats_kwargs["on_stage"] = reporter.stage
                 stats_result = _run_v2_stats(
                     video_path, output_dir / "stats", result.observations, **stats_kwargs
                 )
@@ -1380,11 +1473,29 @@ class PipelineV2:
             print("[v2] progress=100")
             print("[v2] overall V2 complete", flush=True)
             _finish_stage_metrics(direct_metrics)
-            payload = {"acceptance": result.acceptance}
+            reporter.stage("packaging", 1.0)
+            payload = {
+                "acceptance": result.acceptance,
+                "timings": reporter.timings,
+                "gpu": detect_gpu(),
+                "frames": {"requested": frame_end - frame_start + 1, "processed": _distinct_frames(rows)},
+            }
+            video_summary = _video_summary(video_metadata)
+            if video_summary is not None:
+                payload["video"] = video_summary
             if return_diagnostics:
                 payload["debug_diagnostics"] = result.runtime_diagnostics
             if return_artifacts:
-                payload["artifacts"] = collect_artifacts(output_dir, max_bytes=max_artifact_bytes)
+                skipped: list[dict[str, Any]] = []
+                payload["artifacts"] = collect_artifacts(
+                    output_dir,
+                    max_bytes=max_artifact_bytes,
+                    allow_paths=return_artifact_paths,
+                    max_file_bytes=return_artifact_max_file_bytes,
+                    skipped=skipped,
+                )
+                if skipped:
+                    payload["artifacts_skipped"] = skipped
             return payload
 
 
