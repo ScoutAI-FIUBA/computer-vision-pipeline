@@ -155,16 +155,27 @@ def build(args: argparse.Namespace) -> Path:
         wanted = p["wanted"]
         if wanted:
             parts.append("Pases reales, en orden (quién pasa a quién): " + tex(p["sequence_real"]) + ".\n")
-        if p["pass_events"]:
-            parts.append("Pases detectados: " + tex(p["sequence_found"]) + " (``?'' = camiseta no leída).\n")
+        labels = {"real": "pase real, camisetas bien leídas", "real_camiseta_mal": "pase real, camiseta mal leída",
+                  "falsa": "no es un pase", "real_robo": "cambio de posesión real", None: "sin verificar"}
+        events_here = p["pass_events"] + p["transfers"]
+        if events_here:
+            lines = []
+            for e in events_here:
+                kind = "pase" if e["type"] == "pass" else "cambio de posesión"
+                note = f" ({e['verdict_note']})" if e.get("verdict_note") else ""
+                label = labels.get(e["verdict"], e["verdict"])
+                if e["type"] != "pass" and e["verdict"] == "real":
+                    label = "cambio de posesión real"
+                lines.append(f"{kind} a los {e['timestamp_seconds']:.1f} s, {e['from_jersey'] or '?'}→{e['to_jersey'] or '?'}: {label}{note}")
+            parts.append(r"\begin{itemize}" + "".join(r"\item " + tex(x) for x in lines) + r"\end{itemize}")
+        else:
+            parts.append("El sistema no declaró ningún pase ni cambio de posesión.\n")
         if p["near_misses"]:
-            parts.append("Casi aciertos (un dígito distinto): " + tex("; ".join(p["near_misses"])) + ".\n")
+            parts.append("Casi aciertos por camiseta (un dígito distinto): " + tex("; ".join(p["near_misses"])) + ".\n")
         if p["changes_real"] is not None:
-            parts.append(f"Cambios de posesión reales: {p['changes_real']}; detectados por el sistema: {len(p['transfers'])}.\n")
-        parts.append("Pases: " + (f"reales {len(wanted)}, detectados correctamente {p['matched']}, no coinciden "
-                                  f"{len(p['pass_events']) - p['matched']} (no coinciden con la lista)." if wanted is not None
-                                  else f"sin anotar; el sistema detectó {len(p['pass_events'])}.")
-                     + f" Poseedor confirmado en {p['confirmed']} de {p['frames']} cuadros; motivos principales: "
+            parts.append(f"Cambios de posesión reales: {p['changes_real']}; detectados correctamente: {len(p['transfers_real'])}.\n")
+        parts.append("(``?'' = camiseta no leída.) "
+                     + f"Poseedor confirmado en {p['confirmed']} de {p['frames']} cuadros; motivos principales: "
                      + (", ".join(f"{k} ({v})" for k, v in p["reasons"]) or "n/d") + ".\n")
         figs = []
         if c["figures"]["frame"]:
