@@ -88,25 +88,38 @@ def load_clip(name: str, folder: Path, csv_path: Path | None, truth: dict[str, A
     def _label(event: dict[str, Any]) -> str:
         return f"{event.get('from_jersey') or '?'}→{event.get('to_jersey') or '?'}"
 
-    matched = 0
+    # A pass counts as correct only when a person verified that detection; matching jersey pairs
+    # without an instant could credit a coincidence, so it is not used.
+    verdicts = (truth or {}).get("verdicts", [])
+
+    def _verdict(event: dict[str, Any]) -> str | None:
+        for item in verdicts:
+            if item.get("kind") == event["type"] and abs(item["time_seconds"] - event["timestamp_seconds"]) <= 0.35:
+                event["verdict_note"] = item.get("note")
+                return item.get("verdict")
+        return None
+
+    for event in pass_events + transfers:
+        event["verdict"] = _verdict(event)
+    matched = sum(1 for e in pass_events if e["verdict"] == "real")
+    real_wrong_jersey = [e for e in pass_events if e["verdict"] == "real_camiseta_mal"]
+    unverified = [e for e in pass_events if e["verdict"] is None]
+    false_passes = [e for e in pass_events if e["verdict"] == "falsa"]
+    transfers_real = [e for e in transfers if e["verdict"] == "real"]
+    near = []
     if wanted is not None:
-        free = list(range(len(pass_events)))
-        for expected in wanted:
-            hit = None
-            for i in free:
-                event = pass_events[i]
-                if expected.get("from") is not None and (event["from_jersey"], event["to_jersey"]) != (str(expected["from"]), str(expected["to"])):
+        used_real = set()
+        for event in pass_events:
+            pair = (event["from_jersey"], event["to_jersey"])
+            for index, expected in enumerate(wanted):
+                if index in used_real or expected.get("from") is None or pair == (str(expected["from"]), str(expected["to"])):
                     continue
-                when = expected.get("approx_time_seconds")
-                if when is not None and abs(event["timestamp_seconds"] - when) > tolerance:
+                other = (str(expected["from"]), str(expected["to"]))
+                if None in pair or sum(1 for a, b in zip("".join(pair), "".join(other)) if a != b) != 1 or len("".join(pair)) != len("".join(other)):
                     continue
-                if expected.get("from") is None and when is None:
-                    continue  # nothing to match on: never counted as a hit
-                hit = i
+                near.append(f"{other[0]}→{other[1]} detectado como {pair[0]}→{pair[1]}")
+                used_real.add(index)
                 break
-            if hit is not None:
-                free.remove(hit)
-                matched += 1
     sequence_real = ", ".join(f"{x.get('from', '?')}→{x.get('to', '?')}" for x in wanted) if wanted else ""
     sequence_found = ", ".join(_label(e) for e in pass_events)
     return {
@@ -122,6 +135,11 @@ def load_clip(name: str, folder: Path, csv_path: Path | None, truth: dict[str, A
         "ball_truth": ball_truth,
         "pass_events": pass_events,
         "transfers": transfers,
+        "near_misses": near,
+        "real_wrong_jersey": real_wrong_jersey,
+        "unverified": unverified,
+        "false_passes": false_passes,
+        "transfers_real": transfers_real,
         "sequence_real": sequence_real,
         "sequence_found": sequence_found,
         "changes_real": (truth or {}).get("possession_changes"),

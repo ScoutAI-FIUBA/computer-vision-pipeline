@@ -41,7 +41,7 @@ def build(args: argparse.Namespace) -> Path:
         shots = vr.evaluate_clip(name, Path(folder), truth)
         passes = load_clip(name, Path(folder), Path(ball_csv) if ball_csv else None, truth)
         figures = {"frame": False, "court": False}
-        if shots.get("shots_detected"):
+        if shots.get("shots_detected") and shots.get("court_projected"):
             if video and Path(video).is_file():
                 figures["frame"] = _shot_frame(Path(folder), Path(video), work / f"{name}-frame.jpg")
             _court(Path(folder), work / f"{name}-court.png")
@@ -54,6 +54,7 @@ def build(args: argparse.Namespace) -> Path:
         _time_chart(with_summary, work / "tiempos.png")
 
     scored = [c["shots"] for c in clips if c["shots"]["status"] == "evaluado"]
+    ambiguous = [c["shots"] for c in clips if c["shots"]["status"] == "evaluado_ambiguo"]
     shots_real = sum(r["truth_shots"] for r in scored)
     shots_found = sum(r["matched"] for r in scored)
     shots_false = sum(len(r["spurious"]) for r in scored)
@@ -63,23 +64,33 @@ def build(args: argparse.Namespace) -> Path:
     numbers_ok = sum(1 for x in numbered if x["number_ok"])
     pass_scored = [c["passes"] for c in clips if c["passes"]["wanted"] is not None]
     passes_real = sum(len(p["wanted"]) for p in pass_scored)
+    passes_declared = sum(len(p["pass_events"]) for p in pass_scored)
     passes_hit = sum(p["matched"] for p in pass_scored)
-    passes_false = sum(len(p["pass_events"]) - p["matched"] for p in pass_scored)
+    passes_wrong_jersey = sum(len(p["real_wrong_jersey"]) for p in pass_scored)
+    passes_unverified = sum(len(p["unverified"]) for p in pass_scored)
+    passes_false = sum(len(p["false_passes"]) for p in pass_scored)
+    changes_real = sum(p["changes_real"] or 0 for p in pass_scored)
+    changes_hit = sum(len(p["transfers_real"]) for p in pass_scored)
 
     def shots_line() -> str:
         if not scored:
-            return "Tiros: todavía sin tiros anotados; se muestran los detectados sin evaluar."
+            return "Tiros: sin tiros evaluables todavía; se muestran los detectados."
         text = (f"Tiros reales detectados: \\textbf{{{shots_found} de {shots_real}}}; falsos positivos: \\textbf{{{shots_false}}}; "
                 f"resultado correcto: \\textbf{{{outcome_ok} de {judged}}}")
         if numbered:
             text += f"; camiseta del tirador leída correctamente: \\textbf{{{numbers_ok} de {len(numbered)}}}"
+        if ambiguous:
+            text += (f". En {len(ambiguous)} videos el número de tiros detectados no coincide con los anotados y, sin instantes, no se puede "
+                     "emparejar cada uno: se muestran lado a lado, sin evaluar")
         return text + "."
 
     def passes_line() -> str:
         if not pass_scored:
             return "Pases: todavía sin pases anotados; se muestran los detectados sin evaluar."
-        return (f"Pases reales: \\textbf{{{passes_real}}}; detectados correctamente: \\textbf{{{passes_hit}}}; "
-                f"detecciones sin pase real: \\textbf{{{passes_false}}}.")
+        return (f"Pases reales anotados: \\textbf{{{passes_real}}}. El sistema declaró \\textbf{{{passes_declared}}}: una persona verificó "
+                f"\\textbf{{{passes_hit + passes_wrong_jersey}}} como pases reales, de los cuales \\textbf{{{passes_hit}}} con ambas camisetas bien "
+                f"leídas y \\textbf{{{passes_wrong_jersey}}} con una camiseta mal leída; \\textbf{{{passes_false}}} resultaron falsos y "
+                f"\\textbf{{{passes_unverified}}} quedaron sin verificar. Cambios de posesión reales: {changes_real}; detectados correctamente: {changes_hit}.")
 
     cost_rows, cost_total = [], 0.0
     for c in clips:
@@ -94,13 +105,16 @@ def build(args: argparse.Namespace) -> Path:
                           cost, per_minute])
     cost_table = _table(["Clip", "Duración", "Pipeline", "Total", "Costo est.", "Por minuto"], cost_rows, "lccccc")
 
+    shots_rows = [_summary_row(r) for r in scored] + [[r["clip"], str(r["truth_shots"]), f"{r['shots_detected']} detectados", "—", "no evaluable", "no evaluable"]
+                                                       for r in ambiguous]
     shots_table = _table(
-        ["Clip", "Tiros reales", "Detectados", "Falsos", "Resultado correcto", "Camiseta correcta"],
-        [_summary_row(r) for r in scored], "lccccc") if scored else "Sin tiros anotados."
+        ["Clip", "Tiros reales", "Detectados bien", "Adicionales", "Resultado correcto", "Camiseta correcta"],
+        shots_rows, "lccccc") if shots_rows else "Sin tiros anotados."
     overview = _table(
         ["Clip", "Duración", "Jugadores seguidos", "Con camiseta", "Tiros detectados"],
         [[c["name"], f"{c['passes']['duration']:.1f} s" if c["passes"]["duration"] else "n/d",
-          str(c["shots"].get("players_tracked", "n/d")), str(c["shots"].get("players_with_confirmed_number", "n/d")),
+          str(c["shots"].get("players_tracked") if c["shots"].get("players_tracked") is not None else "n/d"),
+          str(c["shots"].get("players_with_confirmed_number") if c["shots"].get("players_with_confirmed_number") is not None else "n/d"),
           str(c["shots"].get("shots_detected", "n/d"))] for c in clips], "lcccc")
     ball_table = _table(
         ["Clip", "Balón real", "Detectado", "Recall", "Con poseedor", "Pases reales", "Pases det."],
@@ -115,8 +129,14 @@ def build(args: argparse.Namespace) -> Path:
         parts = [(r"\clearpage\section{Detalle por video}" if not sections else r"\clearpage") + r"\subsection{" + tex(c["name"]) + "}"]
         if s.get("description"):
             parts.append(r"\textit{Hechos:} " + tex(s["description"]) + "\n")
-        parts.append(f"Jugadores seguidos: {s.get('players_tracked', 'n/d')}; con camiseta confirmada: "
-                     f"{s.get('players_with_confirmed_number', 'n/d')}.\n")
+        if s.get("review_note"):
+            parts.append(r"\textit{Verificación humana:} " + tex(s["review_note"]) + "\n")
+        parts.append(f"Jugadores seguidos: {s.get('players_tracked') if s.get('players_tracked') is not None else 'n/d'}; con camiseta confirmada: "
+                     f"{s.get('players_with_confirmed_number') if s.get('players_with_confirmed_number') is not None else 'n/d'}.\n")
+        if not s.get("court_projected", True):
+            parts.append(r"\textbf{No se pudo proyectar la cancha en este video:} el análisis terminó, pero sin posiciones de jugadores ni de tiros en "
+                         "la cancha. Los tiros que se muestran vienen directamente del detector, sin tirador asignado; en la aplicación este video "
+                         "aparecería con cero tiros y cero jugadores en cancha.\n")
         if s["status"] == "evaluado":
             for row in s["rows"]:
                 got = row["found"]
@@ -124,6 +144,11 @@ def build(args: argparse.Namespace) -> Path:
                              + (tex(vr._fmt_found(got)) if got else r"\textbf{no detectado}") + r"\end{itemize}")
             for extra in s["spurious"]:
                 parts.append(r"Tiro detectado sin tiro real: " + tex(vr._fmt_found(extra)) + ".\n")
+        elif s["status"] == "evaluado_ambiguo":
+            parts.append("Tiros anotados: " + tex("; ".join(vr._fmt_expected(x) for x in s["expected"])) + ".\n")
+            parts.append(r"\textbf{No evaluable:} el sistema detectó " + str(len(s["detections"])) + " tiros y se anotaron " + str(s["truth_shots"])
+                         + "; sin instantes no se puede emparejar cada uno y no se afirma cuál es correcto. Detectados, en orden: "
+                         + tex("; ".join(vr._fmt_found(d) for d in s["detections"])) + ".\n")
         else:
             detected = "; ".join(vr._fmt_found(d) for d in s.get("detections", [])) or "ninguno"
             parts.append("Tiros: sin anotar. Detectados por el sistema: " + tex(detected) + ".\n")
@@ -132,18 +157,20 @@ def build(args: argparse.Namespace) -> Path:
             parts.append("Pases reales, en orden (quién pasa a quién): " + tex(p["sequence_real"]) + ".\n")
         if p["pass_events"]:
             parts.append("Pases detectados: " + tex(p["sequence_found"]) + " (``?'' = camiseta no leída).\n")
+        if p["near_misses"]:
+            parts.append("Casi aciertos (un dígito distinto): " + tex("; ".join(p["near_misses"])) + ".\n")
         if p["changes_real"] is not None:
             parts.append(f"Cambios de posesión reales: {p['changes_real']}; detectados por el sistema: {len(p['transfers'])}.\n")
-        parts.append("Pases: " + (f"reales {len(wanted)}, detectados correctamente {p['matched']}, sin pase real "
-                                  f"{len(p['pass_events']) - p['matched']}." if wanted is not None
+        parts.append("Pases: " + (f"reales {len(wanted)}, detectados correctamente {p['matched']}, no coinciden "
+                                  f"{len(p['pass_events']) - p['matched']} (no coinciden con la lista)." if wanted is not None
                                   else f"sin anotar; el sistema detectó {len(p['pass_events'])}.")
                      + f" Poseedor confirmado en {p['confirmed']} de {p['frames']} cuadros; motivos principales: "
                      + (", ".join(f"{k} ({v})" for k, v in p["reasons"]) or "n/d") + ".\n")
         figs = []
         if c["figures"]["frame"]:
-            figs.append(r"\includegraphics[width=0.74\textwidth]{" + f"{c['name']}-frame.jpg" + "}")
+            figs.append(r"\includegraphics[width=0.6\textwidth]{" + f"{c['name']}-frame.jpg" + "}")
         if c["figures"]["court"]:
-            figs.append(r"\includegraphics[width=0.5\textwidth]{" + f"{c['name']}-court.png" + "}")
+            figs.append(r"\includegraphics[width=0.36\textwidth]{" + f"{c['name']}-court.png" + "}")
         if figs:
             parts.append(r"\begin{figure}[H]\centering " + r"\\[4pt] ".join(figs) + r"\caption{" + tex(c["name"])
                          + r": momento del primer tiro (en rojo el tirador asignado) y posición en la cancha.}\end{figure}")
@@ -185,6 +212,8 @@ datos. Una parte sin anotar no se evalúa; se muestra lo que detectó el sistema
 \subsection{Tiros}
 {\small
 """ + shots_table + r"""}
+
+``Adicionales'' son tiros que el sistema declaró y que una persona verificó que no existen. Un tiro cuyo resultado el sistema dejó sin resolver cuenta como no correcto.
 
 \subsection{Balón, posesión y pases}
 {\small\setlength{\tabcolsep}{4pt}

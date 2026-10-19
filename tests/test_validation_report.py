@@ -84,3 +84,12 @@ def test_truth_without_a_shots_key_is_not_scored(tmp_path):
     folder = _write(tmp_path / "a", [_shot(3.0)])
     result = vr.evaluate_clip("a", folder, {"description": "solo pases", "passes": []})
     assert result["status"] == "sin_verdad_terreno" and "rows" not in result and len(result["detections"]) == 1
+
+
+def test_without_a_court_projection_shots_fall_back_to_raw_events(tmp_path):
+    folder = tmp_path / "a"
+    folder.mkdir()
+    (folder / "shot_events.jsonl").write_text(json.dumps({"start_timestamp_seconds": 21.4, "outcome": "made"}) + "\n")
+    result = vr.evaluate_clip("a", folder, {"shots": [{"outcome": "made", "jersey_number": "35"}]})
+    assert result["court_projected"] is False and result["matched"] == 1
+    assert result["rows"][0]["outcome_ok"] is True and result["rows"][0]["number_ok"] is None

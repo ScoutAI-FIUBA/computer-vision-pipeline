@@ -65,8 +65,13 @@ def _match(truth: list[dict[str, Any]], detected: list[dict[str, Any]], toleranc
 
 def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict[str, Any]:
     shots_doc = _load(folder, "projected_shots.json")
+    court_projected = shots_doc is not None
     if shots_doc is None:
-        return {"clip": name, "status": "sin_resultados", "detail": f"no hay projected_shots.json en {folder}"}
+        # No court projection: fall back to the raw shot detections (no shooter, no court position).
+        events_path = folder / "shot_events.jsonl"
+        if not events_path.is_file():
+            return {"clip": name, "status": "sin_resultados", "detail": f"no hay projected_shots.json en {folder}"}
+        shots_doc = {"shots": [json.loads(x) for x in events_path.read_text().splitlines() if x.strip()]}
     detected = list(shots_doc.get("shots", []))
     summary_doc = _load(folder, "player_summary.json")
     numbers_doc = _load(folder, "numbers.json")
@@ -80,6 +85,7 @@ def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict
         "description": (truth or {}).get("description"),
         "review_note": (truth or {}).get("review_note"),
         "shots_detected": len(detected),
+        "court_projected": court_projected,
         "players_tracked": len(players) if summary_doc else None,
         "players_with_confirmed_number": len(confirmed) if summary_doc else (
             sum(1 for p in (numbers_doc or {}).get("players", []) if p.get("status") == "confirmed")
@@ -94,6 +100,13 @@ def evaluate_clip(name: str, folder: Path, truth: dict[str, Any] | None) -> dict
         return result
 
     expected = truth.get("shots", [])
+    if any(x.get("approx_time_seconds") is None for x in expected) and len(detected) != len(expected):
+        # No times and a different count: pairing by order would be a guess, so the clip is not scored.
+        result["status"] = "evaluado_ambiguo"
+        result["truth_shots"] = len(expected)
+        result["expected"] = expected
+        result["detections"] = [_describe(x) for x in detected]
+        return result
     pairs, spurious = _match(expected, detected, float(truth.get("tolerance_seconds", DEFAULT_TOLERANCE_SECONDS)))
     rows = []
     for t_index, d_index in pairs:
