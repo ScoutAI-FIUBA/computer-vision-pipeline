@@ -92,6 +92,26 @@ def build(args: argparse.Namespace) -> Path:
                 f"leídas y \\textbf{{{passes_wrong_jersey}}} con una camiseta mal leída; \\textbf{{{passes_false}}} resultaron falsos y "
                 f"\\textbf{{{passes_unverified}}} quedaron sin verificar. Cambios de posesión reales: {changes_real}; detectados correctamente: {changes_hit}.")
 
+    from datetime import datetime, timedelta
+
+    windows, attempts, gpus = [], [], set()
+    for spec in args.run:
+        job_path = Path(spec.partition("=")[2].split(":")[0]) / "job.json"
+        if job_path.is_file():
+            record = json.loads(job_path.read_text(encoding="utf-8"))
+            job, summary = record.get("job", {}), record.get("summary") or {}
+            if job.get("started_at") and job.get("finished_at"):
+                windows.append((datetime.fromisoformat(job["started_at"]) - timedelta(hours=3),
+                                datetime.fromisoformat(job["finished_at"]) - timedelta(hours=3)))
+            attempts.append(summary.get("attempts"))
+            gpus.add((summary.get("gpu") or {}).get("name"))
+    when = (f"entre las {min(w[0] for w in windows):%H:%M} y las {max(w[1] for w in windows):%H:%M} (hora de Argentina)"
+            if windows else "en horario no registrado")
+    gpu_text = ", ".join(sorted(g for g in gpus if g)) or "no registrada"
+    restarted = [x for x in args.restarted.split(",") if x]
+    restart_text = (f"En {', '.join(tex(x) for x in restarted)} el registro de progreso mostró un reinicio de contenedor durante el análisis; "
+                    "el trabajo terminó igualmente." if restarted else "No se registraron reinicios de contenedor.")
+
     cost_rows, cost_total = [], 0.0
     for c in clips:
         s = c["shots"].get("job_summary") or {}
@@ -215,6 +235,46 @@ Cada video se subió y se analizó con el flujo normal de producción. Los hecho
 persona. Un evento detectado cuenta si está a menos de 1~segundo del instante anotado. Para el balón se usa la anotación por cuadro del conjunto de
 datos. Una parte sin anotar no se evalúa; se muestra lo que detectó el sistema.
 
+\section{Condiciones de ejecución}
+\textbf{Cuándo y dónde.} Los análisis se lanzaron el 18 de octubre de 2026, """ + when + r""", en producción: backend en Render y procesamiento en Modal.
+GPU informada por los trabajos: """ + tex(gpu_text) + r""". Cada trabajo registra """ + tex(", ".join(sorted({str(a) for a in attempts})) or "n/d") + r""" intento(s). """ + restart_text + r"""
+
+\textbf{Código desplegado.} Backend: rama \texttt{main}, commit \texttt{""" + tex(args.backend_commit) + r"""} (incluye la lectura de los nuevos resultados y el avance real por fases).
+Procesamiento: rama \texttt{integration/modelv2-closeout}, commit \texttt{""" + tex(args.pipeline_commit) + r"""}, desplegado en las aplicaciones de Modal
+\texttt{scoutai-pipeline-v2} y \texttt{scoutai-pipeline-v2-service}.
+
+\textbf{Configuración del análisis} (valores registrados en cada trabajo, salvo indicación). Motor \texttt{v2}; seguimiento de jugadores con SAM~3.1 por segmentos de
+96 cuadros (consigna ``basketball player on the court''); identidad estable por jugador; seguimiento del balón con TrackNet activado; puntos de la cancha con el modelo
+alojado \texttt{basketball-court-detection-2/22} (confianza mínima 0,7); lectura de camisetas con modelo alojado (umbral 0,7); \textbf{motor de posesión v5}
+(ventana de cambio revertido 0,5~s, ventana de recuperación 0,8~s); tipo de análisis \texttt{stats}. Se procesaron todos los cuadros de cada video.
+
+\textbf{Cómo se ejecutó.} Cada video se subió y se analizó con la misma API que usa la aplicación web: iniciar la subida, subir el archivo al almacenamiento,
+completar la subida, crear el trabajo para el equipo y consultar su avance hasta que termina; después se descargaron los resultados guardados. Las credenciales
+se pasan por variables de entorno y no figuran aquí.
+
+{\small
+\begin{verbatim}
+python run_analysis_e2e.py passes-eval/videos/clip_003.mp4 \
+    --team-id <ID_DEL_EQUIPO> --title "eval clip_003" \
+    --part-count 1 --out-dir analysis-results/passes-eval
+# para volver a descargar un trabajo ya terminado:
+python run_analysis_e2e.py x --team-id <ID_DEL_EQUIPO> --job-id <ID_DEL_TRABAJO>
+\end{verbatim}
+}
+
+El informe se generó con el script \texttt{scripts/ops/full\_report\_pdf.py}, a partir de los resultados descargados, los hechos anotados y la anotación del balón:
+{\small
+\begin{verbatim}
+python scripts/ops/full_report_pdf.py --truth facts.json --workdir build \
+    --run clip_003=<resultados>:<video.mp4>:<balon.csv> ... --output informe.pdf
+\end{verbatim}
+}
+
+\textbf{Dos definiciones de pase.} El procesamiento clasifica una transición como pase solo si dos poseedores confirmados del mismo equipo están a lo sumo a
+15 cuadros (0,5~s) de distancia; si la separación es mayor la marca como pérdida de posesión incierta. La aplicación (\texttt{/events}) usa una regla más amplia:
+cualquier cambio de poseedor confirmado entre jugadores del mismo equipo, sin límite de tiempo. Los pases de este informe son los de la aplicación; con la regla
+del procesamiento no se declaró ninguno en estos cuatro videos.
+
 \section{Resultados}
 \subsection{Panorama}
 {\small
@@ -267,6 +327,9 @@ def main() -> int:
     parser.add_argument("--truth", type=Path, default=Path("facts.json"))
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument("--run", action="append", required=True, metavar="CLIP=FOLDER:VIDEO:BALL_CSV")
+    parser.add_argument("--backend-commit", default="no registrado")
+    parser.add_argument("--pipeline-commit", default="no registrado")
+    parser.add_argument("--restarted", default="", help="comma separated clips whose progress log showed a container restart")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     pdf = build(args)
