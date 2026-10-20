@@ -272,10 +272,12 @@ python scripts/ops/full_report_pdf.py --truth facts.json --workdir build \
 \end{verbatim}
 }
 
-\textbf{Dos definiciones de pase.} El procesamiento clasifica una transición como pase solo si dos poseedores confirmados del mismo equipo están a lo sumo a
-15 cuadros (0,5~s) de distancia; si la separación es mayor la marca como pérdida de posesión incierta. La aplicación (\texttt{/events}) usa una regla más amplia:
-cualquier cambio de poseedor confirmado entre jugadores del mismo equipo, sin límite de tiempo. Los pases de este informe son los de la aplicación; con la regla
-del procesamiento no se declaró ninguno en estos cuatro videos.
+\textbf{Tres formas de contar pases.} (1) \emph{Transiciones} del procesamiento: dos poseedores confirmados del mismo equipo a lo sumo a 15 cuadros (0,5~s);
+con una separación mayor las marca como pérdida de posesión incierta. (2) \emph{Capa v3} del procesamiento: eventos \texttt{PASS} detectados por la trayectoria del
+balón (liberación, tránsito y recepción), que no necesitan dos poseedores confirmados seguidos. (3) \emph{Aplicación} (\texttt{/events}): cualquier cambio de poseedor
+confirmado entre jugadores del mismo equipo, sin límite de tiempo. \textbf{Los pases de este informe son los de la aplicación (3).} Los eventos de la capa v3 (2) no se
+devuelven en el flujo de producción, por lo que no pudieron evaluarse en estos videos. En una ejecución por etapas del video clip\_027 hecha por un compañero, la capa v3
+declaró 3 pases (a los 4,0, 4,8 y 12,9~s) y un cambio de equipo a los 17,3~s, que coincide con el robo; es decir, la capa v3 detecta más de lo que muestra este informe.
 
 \section{Resultados}
 \subsection{Panorama}
