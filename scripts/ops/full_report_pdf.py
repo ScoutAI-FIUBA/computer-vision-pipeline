@@ -154,9 +154,11 @@ def build(args: argparse.Namespace) -> Path:
         parts.append(f"Jugadores seguidos: {s.get('players_tracked') if s.get('players_tracked') is not None else 'n/d'}; con camiseta confirmada: "
                      f"{s.get('players_with_confirmed_number') if s.get('players_with_confirmed_number') is not None else 'n/d'}.\n")
         if not s.get("court_projected", True):
-            parts.append(r"\textbf{No se pudo proyectar la cancha en este video:} el análisis terminó, pero sin posiciones de jugadores ni de tiros en "
-                         "la cancha. Los tiros que se muestran vienen directamente del detector, sin tirador asignado; en la aplicación este video "
-                         "aparecería con cero tiros y cero jugadores en cancha.\n")
+            parts.append(r"\textbf{En esta ejecución no se proyectó la cancha:} el análisis terminó como completo, pero sin posiciones de jugadores ni de "
+                         "tiros en la cancha. Los tiros que se muestran vienen directamente del detector, sin tirador asignado; en la aplicación este "
+                         "análisis aparecería con cero tiros y cero jugadores en cancha. Una ejecución independiente del mismo video, hecha por un "
+                         "compañero con el flujo por etapas, sí logró la proyección (6661 filas), y el modelo de cancha respondió bien en 13 de 13 "
+                         "cuadros de prueba: la falla no es propia del video y su causa en esta ejecución no está determinada.\n")
         if s["status"] == "evaluado":
             for row in s["rows"]:
                 got = row["found"]
