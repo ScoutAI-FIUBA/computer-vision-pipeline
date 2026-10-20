@@ -105,9 +105,18 @@ def build(args: argparse.Namespace) -> Path:
                                 datetime.fromisoformat(job["finished_at"]) - timedelta(hours=3)))
             attempts.append(summary.get("attempts"))
             gpus.add((summary.get("gpu") or {}).get("name"))
-    when = (f"entre las {min(w[0] for w in windows):%H:%M} y las {max(w[1] for w in windows):%H:%M} (hora de Argentina)"
-            if windows else "en horario no registrado")
+    if windows:
+        by_day: dict = {}
+        for begin, end in windows:
+            span = by_day.setdefault(begin.date(), [begin, end])
+            span[0], span[1] = min(span[0], begin), max(span[1], end)
+        months = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        pieces = [f"el {day.day} de {months[day.month - 1]} de {day.year} entre las {span[0]:%H:%M} y las {span[1]:%H:%M}" for day, span in sorted(by_day.items())]
+        when = "; ".join(pieces) + " (hora de Argentina)"
+    else:
+        when = "en horario no registrado"
     gpu_text = ", ".join(sorted(g for g in gpus if g)) or "no registrada"
+    notes = {spec.partition("=")[0]: spec.partition("=")[2] for spec in args.note}
     restarted = [x for x in args.restarted.split(",") if x]
     restart_text = (f"En {', '.join(tex(x) for x in restarted)} el registro de progreso mostró un reinicio de contenedor durante el análisis; "
                     "el trabajo terminó igualmente." if restarted else "No se registraron reinicios de contenedor.")
@@ -151,6 +160,8 @@ def build(args: argparse.Namespace) -> Path:
             parts.append(r"\textit{Hechos:} " + tex(s["description"]) + "\n")
         if s.get("review_note"):
             parts.append(r"\textit{Verificación humana:} " + tex(s["review_note"]) + "\n")
+        if notes.get(c["name"]):
+            parts.append(r"\textit{Nota:} " + tex(notes[c["name"]]) + "\n")
         parts.append(f"Jugadores seguidos: {s.get('players_tracked') if s.get('players_tracked') is not None else 'n/d'}; con camiseta confirmada: "
                      f"{s.get('players_with_confirmed_number') if s.get('players_with_confirmed_number') is not None else 'n/d'}.\n")
         if not s.get("court_projected", True):
@@ -238,7 +249,7 @@ persona. Un evento detectado cuenta si está a menos de 1~segundo del instante a
 datos. Una parte sin anotar no se evalúa; se muestra lo que detectó el sistema.
 
 \section{Condiciones de ejecución}
-\textbf{Cuándo y dónde.} Los análisis se lanzaron el 18 de octubre de 2026, """ + when + r""", en producción: backend en Render y procesamiento en Modal.
+\textbf{Cuándo y dónde.} Los análisis se lanzaron """ + when + r""", en producción: backend en Render y procesamiento en Modal.
 GPU informada por los trabajos: """ + tex(gpu_text) + r""". Cada trabajo registra """ + tex(", ".join(sorted({str(a) for a in attempts})) or "n/d") + r""" intento(s). """ + restart_text + r"""
 
 \textbf{Código desplegado.} Backend: rama \texttt{main}, commit \texttt{""" + tex(args.backend_commit) + r"""} (incluye la lectura de los nuevos resultados y el avance real por fases).
@@ -334,6 +345,7 @@ def main() -> int:
     parser.add_argument("--backend-commit", default="no registrado")
     parser.add_argument("--pipeline-commit", default="no registrado")
     parser.add_argument("--restarted", default="", help="comma separated clips whose progress log showed a container restart")
+    parser.add_argument("--note", action="append", default=[], metavar="CLIP=TEXT", help="a note shown in that clip's section")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     pdf = build(args)
