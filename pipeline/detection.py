@@ -8,8 +8,42 @@ class here and nothing else in the pipeline changes.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Callable, Protocol
+
+# Bounded on purpose: the Roboflow quota is shared per account.
+RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+_CONNECTION_ERROR_NAMES = {"ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout", "TimeoutError"}
+
+
+@dataclass
+class DetectorCounters:
+    """Hosted detector call accounting, readable by callers."""
+
+    retries: int = 0
+    failures: int = 0
+
+
+def _http_status(error: BaseException) -> int | None:
+    for name in ("status_code", "status"):
+        value = getattr(error, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def is_retryable_detector_error(error: BaseException) -> bool:
+    """429, 5xx and connection/timeout errors are transient; other 4xx are not."""
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return True
+    # Matched by class name so inference_sdk need not be importable (it is a container dependency).
+    classes = {cls.__name__ for cls in type(error).__mro__}
+    if "HTTPCallErrorError" in classes:
+        status = _http_status(error)
+        return status is not None and (status == 429 or status >= 500)
+    return bool(classes & _CONNECTION_ERROR_NAMES)
 
 
 class Detector(Protocol):
@@ -28,16 +62,30 @@ class HostedRoboflowDetector:
     and passing the path, so results match without the filesystem round-trip.
     """
 
-    def __init__(self, *, api_key: str, api_url: str, model_id: str) -> None:
+    def __init__(
+        self, *, api_key: str, api_url: str, model_id: str,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         from inference_sdk import InferenceHTTPClient
 
         self._client = InferenceHTTPClient(api_url=api_url, api_key=api_key)
         self._model_id = model_id
+        self._sleep = sleep
         self.call_count = 0
+        self.counters = DetectorCounters()
 
     def detect(self, frame) -> dict:
-        self.call_count += 1
-        return self._client.infer(frame, model_id=self._model_id)
+        """One request, retried at most twice (1 s then 3 s) on transient errors only."""
+        for attempt in range(len(RETRY_BACKOFF_SECONDS) + 1):
+            self.call_count += 1
+            try:
+                return self._client.infer(frame, model_id=self._model_id)
+            except Exception as error:
+                if attempt >= len(RETRY_BACKOFF_SECONDS) or not is_retryable_detector_error(error):
+                    self.counters.failures += 1
+                    raise
+                self.counters.retries += 1
+                self._sleep(RETRY_BACKOFF_SECONDS[attempt])
 
 
 class PrefetchingDetector:
@@ -63,6 +111,10 @@ class PrefetchingDetector:
     @property
     def call_count(self) -> int:
         return getattr(self._inner, "call_count", 0)
+
+    @property
+    def counters(self) -> DetectorCounters:
+        return getattr(self._inner, "counters", DetectorCounters())
 
     def submit(self, frame) -> None:
         """Start a detection in the background. Overwrites any unclaimed result."""

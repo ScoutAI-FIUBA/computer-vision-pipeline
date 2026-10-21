@@ -855,10 +855,16 @@ def _project_v2_rows(
     info,
     config: PipelineConfig,
     emit: Callable[[str], None],
-    counters: dict[str, int] | None = None,
+    counters: dict[str, Any] | None = None,
     on_frame: Callable[[int, int], None] | None = None,
 ) -> int:
-    """Project authoritative V2 rows without creating a second player pipeline."""
+    """Project authoritative V2 rows without creating a second player pipeline.
+
+    Per-frame errors of any type skip only that frame and are counted in `counters`
+    (`frames_total`, `frames_projected`, `frames_failed`, `errors_by_type`); rows
+    already written are kept. Only a detector-build failure or zero projected rows
+    removes the file.
+    """
     if counters is not None:
         counters["court_detection_frames"] = 0
     if not config.court_model_id or not rows:
@@ -866,8 +872,26 @@ def _project_v2_rows(
     grouped: dict[int, list[dict]] = {}
     for row in rows:
         grouped.setdefault(int(row["frame_index"]), []).append(row)
+    errors_by_type: dict[str, int] = {}
+    if counters is not None:
+        counters.update(frames_total=len(grouped), frames_projected=0, frames_failed=0,
+                        errors_by_type=errors_by_type)
+
+    def fail_frame(error_name: str) -> None:
+        errors_by_type[error_name] = errors_by_type.get(error_name, 0) + 1
+        if counters is not None:
+            counters["frames_failed"] += 1
+
     try:
         detector = _build_detector_for_model(config, model_id=config.court_model_id)
+    except Exception as error:
+        output_path.unlink(missing_ok=True)
+        emit(f"court projection failed: {type(error).__name__}: {error}")
+        if counters is not None:
+            counters["frames_failed"] = len(grouped)
+            errors_by_type[type(error).__name__] = len(grouped)
+        return 0
+    try:
         frames = _read_video_frames(video_path, grouped)
         written = 0
         with output_path.open("w", encoding="utf-8") as handle:
@@ -876,6 +900,7 @@ def _project_v2_rows(
                     on_frame(done, len(grouped))
                 frame = frames.get(frame_index)
                 if frame is None:
+                    fail_frame("FrameReadError")
                     continue
                 try:
                     if counters is not None:
@@ -889,12 +914,16 @@ def _project_v2_rows(
                     homography = compute_frame_homography(
                         keypoints, min_confidence=config.court_keypoint_confidence
                     )
-                except (RuntimeError, ValueError) as error:
-                    emit(f"court projection frame {frame_index} unavailable: {error}")
+                    frame_written = _write_projected_track_rows(
+                        handle, frame_index=frame_index, rows=grouped[frame_index], homography_result=homography
+                    )
+                except Exception as error:
+                    emit(f"court projection frame {frame_index} unavailable: {type(error).__name__}: {error}")
+                    fail_frame(type(error).__name__)
                     continue
-                written += _write_projected_track_rows(
-                    handle, frame_index=frame_index, rows=grouped[frame_index], homography_result=homography
-                )
+                written += frame_written
+                if counters is not None:
+                    counters["frames_projected"] += 1
         if written:
             emit(f"court projection complete: {written} projected rows")
         else:
@@ -1271,8 +1300,12 @@ def run_stats_from_v2_observations(
     number_detector=None,
     metrics=None,
     on_stage: Callable[[str, float | None], None] | None = None,
+    court_run_info: dict[str, Any] | None = None,
 ) -> PipelineResults:
-    """Run stats stages from authoritative V2 player rows without player tracking."""
+    """Run stats stages from authoritative V2 player rows without player tracking.
+
+    `court_run_info`, when given, receives the court projection counters.
+    """
     emit = on_progress or (lambda message: print(f"[v2-stats] {message}", flush=True))
     notify = _stage_notifier(on_stage)
 
@@ -1307,13 +1340,13 @@ def run_stats_from_v2_observations(
     phase("TrackNet/player artifact writing", write_tracks)
 
     projected_tracks_path = output_dir / PROJECTED_TRACKS_FILENAME
-    court_counters: dict[str, int] = {}
+    court_counters: dict[str, Any] = court_run_info if court_run_info is not None else {}
     notify("court_projection", 0.0)
     projected_track_records = phase(
         "court projection",
         lambda: _project_v2_rows(
             video_path, projected_tracks_path, rows, info=info, config=config, emit=emit,
-            **({"counters": court_counters} if metrics is not None else {}),
+            counters=court_counters,
             **({"on_frame": _fraction_notifier(notify, "court_projection")} if on_stage is not None else {}),
         ),
     )

@@ -42,7 +42,7 @@ def _timestamp(row: dict) -> float | None:
 
 def _identity(row: dict) -> tuple[bool, str | None]:
     track_id = row.get("track_id", row.get("raw_track_id"))
-    if not isinstance(track_id, int) or isinstance(track_id, bool) or track_id < 1:
+    if not isinstance(track_id, int) or isinstance(track_id, bool) or track_id < 0:
         return False, None
     if "stable_player_id" not in row:
         return True, None

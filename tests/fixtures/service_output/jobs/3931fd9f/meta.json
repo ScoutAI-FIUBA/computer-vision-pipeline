@@ -1,0 +1,31 @@
+{
+ "source": "passes-eval-rerun/3931fd9f-862f-472a-9b6e-ca2fb34bd030",
+ "files": [
+  "numbers.json",
+  "player_paths.jsonl",
+  "player_summary.json",
+  "possession_events.jsonl",
+  "possession_transitions.jsonl",
+  "projected_shots.json",
+  "projected_tracks.jsonl",
+  "results.json",
+  "shot_events.jsonl",
+  "teams.json"
+ ],
+ "team_assignments": 99,
+ "acceptance": {
+  "checks": {
+   "team_id": "passed",
+   "stable_identity": "passed",
+   "mask_authoritative_reid": "passed"
+  },
+  "authority": "runtime_identity",
+  "statistics": "deferred",
+  "tracking_identity": "accepted",
+  "identity_excluded_observations": 2,
+  "identity_excluded_observation_keys": [
+   "588:6000014",
+   "589:6000014"
+  ]
+ }
+}

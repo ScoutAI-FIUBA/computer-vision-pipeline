@@ -1,0 +1,39 @@
+{
+  "artifacts": {
+    "events": {
+      "count": 8,
+      "path": "possession_v3/generations/88894553b8885b54/possession_events_v3.jsonl",
+      "sha256": "2625d6a62396b9473d29b9f118ba51d6a37e7d41494d7ebdbbedd8ff986d9db6"
+    },
+    "manifest": {
+      "path": "possession_v3_manifest.json",
+      "sha256": "ad2400fba640fd5212b7dc60422f4a96c958954c62880abae5a65992d36b2b3f"
+    },
+    "possession": {
+      "count": 655,
+      "path": "possession_v3/generations/88894553b8885b54/possession_v3.jsonl",
+      "sha256": "a3e96e1ac2fbab2453d5192a66fb7a6be841187846a000c53992cd7d651dc947"
+    },
+    "primitives": {
+      "count": 13,
+      "path": "possession_v3/generations/88894553b8885b54/possession_primitives_v3.jsonl",
+      "sha256": "b69211296697ddd3cd45af433de31777323b13cea1393ca1587d5ffca7338bdd"
+    },
+    "transitions": {
+      "count": 4,
+      "path": "possession_v3/generations/88894553b8885b54/ball_transitions_v3.jsonl",
+      "sha256": "2d0675be96f51c3a10672640ceaa5cb7456af41a13b3fc8d2826e7bc2631dab7"
+    }
+  },
+  "config": {
+    "engine": "v5",
+    "event_window_seconds": 1.0,
+    "input_contract_version": 1,
+    "profile": "default",
+    "recovery_window_seconds": 0.8,
+    "reverted_switch_window_seconds": 0.5
+  },
+  "generation": "88894553b8885b54",
+  "schema": "possession-engine-v3",
+  "schema_version": 1
+}

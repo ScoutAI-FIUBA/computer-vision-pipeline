@@ -1,0 +1,27 @@
+{
+ "source": "passes-eval/c9fad24b-c95e-452a-86e7-e325ee915894",
+ "files": [
+  "numbers.json",
+  "possession_events.jsonl",
+  "possession_transitions.jsonl",
+  "results.json",
+  "shot_events.jsonl",
+  "teams.json"
+ ],
+ "team_assignments": 99,
+ "acceptance": {
+  "checks": {
+   "team_id": "passed",
+   "stable_identity": "passed",
+   "mask_authoritative_reid": "passed"
+  },
+  "authority": "runtime_identity",
+  "statistics": "deferred",
+  "tracking_identity": "accepted",
+  "identity_excluded_observations": 2,
+  "identity_excluded_observation_keys": [
+   "588:6000014",
+   "589:6000014"
+  ]
+ }
+}
