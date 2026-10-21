@@ -1,0 +1,136 @@
+{
+  "schema_version": 5,
+  "video": {
+    "filename": "input.mp4",
+    "fps": 30.0,
+    "frame_count": 409,
+    "width": 1874,
+    "height": 1044,
+    "duration_seconds": 13.633333333333333
+  },
+  "config": {
+    "source": "sam31_v2_observations",
+    "tracknet_enabled": true,
+    "court_model_id": "basketball-court-detection-2/22",
+    "court_keypoint_confidence": 0.7,
+    "number_predictor_backend": "roboflow-hosted",
+    "number_predictor_score_threshold": 0.7,
+    "possession_engine": "v5",
+    "possession_v3_schema_version": 1,
+    "possession_v3_reverted_switch_window_seconds": 0.5,
+    "possession_v3_recovery_window_seconds": 0.8
+  },
+  "summary": {
+    "frames_processed": 409,
+    "segments_processed": 0,
+    "detector_calls": 0,
+    "track_records": 4713,
+    "distinct_track_ids": 64,
+    "suspected_swaps": 0,
+    "wall_seconds": 0.0
+  },
+  "device": "cpu",
+  "tracks_file": "tracks.jsonl",
+  "teams_file": "teams.json",
+  "numbers_file": "numbers.json",
+  "shot_events_file": "shot_events.jsonl",
+  "ball_tracks_file": "ball_tracks.jsonl",
+  "projected_tracks_file": "projected_tracks.jsonl",
+  "projected_shots_file": "projected_shots.json",
+  "projected_shots_image_file": "projected_shots.png",
+  "annotated_video_file": null,
+  "artifact_references": {
+    "possession_events": {
+      "file": "possession_events.jsonl",
+      "schema_version": 1
+    },
+    "possession_transitions": {
+      "file": "possession_transitions.jsonl",
+      "schema_version": 1,
+      "event_types": [
+        "pass",
+        "steal",
+        "turnover",
+        "lost_possession"
+      ]
+    },
+    "numbers": {
+      "file": "numbers.json",
+      "manifest": "number_manifest.json",
+      "source": "sam31_v2_observations",
+      "artifacts": {
+        "numbers.json": {
+          "sha256": "d3741b47cdf7df990a2470b77f4bd735a71e2818bbaadd54fd6e4f32d75bf642",
+          "size": 228500
+        },
+        "number_predictions.json": {
+          "sha256": "87f92e48b556f99decf8ed08c6c6e8cdaf27de82ccbf7bffb0e33715126bc3ec",
+          "size": 196487
+        },
+        "number_prediction_cases.jsonl": {
+          "sha256": "6ccb3487019a9498c357ed84a065e2c6dfd457021031de4bc3e725e528ef31eb",
+          "size": 135011
+        }
+      }
+    },
+    "possession_v3": {
+      "manifest": "possession_v3_manifest.json",
+      "artifacts": {
+        "possession": {
+          "path": "possession_v3/generations/fbef48e3e4334c28/possession_v3.jsonl",
+          "sha256": "68649236cf1ffd14b26eb5edd20d32f0b494f4abb0b93e85a21e678f88ea1a8f",
+          "count": 409
+        },
+        "primitives": {
+          "path": "possession_v3/generations/fbef48e3e4334c28/possession_primitives_v3.jsonl",
+          "sha256": "12b335790e63453157be9c9359b9d97c843fc45ea525ace46fd6c111c846863c",
+          "count": 1
+        },
+        "transitions": {
+          "path": "possession_v3/generations/fbef48e3e4334c28/ball_transitions_v3.jsonl",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "count": 0
+        },
+        "events": {
+          "path": "possession_v3/generations/fbef48e3e4334c28/possession_events_v3.jsonl",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "count": 0
+        },
+        "manifest": {
+          "path": "possession_v3_manifest.json",
+          "sha256": "bfd062f411768ca3b7a3f2c7a7f32398f55cd3445403262e4c7040d0be696318"
+        }
+      }
+    },
+    "court_projection": {
+      "projected_tracks": "projected_tracks.jsonl",
+      "projected_shots": "projected_shots.json",
+      "projected_shots_image": "projected_shots.png"
+    },
+    "player_summary": {
+      "summary": "player_summary.json",
+      "paths": "player_paths.jsonl",
+      "schema_version": 1
+    }
+  },
+  "shot_evidence_file": "shot_evidence.jsonl",
+  "possession_events_file": "possession_events.jsonl",
+  "possession_transitions_file": "possession_transitions.jsonl",
+  "possession_v3_file": "possession_v3/generations/fbef48e3e4334c28/possession_v3.jsonl",
+  "possession_v3_schema_version": 1,
+  "possession_v3_transitions_file": "possession_v3/generations/fbef48e3e4334c28/ball_transitions_v3.jsonl",
+  "possession_v3_events_file": "possession_v3/generations/fbef48e3e4334c28/possession_events_v3.jsonl",
+  "possession_v3_manifest_file": "possession_v3_manifest.json",
+  "possession_v3_observability": {
+    "status": "complete",
+    "phase": "artifact_write",
+    "counts": {
+      "observations": 409,
+      "primitives": 1,
+      "transitions": 0,
+      "events": 0
+    },
+    "elapsed_seconds": 43.411674,
+    "error": null
+  }
+}

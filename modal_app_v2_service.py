@@ -26,6 +26,8 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import modal
@@ -71,9 +73,10 @@ FALLBACK_FRAME_END = 130
 # The window that holds <=16 tracks is clip-dependent (a dense clip has more
 # distinct tracks in the same span). Rather than guess one value, we try a ladder
 # largest-first -- a bigger window means fewer segments, so it's faster and makes
-# fewer client round-trips when it fits. If a run trips the 16-object cap we step
-# down to a smaller window and retry. A payload may pin segment_window to skip the
-# ladder.
+# fewer client round-trips when it fits. 17-22 simultaneous objects are pruned by
+# the pipeline and the run continues; only more than 22 trips the cap error, and
+# then we step down to a smaller window and retry. A payload may pin
+# segment_window to skip the ladder.
 DEFAULT_SEGMENTED = True
 SEGMENT_WINDOW_LADDER = (96, 48, 24)
 
@@ -96,13 +99,58 @@ RETURN_ARTIFACT_PATHS = [
     "stats/possession_events.jsonl",
     "stats/possession_transitions.jsonl",
     "stats/projected_tracks.jsonl",
+    # Evidence behind the numbers (never tracks.jsonl or masks: size and privacy).
+    "stats/possession_v3_manifest.json",
+    "stats/possession_v3/generations/",
+    "stats/possession_v3_failure.json",
+    "stats/ball_tracks.jsonl",
+    "stats/shot_evidence.jsonl",
+    "stats/shot_signals.jsonl",
+    "stats/shot_raw_predictions.jsonl",
+    "stats/number_predictions.json",
 ]
+# Files the v3 possession engine writes under a generation directory; they are
+# uploaded flattened, and only from the generation the manifest names.
+V3_GENERATIONS_PREFIX = "stats/possession_v3/generations/"
+V3_MANIFEST_PATH = "stats/possession_v3_manifest.json"
+V3_FAILURE_PATH = "stats/possession_v3_failure.json"
+V3_EVENTS_NAME = "possession_events_v3.jsonl"
+V3_BASENAMES = (
+    "possession_v3.jsonl",
+    "possession_primitives_v3.jsonl",
+    "ball_transitions_v3.jsonl",
+    V3_EVENTS_NAME,
+    "possession_v4_diagnostics.jsonl",
+)
 RETURN_ARTIFACT_MAX_FILE_BYTES = 30 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 DEFAULT_POSSESSION_ENGINE = "v5"
 
-# Test seam for the deadline and stall clocks.
+# Status callbacks: DONE/FAILED get 3 attempts with these pauses between them.
+REPORT_BACKOFF_SECONDS = (2, 5, 15)
+
+# Test seams for the deadline and stall clocks and the callback backoff.
 _clock = time.monotonic
+_sleep = time.sleep
+
+
+def _git_sha() -> str | None:
+    """Short git sha of this checkout at deploy time, else the baked-in env value."""
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, cwd=Path(__file__).resolve().parent,
+        )
+        sha = out.stdout.strip()
+        if out.returncode == 0 and sha:
+            return sha
+    except Exception:  # noqa: BLE001 - provenance is best-effort, never blocks a deploy
+        pass
+    return (os.getenv("SERVICE_GIT_SHA") or "").strip() or None
+
+
+SERVICE_GIT_SHA = _git_sha()
 
 app = modal.App(APP_NAME)
 
@@ -116,6 +164,9 @@ image = (
     .apt_install("ffmpeg")
     .pip_install("boto3==1.35.36", "fastapi==0.115.6")
 )
+if SERVICE_GIT_SHA:
+    # Evaluated where the module is loaded for deploy; the container has no git.
+    image = image.env({"SERVICE_GIT_SHA": SERVICE_GIT_SHA})
 
 r2_secret = modal.Secret.from_name("scoutai-r2")
 auth_secret = modal.Secret.from_name("scoutai-auth")
@@ -162,20 +213,28 @@ def _report_status(
     if progress_phase is not None:
         body["progress_phase"] = progress_phase[:40]
 
-    try:
-        import urllib.error
-        import urllib.request
-
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=15) as response:
-            print(f"[job {job_id}] reported {status} ({response.status})")
-    except Exception as error:  # noqa: BLE001 - reporting must never break a job
-        print(f"[job {job_id}] could not report {status}: {error!r}")
+    # DONE/FAILED decide the job's fate in the backend, so they are retried on a
+    # transient failure. RUNNING ticks every few seconds and the next one
+    # supersedes it, so one attempt is enough (and never stalls the poll loop).
+    attempts = len(REPORT_BACKOFF_SECONDS) if status in ("DONE", "FAILED") else 1
+    for attempt in range(attempts):
+        try:
+            request = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                print(f"[job {job_id}] reported {status} ({response.status})")
+            return
+        except Exception as error:  # noqa: BLE001 - reporting must never break a job
+            print(f"[job {job_id}] could not report {status} (attempt {attempt + 1}/{attempts}): {error!r}")
+            code = getattr(error, "code", None)
+            if isinstance(code, int) and code < 500:
+                return  # the backend rejected it; retrying the same body cannot help
+            if attempt + 1 < attempts:
+                _sleep(REPORT_BACKOFF_SECONDS[attempt])
 
 
 def _r2_client():
@@ -398,13 +457,269 @@ def _is_returnable(relative_path: str) -> bool:
     )
 
 
-def _build_summary(result: dict, *, engine: str, window: int, attempts: int) -> dict:
+def _v3_generation(artifacts: dict[str, bytes]) -> str | None:
+    """The generation the returned v3 manifest names, or None if unreadable."""
+
+    try:
+        generation = json.loads(artifacts[V3_MANIFEST_PATH]).get("generation")
+    except Exception:  # noqa: BLE001 - absent or malformed manifest: no generation
+        return None
+    return generation if isinstance(generation, str) and generation else None
+
+
+def _upload_name(relative_path: str, v3_generation: str | None) -> str | None:
+    """The flat upload name for a returned artifact, or None if it must not go up.
+
+    `stats/<name>` -> `<name>`. A v3 generation file -> its basename, only when its
+    generation is the one the manifest names (stale generations from earlier runs
+    must not shadow the current files).
+    """
+
+    if not relative_path.startswith(STATS_PREFIX):
+        return None
+    name = relative_path[len(STATS_PREFIX):]
+    if relative_path.startswith(V3_GENERATIONS_PREFIX):
+        generation, _, base = relative_path[len(V3_GENERATIONS_PREFIX):].partition("/")
+        if not v3_generation or generation != v3_generation or not base or "/" in base:
+            return None
+        return base
+    return name if name and "/" not in name else None
+
+
+def _plan_uploads(artifacts: dict[str, bytes]) -> tuple[list[tuple[str, str]], list[dict]]:
+    """(relative_path, upload_name) pairs to upload, plus the files skipped here."""
+
+    generation = _v3_generation(artifacts)
+    plan: list[tuple[str, str]] = []
+    skipped: list[dict] = []
+    taken: set[str] = set()
+    for relative_path, data in artifacts.items():
+        if not _is_returnable(relative_path) or not relative_path.startswith(STATS_PREFIX):
+            continue
+        name = _upload_name(relative_path, generation)
+        reason = None
+        if name is None:
+            reason = "v3_generation_mismatch"
+        elif name in taken:
+            reason = "name_collision"
+        if reason:
+            skipped.append({"path": relative_path, "bytes": len(data), "reason": reason})
+            continue
+        taken.add(name)
+        plan.append((relative_path, name))
+    return plan, skipped
+
+
+# Names a healthy run is expected to upload (flat), for `missing_expected`.
+EXPECTED_ARTIFACT_NAMES = tuple(
+    entry[len(STATS_PREFIX):] for entry in RETURN_ARTIFACT_PATHS
+    if not entry.endswith("/") and entry not in (V3_FAILURE_PATH,)
+) + (V3_EVENTS_NAME,)
+COURT_FAILED_RATIO_DEGRADED = 0.05
+
+
+def _json_rows(data: bytes | None) -> list[dict]:
+    rows = []
+    for line in (data or b"").decode("utf-8", "replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _court_stage(config: dict, uploaded: list[str], run_info: dict | None) -> dict:
+    court = (run_info or {}).get("court") if isinstance((run_info or {}).get("court"), dict) else {}
+    stage = {
+        "status": "unknown",
+        "frames_total": court.get("frames_total"),
+        "frames_projected": court.get("frames_projected"),
+        "frames_failed": court.get("frames_failed"),
+        "errors_by_type": court.get("errors_by_type"),
+    }
+    if not config:
+        return stage
+    if not config.get("court_model_id"):
+        stage["status"] = "disabled"
+    elif "projected_tracks.jsonl" not in uploaded:
+        stage["status"] = "empty"
+    elif stage["frames_projected"] == 0 and stage["frames_total"]:
+        stage["status"] = "empty"
+    elif stage["frames_failed"]:
+        stage["status"] = "partial"
+    else:
+        stage["status"] = "ok"
+    return stage
+
+
+def build_quality(
+    results: dict,
+    uploaded: list[str],
+    skipped: list[dict],
+    run_info: dict | None,
+    *,
+    acceptance: dict | None = None,
+    team_assignments: int | None = None,
+    v3_events: bytes | None = None,
+) -> dict:
+    """What the user can trust in this run: a level, the reasons, per-stage facts.
+
+    `results` is the run's results.json. Anything that only the GPU side knows
+    comes from `run_info` and stays None when it is absent (never invented).
+    `acceptance`, `team_assignments` and `v3_events` are facts the service reads
+    from the GPU result and the returned files themselves.
+    """
+
+    results = results or {}
+    run_info = run_info if isinstance(run_info, dict) else {}
+    acceptance = acceptance or {}
+    config = results.get("config") or {}
+    reasons: list[dict] = []
+
+    def reason(code: str, severity: str, detail: str) -> None:
+        reasons.append({"code": code, "severity": severity, "detail": detail})
+
+    court = _court_stage(config, uploaded, run_info)
+    if config.get("court_model_id") and "projected_tracks.jsonl" not in uploaded:
+        reason("court_projection_empty", "critical",
+               "court model configured but no projected_tracks.jsonl was produced")
+    if team_assignments == 0:
+        reason("teams_empty", "critical", "teams.json has no track assignments")
+
+    observability = results.get("possession_v3_observability") or {}
+    failed = observability.get("status") == "failed" or "possession_v3_failure.json" in uploaded
+    events_uploaded = V3_EVENTS_NAME in uploaded
+    counts = observability.get("counts") or {}
+    v3 = {"status": "ok", "transitions": counts.get("transitions"),
+          "events": counts.get("events"), "passes": None}
+    if failed:
+        v3["status"] = "failed"
+        reason("possession_v3_failed", "degraded", str(observability.get("error") or "v3 possession failed"))
+    elif not events_uploaded:
+        v3["status"] = "missing"
+    if not failed and not events_uploaded:
+        reason("possession_v3_events_missing", "degraded", f"{V3_EVENTS_NAME} was not returned")
+    if events_uploaded and v3_events is not None:
+        v3["passes"] = sum(1 for row in _json_rows(v3_events) if row.get("event_type") == "PASS")
+
+    for item in skipped:
+        reason("artifact_skipped", "degraded", f"{item.get('path')}: {item.get('reason') or 'too_large'}")
+
+    ratio_total, ratio_failed = court["frames_total"], court["frames_failed"]
+    if ratio_total and ratio_failed and ratio_failed / ratio_total > COURT_FAILED_RATIO_DEGRADED:
+        reason("court_projection_partial", "degraded", f"{ratio_failed}/{ratio_total} frames failed to project")
+
+    tracking_info = run_info.get("tracking") if isinstance(run_info.get("tracking"), dict) else {}
+    tracking = {key: tracking_info.get(key)
+                for key in ("segments", "overflow_dropped_ids", "seams", "seams_linked")}
+    if tracking["overflow_dropped_ids"]:
+        reason("tracking_overflow_dropped_ids", "degraded",
+               f"{tracking['overflow_dropped_ids']} track ids dropped by the object cap")
+
+    numbers_ok = "numbers.json" in uploaded
+    if not numbers_ok:
+        reason("jersey_numbers_missing", "degraded", "numbers.json was not returned")
+
+    tracking_identity = acceptance.get("tracking_identity")
+    if tracking_identity is not None and tracking_identity != "accepted":
+        reason("tracking_identity_not_accepted", "degraded", f"tracking_identity={tracking_identity}")
+
+    if any(r["severity"] == "critical" for r in reasons):
+        level = "critical"
+    elif reasons:
+        level = "degraded"
+    else:
+        level = "ok"
+
+    return {
+        "schema_version": 1,
+        "level": level,
+        "reasons": reasons,
+        "stages": {
+            "court_projection": court,
+            "possession_v3": v3,
+            "jersey_numbers": {"status": "ok" if numbers_ok else "missing"},
+            "tracking": tracking,
+        },
+        "identity": {
+            "tracking_identity": tracking_identity,
+            "excluded_observations": acceptance.get("identity_excluded_observations"),
+            "reasons": run_info.get("acceptance_reasons"),
+        },
+        "artifacts": {
+            "uploaded": list(uploaded),
+            "missing_expected": [name for name in EXPECTED_ARTIFACT_NAMES if name not in uploaded],
+            "skipped": list(skipped),
+        },
+    }
+
+
+def build_provenance(
+    results: dict,
+    *,
+    engine: str,
+    window: int,
+    prompt: str,
+    run_info: dict | None,
+    v3_generation: str | None,
+    service_git_sha: str | None = None,
+) -> dict:
+    """Which code and inputs produced this run. GPU-side facts come from `run_info`."""
+
+    config = (results or {}).get("config") or {}
+    run_info = run_info if isinstance(run_info, dict) else {}
+    return {
+        "service_git_sha": service_git_sha,
+        "pipeline_git_sha": run_info.get("pipeline_git_sha"),
+        "possession_engine": engine,
+        "segment_window": window,
+        "segment_overlap": run_info.get("segment_overlap"),
+        "prompt": prompt,
+        "court_model_id": config.get("court_model_id"),
+        "number_predictor_backend": config.get("number_predictor_backend"),
+        "input_sha256": run_info.get("input_sha256"),
+        "possession_v3_generation": v3_generation,
+    }
+
+
+def _build_summary(
+    result: dict,
+    *,
+    engine: str,
+    window: int,
+    attempts: int,
+    artifacts: dict[str, bytes] | None = None,
+    uploaded: list[str] | None = None,
+    skipped: list[dict] | None = None,
+    prompt: str = DEFAULT_PROMPT,
+) -> dict:
     """The DONE summary: the pipeline's own facts, each optional."""
 
     video = result.get("video") or {}
     frames = result.get("frames")
+    artifacts = artifacts or {}
+    run_info = result.get("run_info")
+    generation = _v3_generation(artifacts)
+    results_json = {}
+    teams_assignments = None
+    try:
+        results_json = json.loads(artifacts["stats/results.json"])
+    except Exception:  # noqa: BLE001 - quality degrades to "unknown", never fails the job
+        pass
+    try:
+        teams_assignments = len(json.loads(artifacts["stats/teams.json"])["assignments_by_track_id"])
+    except Exception:  # noqa: BLE001
+        pass
+    quality = build_quality(
+        results_json, uploaded or [], skipped or [], run_info,
+        acceptance=result.get("acceptance"), team_assignments=teams_assignments,
+        v3_events=artifacts.get(f"{V3_GENERATIONS_PREFIX}{generation}/{V3_EVENTS_NAME}"),
+    )
     return {
         "engine": "v2",
+        "contract_version": 2,
         "acceptance": result.get("acceptance"),
         "possession_engine": engine,
         "segment_window": window,
@@ -414,6 +729,11 @@ def _build_summary(result: dict, *, engine: str, window: int, attempts: int) -> 
         "duration_seconds": video.get("duration_seconds"),
         "gpu": result.get("gpu"),
         "timings": result.get("timings"),
+        "quality": quality,
+        "provenance": build_provenance(
+            results_json, engine=engine, window=window, prompt=prompt, run_info=run_info,
+            v3_generation=generation, service_git_sha=SERVICE_GIT_SHA,
+        ),
     }
 
 
@@ -496,16 +816,17 @@ def run_backed_job(payload: dict) -> dict:
             percent = max(state.percent, UPLOAD_BAND[0])
             _report_status(job_id, "RUNNING", progress_percent=percent, progress_phase="upload")
             uploaded: list[str] = []
+            skipped = [dict(item, reason=item.get("reason") or "too_large")
+                       for item in result.get("artifacts_skipped") or []]
             if output_prefix:
                 prefix = output_prefix.rstrip("/") + "/"
-                for relative_path, data in artifacts.items():
-                    # Only allowlisted box-score outputs are uploaded, flattened to
-                    # the results-key root where the stats endpoints read them.
-                    if not _is_returnable(relative_path) or not relative_path.startswith(STATS_PREFIX):
-                        continue
-                    name = relative_path[len(STATS_PREFIX):]
+                # Only allowlisted outputs are uploaded, flattened to the
+                # results-key root where the stats endpoints read them.
+                plan, plan_skipped = _plan_uploads(artifacts)
+                skipped.extend(plan_skipped)
+                for relative_path, name in plan:
                     staged = work / "upload.bin"
-                    staged.write_bytes(data)
+                    staged.write_bytes(artifacts[relative_path])
                     s3.upload_file(str(staged), bucket, prefix + name)
                     uploaded.append(name)
 
@@ -513,7 +834,11 @@ def run_backed_job(payload: dict) -> dict:
                 job_id,
                 "DONE",
                 artifacts=uploaded,
-                summary=_build_summary(result, engine=engine, window=window, attempts=attempts),
+                summary=_build_summary(
+                    result, engine=engine, window=window, attempts=attempts,
+                    artifacts=artifacts, uploaded=uploaded, skipped=skipped,
+                    prompt=payload.get("prompt") or DEFAULT_PROMPT,
+                ),
                 progress_percent=100,
             )
             return {"status": "DONE", "artifacts": uploaded}
