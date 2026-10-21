@@ -8,6 +8,7 @@ import importlib
 import inspect
 import json
 import os
+import subprocess
 import tempfile
 import time
 import uuid
@@ -64,6 +65,29 @@ from pipeline.sam31_segments import (
 
 SAM31_REPOSITORY = "git+https://github.com/facebookresearch/sam3.git"
 SAM31_COMMIT = "2345a4a"
+
+
+def _deploy_git_sha() -> str | None:
+    """Short git SHA of the pipeline checkout, evaluated where this module is loaded for deploy.
+
+    Inside the container the image env already carries PIPELINE_GIT_SHA and there is no
+    git checkout, so the env value wins. Never raises; None when unknown.
+    """
+    existing = os.environ.get("PIPELINE_GIT_SHA")
+    if existing:
+        return existing
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception:
+        return None
+    sha = completed.stdout.strip() if completed.returncode == 0 else ""
+    return sha or None
+
+
+PIPELINE_GIT_SHA = _deploy_git_sha()
 SAM31_SMOKE_MODULES = (
     "pycocotools.mask",
     "PIL",
@@ -332,6 +356,7 @@ image = (
         "BBOX_SANITIZER_ENABLED": "1",
         "POSSESSION_ENGINE": "v3",
         "NUMBER_PREDICTOR_BACKEND": "roboflow-hosted",
+        **({"PIPELINE_GIT_SHA": PIPELINE_GIT_SHA} if PIPELINE_GIT_SHA else {}),
     })
     .add_local_python_source("pipeline")
     .add_local_file("scripts/ball/tracknet.py", remote_path="/root/scripts/ball/tracknet.py")
@@ -527,7 +552,8 @@ def _load_video_frames(path: Path, frame_start: int, frame_end: int) -> dict[int
 
 
 def _run_v2_stats(video_path: Path, output_dir: Path, observations, *, masks=None, clean_masks=None,
-                  config=None, number_predictor=None, number_detector=None, on_stage=None):
+                  config=None, number_predictor=None, number_detector=None, on_stage=None,
+                  court_run_info=None):
     """Run stats from SAM3.1 rows; never construct a legacy player tracker."""
     config = config or PipelineConfig.from_env()
     kwargs = {
@@ -538,6 +564,8 @@ def _run_v2_stats(video_path: Path, output_dir: Path, observations, *, masks=Non
     }
     if on_stage is not None:
         kwargs["on_stage"] = on_stage
+    if court_run_info is not None:
+        kwargs["court_run_info"] = court_run_info
     return run_stats_from_v2_observations(video_path, config, output_dir, observations, **kwargs)
 
 
@@ -724,6 +752,44 @@ def _track_segmented_video(
         stitched_masks,
         diagnostics=seam_diagnostics,
     )
+
+
+def _build_run_info(
+    *, court_counters: Mapping[str, Any], seam_diagnostics: list[dict[str, Any]] | None,
+    overflow_diagnostics: list[dict[str, Any]] | None, segment_count: int | None,
+    segment_overlap: int | None, acceptance_reasons, input_sha256: str | None,
+) -> dict[str, Any]:
+    """Counts-only run summary for the service; None means "not measured", never a guess."""
+    tracking: dict[str, Any] = {
+        "segments": segment_count, "overflow_dropped_ids": None, "seams": None, "seams_linked": None,
+    }
+    if segment_count is not None:
+        overflow = overflow_diagnostics or []
+        seams = [item for item in (seam_diagnostics or []) if item.get("event") in {"matched", "ambiguous"}]
+        tracking.update({
+            "overflow_dropped_ids": sum(
+                len(item.get("dropped_raw_ids") or []) for item in overflow
+                if item.get("event") == "segment_object_overflow"
+            ),
+            "seams": len(seams),
+            "seams_linked": sum(1 for item in seams if item.get("event") == "matched"),
+        })
+    errors = court_counters.get("errors_by_type")
+    run_info = {
+        "court": {
+            "frames_total": court_counters.get("frames_total"),
+            "frames_projected": court_counters.get("frames_projected"),
+            "frames_failed": court_counters.get("frames_failed"),
+            "errors_by_type": dict(errors) if errors is not None else None,
+        },
+        "tracking": tracking,
+        "acceptance_reasons": [str(reason) for reason in (acceptance_reasons or [])],
+        "input_sha256": input_sha256,
+        "segment_overlap": segment_overlap,
+        "pipeline_git_sha": os.environ.get("PIPELINE_GIT_SHA") or None,
+        "sam31_commit": SAM31_COMMIT,
+    }
+    return run_info
 
 
 def _segmented_enabled(value: bool | None) -> bool:
@@ -1333,6 +1399,7 @@ class PipelineV2:
             output_dir = root / "artifacts"
             video_path.write_bytes(video_bytes)
             started = time.perf_counter()
+            court_counters: dict[str, Any] = {}
             direct_metrics = _new_stage_metrics("direct")
             reporter = ProgressReporter(
                 _progress_dict_sink(progress_key) if progress_key is not None else None,
@@ -1392,6 +1459,7 @@ class PipelineV2:
                 clean_masks = getattr(result, "cleaned_masks_by_observation", {})
                 _add_clean_mask_references(result.observations, clean_masks)
                 video_metadata = _video_metadata(video_path)
+                input_fingerprint = _file_fingerprint(video_path)
                 artifact_config = {"prompt": prompt, "frame_start": frame_start, "frame_end": frame_end}
                 if config.possession_engine in {"v3", "v4", "v5"}:
                     artifact_config["possession_engine"] = config.possession_engine
@@ -1415,7 +1483,7 @@ class PipelineV2:
                     result.observations,
                     masks,
                     clean_masks=clean_masks,
-                    input_fingerprint=_file_fingerprint(video_path),
+                    input_fingerprint=input_fingerprint,
                     video_metadata=video_metadata,
                     frame_bounds=[frame_start, frame_end],
                     prompts=[prompt],
@@ -1432,6 +1500,7 @@ class PipelineV2:
                     "masks": masks, "clean_masks": clean_masks, "config": config,
                     "number_predictor": number_predictor,
                     "number_detector": number_detector,
+                    "court_run_info": court_counters,
                 }
                 if progress_key is not None:
                     stats_kwargs["on_stage"] = reporter.stage
@@ -1483,6 +1552,17 @@ class PipelineV2:
             video_summary = _video_summary(video_metadata)
             if video_summary is not None:
                 payload["video"] = video_summary
+            used_overlap = _segment_setting(segment_overlap, "SAM31_V2_SEGMENT_OVERLAP", 1) if segmented_run else None
+            payload["run_info"] = _build_run_info(
+                court_counters=court_counters,
+                seam_diagnostics=seam_diagnostics, overflow_diagnostics=overflow_diagnostics,
+                segment_count=len(list(plan_segment_windows(
+                    frame_start, frame_end,
+                    window=_segment_setting(segment_window, "SAM31_V2_SEGMENT_WINDOW", 32), overlap=used_overlap,
+                ))) if segmented_run else None,
+                segment_overlap=used_overlap, acceptance_reasons=result.acceptance_reasons,
+                input_sha256=input_fingerprint.removeprefix("sha256:"),
+            )
             if return_diagnostics:
                 payload["debug_diagnostics"] = result.runtime_diagnostics
             if return_artifacts:

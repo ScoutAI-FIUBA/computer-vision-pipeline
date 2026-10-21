@@ -2684,7 +2684,7 @@ def test_process_exposes_runtime_diagnostics_only_through_explicit_debug_respons
     assert "debug_diagnostics" not in normal
     assert "runtime_diagnostics" not in json.loads(normal["artifacts"]["tracks.jsonl"].decode())
     assert "runtime_diagnostics" not in json.loads(normal["artifacts"]["manifest.json"].decode())
-    assert debug.keys() == {"acceptance", "debug_diagnostics", "timings", "gpu", "frames"}
+    assert debug.keys() == {"acceptance", "debug_diagnostics", "timings", "gpu", "frames", "run_info"}
     assert debug["acceptance"] == {} and debug["debug_diagnostics"] == diagnostics
 
 
@@ -2762,9 +2762,9 @@ def test_conflicting_team_response_keeps_rejected_policy_with_debug_opt_in(monke
     )
 
     assert normal["acceptance"] == {"tracking_identity": "unvalidated", "statistics": "deferred"}
-    assert set(normal) == {"acceptance", "timings", "gpu", "frames"}
+    assert set(normal) == {"acceptance", "timings", "gpu", "frames", "run_info"}
     assert debug["acceptance"] == normal["acceptance"]
-    assert debug.keys() == {"acceptance", "debug_diagnostics", "timings", "gpu", "frames"}
+    assert debug.keys() == {"acceptance", "debug_diagnostics", "timings", "gpu", "frames", "run_info"}
     assert debug["debug_diagnostics"]["team_vote_diagnostics"] == {
         "player-7": {"cluster_votes": {"0": 1, "1": 1}, "total_samples": 2}
     }
@@ -2869,7 +2869,7 @@ def test_process_preserves_explicit_runner_acceptance_states(monkeypatch, accept
     payload = process(cls(), video_bytes=b"fake-video", frame_start=60, frame_end=60)
 
     assert payload["acceptance"] == acceptance
-    assert set(payload) == {"acceptance", "timings", "gpu", "frames"}
+    assert set(payload) == {"acceptance", "timings", "gpu", "frames", "run_info"}
 
 
 def test_process_size_limit_fails_before_returning_partial_artifacts(monkeypatch):
