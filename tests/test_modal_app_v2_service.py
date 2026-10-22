@@ -528,3 +528,17 @@ def test_git_sha_never_raises(monkeypatch):
     assert svc._git_sha() == "abc1234"
     monkeypatch.delenv("SERVICE_GIT_SHA")
     assert svc._git_sha() is None
+
+
+def test_segment_ladder_starts_at_150_and_steps_down():
+    assert svc._segment_windows({}) == (150, 96, 48, 24)
+    assert list(svc._segment_windows({})) == sorted(svc._segment_windows({}), reverse=True)
+
+
+def test_segment_overlap_per_rung():
+    assert [svc._segment_overlap({}, window) for window in svc.SEGMENT_WINDOW_LADDER] == [20, 12, 6, 3]
+
+
+def test_pinned_window_and_overlap_win():
+    assert svc._segment_windows({"segment_window": 96}) == (96,)
+    assert svc._segment_overlap({"segment_overlap": 5}, 150) == 5

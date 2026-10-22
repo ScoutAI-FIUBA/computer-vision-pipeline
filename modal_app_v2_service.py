@@ -77,8 +77,14 @@ FALLBACK_FRAME_END = 130
 # the pipeline and the run continues; only more than 22 trips the cap error, and
 # then we step down to a smaller window and retry. A payload may pin
 # segment_window to skip the ladder.
+#
+# The first rung is 150 frames with a 20-frame overlap, the setting used for the
+# clip_027 comparison run; the lower rungs are the earlier defaults, kept as the
+# fallback when a dense clip trips the object cap.
 DEFAULT_SEGMENTED = True
-SEGMENT_WINDOW_LADDER = (96, 48, 24)
+SEGMENT_WINDOW_LADDER = (150, 96, 48, 24)
+# Seam overlap per rung. A rung without an entry uses an eighth of its window.
+SEGMENT_OVERLAP_BY_WINDOW = {150: 20}
 
 # v2 nests its box-score outputs under this subdirectory; the backend's stats
 # endpoints read them at the results-key root, so we flatten this prefix away on
@@ -307,7 +313,7 @@ def _segment_overlap(payload: dict, window: int) -> int:
     pinned = payload.get("segment_overlap")
     if pinned is not None:
         return int(pinned)
-    return max(1, window // 8)
+    return SEGMENT_OVERLAP_BY_WINDOW.get(window, max(1, window // 8))
 
 
 def _is_object_cap_error(exc: Exception) -> bool:
