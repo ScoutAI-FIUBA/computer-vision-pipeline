@@ -263,3 +263,13 @@ def test_modal_process_passes_preloaded_detector_to_runner(monkeypatch: pytest.M
     )
 
     assert captured["tracknet_detector"] is detector
+
+
+def test_parse_args_requires_exactly_one_clip_source(tmp_path: Path):
+    clips = [str(_clip(tmp_path, "test", "match20")), str(_clip(tmp_path, "train", "match01"))]
+    output = ["--output-dir", str(tmp_path / "out")]
+    with pytest.raises(SystemExit):
+        experiment.parse_args(output)
+    with pytest.raises(SystemExit):
+        experiment.parse_args([*clips, "--processed-root", str(tmp_path), *output])
+    assert len(experiment.parse_args([*clips, *output]).clip_roots) == 2

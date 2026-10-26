@@ -156,9 +156,9 @@ def annotate_frame(frame, prediction, candidates, detector_boxes, frame_index: i
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("clips", nargs="*", type=Path, help="Two or three processed match roots or frame/clip directories")
-    source.add_argument("--processed-root", type=Path, help="Processed dataset root; use --clip-name or deterministic defaults")
+    # Not a required mutually exclusive group: Python 3.12 rejects a positional with nargs="*" inside one.
+    parser.add_argument("clips", nargs="*", type=Path, help="Two or three processed match roots or frame/clip directories")
+    parser.add_argument("--processed-root", type=Path, help="Processed dataset root; use --clip-name or deterministic defaults")
     parser.add_argument("--clip-name", action="append", help="Relative match root under --processed-root; repeat 2 or 3 times")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
@@ -167,6 +167,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confidence", type=float, default=0.4)
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and print the bounded plan; no torch or network")
     args = parser.parse_args(argv)
+    if bool(args.clips) == bool(args.processed_root):
+        parser.error("provide either the clip directories or --processed-root, not both and not neither")
     roots = [args.processed_root / name for name in (args.clip_name or DEFAULT_CLIPS)] if args.processed_root else args.clips
     if len(roots) not in (2, 3):
         parser.error("provide exactly 2 or 3 clips")

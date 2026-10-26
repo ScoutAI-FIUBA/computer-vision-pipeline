@@ -16,3 +16,6 @@ __pycache__/
 
 media/
 outputs/
+
+.coverage
+coverage.xml
